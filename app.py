@@ -371,14 +371,14 @@ TYPE_LABELS = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CUSTOM CSS
+# CUSTOM CSS — theme-aware (works in both light and dark mode)
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* KPI metric cards */
+    /* KPI metric cards — uses Streamlit theme variables */
     div[data-testid="stMetric"] {
-        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-        border: 1px solid #dee2e6;
+        background: var(--secondary-background-color);
+        border: 1px solid rgba(128, 128, 128, 0.2);
         border-radius: 0.75rem;
         padding: 1rem 1.25rem;
         box-shadow: 0 2px 4px rgba(0,0,0,0.06);
@@ -388,26 +388,13 @@ st.markdown("""
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: #495057;
+        opacity: 0.75;
     }
     div[data-testid="stMetric"] [data-testid="stMetricValue"] {
         font-size: 1.6rem !important;
         font-weight: 700;
     }
-    /* Sidebar styling */
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #1a1a2e 0%, #16213e 100%);
-    }
-    section[data-testid="stSidebar"] .stMarkdown h1,
-    section[data-testid="stSidebar"] .stMarkdown h2,
-    section[data-testid="stSidebar"] .stMarkdown h3 {
-        color: #e9ecef;
-    }
-    section[data-testid="stSidebar"] .stMarkdown p,
-    section[data-testid="stSidebar"] label {
-        color: #ced4da !important;
-    }
-    /* Header banner */
+    /* Header banner — self-contained dark gradient with white text */
     .main-header {
         background: linear-gradient(135deg, #1a1a2e 0%, #0d6efd 100%);
         color: white;
@@ -417,19 +404,19 @@ st.markdown("""
     }
     .main-header h1 { margin: 0; font-size: 1.8rem; }
     .main-header p { margin: 0.25rem 0 0 0; opacity: 0.85; font-size: 0.9rem; }
-    /* Section headers */
+    /* Section headers — theme-aware */
     .section-header {
-        background: #f8f9fa;
-        border-left: 4px solid #0d6efd;
+        background: var(--secondary-background-color);
+        border-left: 4px solid var(--primary-color, #0d6efd);
         padding: 0.6rem 1rem;
         border-radius: 0 0.5rem 0.5rem 0;
         margin: 1.5rem 0 0.75rem 0;
         font-size: 1.1rem;
         font-weight: 600;
-        color: #1a1a2e;
+        color: var(--text-color);
     }
-    /* Sensitivity table */
-    .sensitivity-highlight { background-color: #e8f0fe !important; font-weight: 700; }
+    /* Sensitivity table — semi-transparent highlight works in both modes */
+    .sensitivity-highlight { background-color: rgba(13, 110, 253, 0.1) !important; font-weight: 700; }
     .bcr-pass { color: #198754; font-weight: 700; }
     .bcr-fail { color: #dc3545; font-weight: 700; }
 </style>
@@ -442,6 +429,9 @@ st.markdown("""
 with st.sidebar:
     st.markdown("## Transport CBA")
     st.caption("TfNSW Economic Parameter Values (Jan 2025) · June 2024 prices")
+
+    # --- Comparison mode toggle ---
+    comparison_mode = st.toggle("Compare Scenarios", value=False, key="comparison_mode")
 
     # --- Project Details ---
     st.markdown("### Project Details")
@@ -528,6 +518,22 @@ with st.sidebar:
     with col2:
         cycle_km = st.number_input("Daily Cycling (person-km)", 0.0, value=0.0, step=10.0)
 
+    # --- Scenario B overrides (only shown when comparison mode is on) ---
+    if comparison_mode:
+        st.divider()
+        st.markdown("### Scenario B — Overrides")
+        st.caption("Parameters not overridden use Scenario A values")
+        b_name = st.text_input("Project Name (B)", value=project_name + " — Alt", key="b_name")
+        b_col1, b_col2 = st.columns(2)
+        with b_col1:
+            b_cap_construction = st.number_input("Construction ($M)", 0.0, value=cap_construction, step=1.0, key="b_construction")
+            b_speed_project = st.number_input("Project Speed (km/h)", 5.0, 130.0, speed_project, step=1.0, key="b_speed_project")
+            b_traffic_growth = st.number_input("Traffic Growth (%/yr)", 0.0, 10.0, traffic_growth, step=0.1, key="b_growth")
+        with b_col2:
+            b_contingency = st.number_input("Contingency (%)", 0.0, 100.0, contingency, step=1.0, key="b_contingency")
+            b_aadt = st.number_input("Base AADT", 0, value=aadt, step=100, key="b_aadt")
+            b_discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, discount_rate, step=0.5, key="b_dr")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RUN CALCULATION
@@ -551,6 +557,27 @@ inputs = {
 
 results = calculate(inputs)
 
+# Scenario B calculation (if comparison mode)
+results_b = None
+if comparison_mode:
+    inputs_b = inputs.copy()
+    inputs_b.update({
+        "cap_construction": b_cap_construction,
+        "contingency": b_contingency,
+        "speed_project": b_speed_project,
+        "aadt": b_aadt,
+        "traffic_growth": b_traffic_growth,
+        "discount_rate": b_discount_rate,
+    })
+    results_b = calculate(inputs_b)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOTLY LAYOUT DEFAULTS (transparent background for theme compatibility)
+# ─────────────────────────────────────────────────────────────────────────────
+PLOTLY_TRANSPARENT = dict(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -564,24 +591,71 @@ st.markdown(f"""
 # ─────────────────────────────────────────────────────────────────────────────
 # KPI METRICS
 # ─────────────────────────────────────────────────────────────────────────────
-k1, k2, k3, k4, k5, k6 = st.columns(6)
-with k1:
-    st.metric("Net Present Value", format_m(results["npv"]),
-              delta="Positive" if results["npv"] >= 0 else "Negative",
-              delta_color="normal" if results["npv"] >= 0 else "inverse")
-with k2:
-    st.metric("Benefit-Cost Ratio", f"{results['bcr']:.2f}",
-              delta="Above 1.0" if results["bcr"] >= 1 else "Below 1.0",
-              delta_color="normal" if results["bcr"] >= 1 else "inverse")
-with k3:
-    st.metric("PV Benefits", format_m(results["pv_benefits"]))
-with k4:
-    st.metric("PV Costs", format_m(results["pv_costs"]))
-with k5:
-    st.metric("First Year Rate of Return", f"{results['fyrr']:.1f}%")
-with k6:
-    pb = f"{results['payback_year']} years" if results["payback_year"] else "N/A"
-    st.metric("Payback Period", pb)
+if comparison_mode and results_b:
+    # Side-by-side KPIs for comparison mode
+    col_a, col_b, col_delta = st.columns(3)
+    with col_a:
+        st.markdown(f"**Scenario A: {project_name}**")
+        st.metric("NPV", format_m(results["npv"]),
+                  delta="Positive" if results["npv"] >= 0 else "Negative",
+                  delta_color="normal" if results["npv"] >= 0 else "inverse")
+        st.metric("BCR", f"{results['bcr']:.2f}",
+                  delta="Above 1.0" if results["bcr"] >= 1 else "Below 1.0",
+                  delta_color="normal" if results["bcr"] >= 1 else "inverse")
+        st.metric("PV Benefits", format_m(results["pv_benefits"]))
+        st.metric("PV Costs", format_m(results["pv_costs"]))
+        st.metric("FYRR", f"{results['fyrr']:.1f}%")
+        pb_a = f"{results['payback_year']} yrs" if results["payback_year"] else "N/A"
+        st.metric("Payback", pb_a)
+    with col_b:
+        st.markdown(f"**Scenario B: {b_name}**")
+        st.metric("NPV", format_m(results_b["npv"]),
+                  delta="Positive" if results_b["npv"] >= 0 else "Negative",
+                  delta_color="normal" if results_b["npv"] >= 0 else "inverse")
+        st.metric("BCR", f"{results_b['bcr']:.2f}",
+                  delta="Above 1.0" if results_b["bcr"] >= 1 else "Below 1.0",
+                  delta_color="normal" if results_b["bcr"] >= 1 else "inverse")
+        st.metric("PV Benefits", format_m(results_b["pv_benefits"]))
+        st.metric("PV Costs", format_m(results_b["pv_costs"]))
+        st.metric("FYRR", f"{results_b['fyrr']:.1f}%")
+        pb_b = f"{results_b['payback_year']} yrs" if results_b["payback_year"] else "N/A"
+        st.metric("Payback", pb_b)
+    with col_delta:
+        st.markdown("**Delta (B - A)**")
+        delta_npv = results_b["npv"] - results["npv"]
+        st.metric("NPV Delta", format_m(delta_npv),
+                  delta="Better" if delta_npv > 0 else "Worse",
+                  delta_color="normal" if delta_npv > 0 else "inverse")
+        delta_bcr = results_b["bcr"] - results["bcr"]
+        st.metric("BCR Delta", f"{delta_bcr:+.2f}",
+                  delta="Better" if delta_bcr > 0 else "Worse",
+                  delta_color="normal" if delta_bcr > 0 else "inverse")
+        delta_pvb = results_b["pv_benefits"] - results["pv_benefits"]
+        st.metric("PV Benefits Delta", format_m(delta_pvb))
+        delta_pvc = results_b["pv_costs"] - results["pv_costs"]
+        st.metric("PV Costs Delta", format_m(delta_pvc))
+        delta_fyrr = results_b["fyrr"] - results["fyrr"]
+        st.metric("FYRR Delta", f"{delta_fyrr:+.1f}%")
+else:
+    # Standard single-scenario KPIs
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    with k1:
+        st.metric("Net Present Value", format_m(results["npv"]),
+                  delta="Positive" if results["npv"] >= 0 else "Negative",
+                  delta_color="normal" if results["npv"] >= 0 else "inverse")
+    with k2:
+        st.metric("Benefit-Cost Ratio", f"{results['bcr']:.2f}",
+                  delta="Above 1.0" if results["bcr"] >= 1 else "Below 1.0",
+                  delta_color="normal" if results["bcr"] >= 1 else "inverse")
+    with k3:
+        st.metric("PV Benefits", format_m(results["pv_benefits"]))
+    with k4:
+        st.metric("PV Costs", format_m(results["pv_costs"]))
+    with k5:
+        st.metric("First Year Rate of Return", f"{results['fyrr']:.1f}%")
+    with k6:
+        pb = f"{results['payback_year']} years" if results["payback_year"] else "N/A"
+        st.metric("Payback Period", pb)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXPORT BUTTON
@@ -596,304 +670,460 @@ st.download_button(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHARTS — ROW 1: Benefit Composition & NPV Waterfall
+# TABBED LAYOUT
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">Analysis Charts</div>', unsafe_allow_html=True)
+tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
+    ["Dashboard", "Detailed Cashflow", "Sensitivity", "Parameters"]
+)
 
-chart1, chart2 = st.columns(2)
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 1: DASHBOARD — Charts
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_dash:
+    st.markdown('<div class="section-header">Analysis Charts</div>', unsafe_allow_html=True)
 
-with chart1:
-    st.subheader("Benefit Composition (PV $M)")
-    pv = results["pv_by_type"]
-    labels_list = []
-    values_list = []
-    colors_list = []
-    for t in ["tts", "reliability", "voc", "safety", "env", "active"]:
-        if pv[t] > 0:
-            labels_list.append(TYPE_LABELS[t])
-            values_list.append(round(pv[t], 2))
-            colors_list.append(COLORS[t])
-    fig_pie = go.Figure(data=[go.Pie(
-        labels=labels_list, values=values_list,
-        hole=0.45, marker_colors=colors_list,
-        textinfo="label+percent", textposition="outside",
-        pull=[0.03] * len(labels_list),
-    )])
-    fig_pie.update_layout(
-        showlegend=True, height=400,
-        margin=dict(t=20, b=20, l=20, r=20),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.15),
-    )
-    st.plotly_chart(fig_pie, use_container_width=True)
+    chart1, chart2 = st.columns(2)
 
-with chart2:
-    st.subheader("NPV Waterfall ($M)")
-    wf_labels = list(TYPE_LABELS.values()) + ["Total Benefits", "Costs", "NPV"]
-    wf_values = [pv[t] for t in TYPE_LABELS] + [
-        results["pv_benefits"], -results["pv_costs"], results["npv"]
-    ]
-    wf_measures = ["relative"] * 6 + ["total", "relative", "total"]
-    wf_colors = [COLORS[t] for t in TYPE_LABELS] + [
-        COLORS["positive"], COLORS["cost"], COLORS["positive"] if results["npv"] >= 0 else COLORS["negative"]
-    ]
-    fig_wf = go.Figure(go.Waterfall(
-        x=wf_labels, y=wf_values, measure=wf_measures,
-        connector={"line": {"color": "#ced4da"}},
-        increasing={"marker": {"color": COLORS["positive"]}},
-        decreasing={"marker": {"color": COLORS["negative"]}},
-        totals={"marker": {"color": COLORS["neutral"]}},
-        textposition="outside",
-        text=[f"${v:.1f}M" for v in wf_values],
-    ))
-    fig_wf.update_layout(
-        height=400, margin=dict(t=20, b=20, l=20, r=20),
-        yaxis_title="$M", showlegend=False,
-    )
-    st.plotly_chart(fig_wf, use_container_width=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CHARTS — ROW 2: Cashflow Profile & Cumulative
-# ─────────────────────────────────────────────────────────────────────────────
-chart3, chart4 = st.columns(2)
-
-with chart3:
-    st.subheader("Annual Cashflow ($M, undiscounted)")
-    years = list(range(1, results["total_years"] + 1))
-    fig_cf = go.Figure()
-    fig_cf.add_trace(go.Bar(
-        x=years, y=[-c for c in results["annual_costs"]],
-        name="Costs", marker_color=COLORS["negative"], opacity=0.7,
-    ))
-    fig_cf.add_trace(go.Bar(
-        x=years, y=results["annual_benefits"],
-        name="Benefits", marker_color=COLORS["positive"], opacity=0.7,
-    ))
-    fig_cf.add_trace(go.Scatter(
-        x=years, y=results["annual_net"],
-        name="Net", mode="lines+markers",
-        line=dict(color=COLORS["neutral"], width=2),
-        marker=dict(size=4),
-    ))
-    fig_cf.update_layout(
-        barmode="relative", height=400,
-        margin=dict(t=20, b=20, l=20, r=20),
-        xaxis_title="Year", yaxis_title="$M",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig_cf, use_container_width=True)
-
-with chart4:
-    st.subheader("Cumulative Discounted Net Benefits ($M)")
-    fig_cum = go.Figure()
-    # Add a shaded area
-    colors_cum = [COLORS["positive"] if v >= 0 else COLORS["negative"] for v in results["cum_disc_net"]]
-    fig_cum.add_trace(go.Scatter(
-        x=years, y=results["cum_disc_net"],
-        fill="tozeroy", mode="lines",
-        line=dict(color=COLORS["neutral"], width=2.5),
-        fillcolor="rgba(13, 110, 253, 0.15)",
-        name="Cumulative NPV",
-    ))
-    fig_cum.add_hline(y=0, line_dash="dash", line_color="#6c757d", opacity=0.5)
-    if results["payback_year"]:
-        fig_cum.add_vline(
-            x=results["payback_year"], line_dash="dot",
-            line_color=COLORS["positive"], opacity=0.7,
-            annotation_text=f"Payback: Year {results['payback_year']}",
-            annotation_position="top right",
+    with chart1:
+        st.subheader("Benefit Composition (PV $M)")
+        pv = results["pv_by_type"]
+        labels_list = []
+        values_list = []
+        colors_list = []
+        for t in ["tts", "reliability", "voc", "safety", "env", "active"]:
+            if pv[t] > 0:
+                labels_list.append(TYPE_LABELS[t])
+                values_list.append(round(pv[t], 2))
+                colors_list.append(COLORS[t])
+        fig_pie = go.Figure(data=[go.Pie(
+            labels=labels_list, values=values_list,
+            hole=0.45, marker_colors=colors_list,
+            textinfo="label+percent", textposition="outside",
+            pull=[0.03] * len(labels_list),
+        )])
+        fig_pie.update_layout(
+            showlegend=True, height=400,
+            margin=dict(t=20, b=20, l=20, r=20),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.15),
+            **PLOTLY_TRANSPARENT,
         )
-    fig_cum.update_layout(
-        height=400, margin=dict(t=20, b=20, l=20, r=20),
-        xaxis_title="Year", yaxis_title="$M",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    st.plotly_chart(fig_cum, use_container_width=True)
+        st.plotly_chart(fig_pie, use_container_width=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SENSITIVITY ANALYSIS
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">Sensitivity Analysis</div>', unsafe_allow_html=True)
-
-sen1, sen2 = st.columns(2)
-
-with sen1:
-    st.subheader("Discount Rate Sensitivity (BCR)")
-    dr_rates = sorted(results["sensitivity_dr"].keys())
-    dr_bcrs = [results["sensitivity_dr"][r]["bcr"] for r in dr_rates]
-    bar_colors = [COLORS["positive"] if b >= 1 else COLORS["negative"] for b in dr_bcrs]
-    fig_dr = go.Figure(go.Bar(
-        x=[f"{r}%" for r in dr_rates], y=dr_bcrs,
-        marker_color=bar_colors,
-        text=[f"{b:.2f}" for b in dr_bcrs], textposition="outside",
-    ))
-    fig_dr.add_hline(y=1.0, line_dash="dash", line_color="#6c757d",
-                     annotation_text="BCR = 1.0", annotation_position="bottom right")
-    fig_dr.update_layout(
-        height=380, margin=dict(t=20, b=20, l=20, r=20),
-        xaxis_title="Discount Rate", yaxis_title="BCR", showlegend=False,
-    )
-    st.plotly_chart(fig_dr, use_container_width=True)
-
-with sen2:
-    st.subheader("Switching Values (% change for BCR = 1.0)")
-    sw = results["switching"]
-    if sw:
-        sw_labels = list(sw.keys())
-        sw_values = list(sw.values())
-        sw_colors = [COLORS["negative"] if v < 0 else COLORS["positive"] for v in sw_values]
-        fig_sw = go.Figure(go.Bar(
-            y=sw_labels, x=sw_values, orientation="h",
-            marker_color=sw_colors,
-            text=[f"{v:+.1f}%" for v in sw_values], textposition="outside",
+    with chart2:
+        st.subheader("NPV Waterfall ($M)")
+        wf_labels = list(TYPE_LABELS.values()) + ["Total Benefits", "Costs", "NPV"]
+        wf_values = [pv[t] for t in TYPE_LABELS] + [
+            results["pv_benefits"], -results["pv_costs"], results["npv"]
+        ]
+        wf_measures = ["relative"] * 6 + ["total", "relative", "total"]
+        fig_wf = go.Figure(go.Waterfall(
+            x=wf_labels, y=wf_values, measure=wf_measures,
+            connector={"line": {"color": "#ced4da"}},
+            increasing={"marker": {"color": COLORS["positive"]}},
+            decreasing={"marker": {"color": COLORS["negative"]}},
+            totals={"marker": {"color": COLORS["neutral"]}},
+            textposition="outside",
+            text=[f"${v:.1f}M" for v in wf_values],
         ))
-        fig_sw.add_vline(x=0, line_color="#6c757d")
-        fig_sw.update_layout(
-            height=380, margin=dict(t=20, b=20, l=60, r=60),
-            xaxis_title="% Change Required", showlegend=False,
+        fig_wf.update_layout(
+            height=400, margin=dict(t=20, b=20, l=20, r=20),
+            yaxis_title="$M", showlegend=False,
+            **PLOTLY_TRANSPARENT,
         )
-        st.plotly_chart(fig_sw, use_container_width=True)
-    else:
-        st.info("Insufficient data for switching values.")
+        st.plotly_chart(fig_wf, use_container_width=True)
 
-# --- Sensitivity Table ---
-st.subheader("Scenario Analysis")
-rows = []
-for r_val in sorted(results["sensitivity_dr"].keys()):
-    v = results["sensitivity_dr"][r_val]
-    rows.append({
-        "Scenario": f"Discount Rate {r_val}%",
-        "PV Benefits ($M)": round(v["pvb"], 1),
-        "PV Costs ($M)": round(v["pvc"], 1),
-        "NPV ($M)": round(v["npv"], 1),
-        "BCR": round(v["bcr"], 2),
-    })
-for label, v in results["scenarios"].items():
-    rows.append({
-        "Scenario": f"Demand {label}",
-        "PV Benefits ($M)": round(v["pvb"], 1),
-        "PV Costs ($M)": round(v["pvc"], 1),
-        "NPV ($M)": round(v["npv"], 1),
-        "BCR": round(v["bcr"], 2),
-    })
-df_sens = pd.DataFrame(rows)
+    # --- Row 2: Cashflow & Cumulative ---
+    chart3, chart4 = st.columns(2)
+    years = list(range(1, results["total_years"] + 1))
 
-def highlight_rows(row):
-    styles = [""] * len(row)
-    if f"Discount Rate {int(discount_rate)}%" in row["Scenario"] or row["Scenario"] == "Demand Central":
-        styles = ["background-color: #e8f0fe; font-weight: 700"] * len(row)
-    bcr_idx = df_sens.columns.get_loc("BCR")
-    if row["BCR"] >= 1:
-        styles[bcr_idx] += "; color: #198754; font-weight: 700"
-    else:
-        styles[bcr_idx] += "; color: #dc3545; font-weight: 700"
-    return styles
+    with chart3:
+        st.subheader("Annual Cashflow ($M, undiscounted)")
+        fig_cf = go.Figure()
+        fig_cf.add_trace(go.Bar(
+            x=years, y=[-c for c in results["annual_costs"]],
+            name="Costs", marker_color=COLORS["negative"], opacity=0.7,
+        ))
+        fig_cf.add_trace(go.Bar(
+            x=years, y=results["annual_benefits"],
+            name="Benefits", marker_color=COLORS["positive"], opacity=0.7,
+        ))
+        fig_cf.add_trace(go.Scatter(
+            x=years, y=results["annual_net"],
+            name="Net", mode="lines+markers",
+            line=dict(color=COLORS["neutral"], width=2),
+            marker=dict(size=4),
+        ))
+        fig_cf.update_layout(
+            barmode="relative", height=400,
+            margin=dict(t=20, b=20, l=20, r=20),
+            xaxis_title="Year", yaxis_title="$M",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            **PLOTLY_TRANSPARENT,
+        )
+        st.plotly_chart(fig_cf, use_container_width=True)
 
-styled = df_sens.style.apply(highlight_rows, axis=1).format({
-    "PV Benefits ($M)": "{:.1f}",
-    "PV Costs ($M)": "{:.1f}",
-    "NPV ($M)": "{:.1f}",
-    "BCR": "{:.2f}",
-})
-st.dataframe(styled, use_container_width=True, hide_index=True)
+    with chart4:
+        st.subheader("Cumulative Discounted Net Benefits ($M)")
+        fig_cum = go.Figure()
+        fig_cum.add_trace(go.Scatter(
+            x=years, y=results["cum_disc_net"],
+            fill="tozeroy", mode="lines",
+            line=dict(color=COLORS["neutral"], width=2.5),
+            fillcolor="rgba(13, 110, 253, 0.15)",
+            name="Scenario A" if comparison_mode else "Cumulative NPV",
+        ))
+        # Overlay Scenario B if comparison mode
+        if comparison_mode and results_b:
+            years_b = list(range(1, results_b["total_years"] + 1))
+            fig_cum.add_trace(go.Scatter(
+                x=years_b, y=results_b["cum_disc_net"],
+                mode="lines", name="Scenario B",
+                line=dict(color="#fd7e14", width=2.5, dash="dash"),
+            ))
+        fig_cum.add_hline(y=0, line_dash="dash", line_color="#6c757d", opacity=0.5)
+        if results["payback_year"]:
+            fig_cum.add_vline(
+                x=results["payback_year"], line_dash="dot",
+                line_color=COLORS["positive"], opacity=0.7,
+                annotation_text=f"Payback: Year {results['payback_year']}",
+                annotation_position="top right",
+            )
+        fig_cum.update_layout(
+            height=400, margin=dict(t=20, b=20, l=20, r=20),
+            xaxis_title="Year", yaxis_title="$M",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            **PLOTLY_TRANSPARENT,
+        )
+        st.plotly_chart(fig_cum, use_container_width=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIRST-YEAR BENEFIT BREAKDOWN
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
-fy = results["first_year"]
-fy_cols = st.columns(7)
-for i, (key, label) in enumerate(TYPE_LABELS.items()):
-    with fy_cols[i]:
-        st.metric(label, f"${fy[key]:.2f}M")
-with fy_cols[6]:
-    st.metric("Total", f"${fy['total']:.2f}M")
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 2: DETAILED CASHFLOW
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_cashflow:
+    st.markdown('<div class="section-header">Year-by-Year Cashflow</div>', unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PARAMETER REFERENCE (collapsible)
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">TfNSW Economic Parameter Values Reference</div>', unsafe_allow_html=True)
-st.caption("Source: TfNSW Economic Parameter Values (January 2025), indexed to June 2024 prices.")
+    view_mode = st.radio("Values", ["Undiscounted", "Discounted"], horizontal=True, key="cf_view")
+    years_list = list(range(1, results["total_years"] + 1))
 
-with st.expander("Value of Travel Time Savings ($/person-hour)"):
-    vtts_df = pd.DataFrame({
-        "Trip Purpose": ["Commute", "Business", "Other / Private"],
-        "Urban": [f"${PARAMS['vtts']['urban'][k]:.2f}" for k in ["commute", "business", "other"]],
-        "Rural": [f"${PARAMS['vtts']['rural'][k]:.2f}" for k in ["commute", "business", "other"]],
-    })
-    st.dataframe(vtts_df, hide_index=True, use_container_width=True)
-
-with st.expander("Vehicle Operating Costs — Urban ($/vehicle-km)"):
-    speeds_urban = [40, 50, 60, 70, 80, 90, 100]
-    voc_rows = []
-    for s in speeds_urban:
-        voc_rows.append({
-            "Speed (km/h)": s,
-            "Car": PARAMS["voc"]["urban"]["car"].get(s, "–"),
-            "LGV": PARAMS["voc"]["urban"]["lgv"].get(s, "–"),
-            "Rigid Truck": PARAMS["voc"]["urban"]["rigid"].get(s, "–"),
-            "Articulated Truck": PARAMS["voc"]["urban"]["artic"].get(s, "–"),
+    if view_mode == "Undiscounted":
+        df_cf = pd.DataFrame({
+            "Year": years_list,
+            "Costs ($M)": [round(c, 3) for c in results["annual_costs"]],
+            "Benefits ($M)": [round(b, 3) for b in results["annual_benefits"]],
+            "TTS ($M)": [round(v, 3) for v in results["benefits_by_type"]["tts"]],
+            "Reliability ($M)": [round(v, 3) for v in results["benefits_by_type"]["reliability"]],
+            "VOC ($M)": [round(v, 3) for v in results["benefits_by_type"]["voc"]],
+            "Safety ($M)": [round(v, 3) for v in results["benefits_by_type"]["safety"]],
+            "Environmental ($M)": [round(v, 3) for v in results["benefits_by_type"]["env"]],
+            "Active Transport ($M)": [round(v, 3) for v in results["benefits_by_type"]["active"]],
+            "Net ($M)": [round(n, 3) for n in results["annual_net"]],
         })
-    st.dataframe(pd.DataFrame(voc_rows), hide_index=True, use_container_width=True)
-
-with st.expander("Vehicle Operating Costs — Rural ($/vehicle-km)"):
-    speeds_rural = [60, 80, 100, 110]
-    voc_rows_r = []
-    for s in speeds_rural:
-        voc_rows_r.append({
-            "Speed (km/h)": s,
-            "Car": PARAMS["voc"]["rural"]["car"].get(s, "–"),
-            "LGV": PARAMS["voc"]["rural"]["lgv"].get(s, "–"),
-            "Rigid Truck": PARAMS["voc"]["rural"]["rigid"].get(s, "–"),
-            "Articulated Truck": PARAMS["voc"]["rural"]["artic"].get(s, "–"),
+    else:
+        df_cf = pd.DataFrame({
+            "Year": years_list,
+            "Costs ($M)": [round(c, 3) for c in results["disc_costs"]],
+            "Benefits ($M)": [round(b, 3) for b in results["disc_benefits"]],
+            "Net ($M)": [round(n, 3) for n in results["disc_net"]],
+            "Cumulative Net ($M)": [round(c, 3) for c in results["cum_disc_net"]],
         })
-    st.dataframe(pd.DataFrame(voc_rows_r), hide_index=True, use_container_width=True)
 
-with st.expander("Crash Costs ($/crash)"):
-    crash_df = pd.DataFrame({
-        "Severity": ["Fatal", "Serious Injury", "Moderate Injury", "Minor Injury", "Property Damage Only"],
-        "Cost per Crash": [
-            f"${PARAMS['crash_costs']['fatal']:,.0f}",
-            f"${PARAMS['crash_costs']['serious']:,.0f}",
-            f"${PARAMS['crash_costs']['moderate']:,.0f}",
-            f"${PARAMS['crash_costs']['minor']:,.0f}",
-            f"${PARAMS['crash_costs']['pdo']:,.0f}",
-        ],
+    st.dataframe(df_cf, use_container_width=True, hide_index=True)
+
+    # Download for this table
+    cf_csv = df_cf.to_csv(index=False)
+    st.download_button(
+        f"Download {view_mode} Cashflow CSV",
+        cf_csv,
+        file_name=f"cashflow-{view_mode.lower()}.csv",
+        mime="text/csv",
+        key="dl_cashflow",
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 3: SENSITIVITY
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_sensitivity:
+    # --- Existing sensitivity charts ---
+    st.markdown('<div class="section-header">Sensitivity Analysis</div>', unsafe_allow_html=True)
+
+    sen1, sen2 = st.columns(2)
+
+    with sen1:
+        st.subheader("Discount Rate Sensitivity (BCR)")
+        dr_rates = sorted(results["sensitivity_dr"].keys())
+        dr_bcrs = [results["sensitivity_dr"][r]["bcr"] for r in dr_rates]
+        bar_colors = [COLORS["positive"] if b >= 1 else COLORS["negative"] for b in dr_bcrs]
+        fig_dr = go.Figure(go.Bar(
+            x=[f"{r}%" for r in dr_rates], y=dr_bcrs,
+            marker_color=bar_colors,
+            text=[f"{b:.2f}" for b in dr_bcrs], textposition="outside",
+        ))
+        fig_dr.add_hline(y=1.0, line_dash="dash", line_color="#6c757d",
+                         annotation_text="BCR = 1.0", annotation_position="bottom right")
+        fig_dr.update_layout(
+            height=380, margin=dict(t=20, b=20, l=20, r=20),
+            xaxis_title="Discount Rate", yaxis_title="BCR", showlegend=False,
+            **PLOTLY_TRANSPARENT,
+        )
+        st.plotly_chart(fig_dr, use_container_width=True)
+
+    with sen2:
+        st.subheader("Switching Values (% change for BCR = 1.0)")
+        sw = results["switching"]
+        if sw:
+            sw_labels = list(sw.keys())
+            sw_values = list(sw.values())
+            sw_colors = [COLORS["negative"] if v < 0 else COLORS["positive"] for v in sw_values]
+            fig_sw = go.Figure(go.Bar(
+                y=sw_labels, x=sw_values, orientation="h",
+                marker_color=sw_colors,
+                text=[f"{v:+.1f}%" for v in sw_values], textposition="outside",
+            ))
+            fig_sw.add_vline(x=0, line_color="#6c757d")
+            fig_sw.update_layout(
+                height=380, margin=dict(t=20, b=20, l=60, r=60),
+                xaxis_title="% Change Required", showlegend=False,
+                **PLOTLY_TRANSPARENT,
+            )
+            st.plotly_chart(fig_sw, use_container_width=True)
+        else:
+            st.info("Insufficient data for switching values.")
+
+    # --- Scenario Analysis Table ---
+    st.subheader("Scenario Analysis")
+    rows = []
+    for r_val in sorted(results["sensitivity_dr"].keys()):
+        v = results["sensitivity_dr"][r_val]
+        rows.append({
+            "Scenario": f"Discount Rate {r_val}%",
+            "PV Benefits ($M)": round(v["pvb"], 1),
+            "PV Costs ($M)": round(v["pvc"], 1),
+            "NPV ($M)": round(v["npv"], 1),
+            "BCR": round(v["bcr"], 2),
+        })
+    for label, v in results["scenarios"].items():
+        rows.append({
+            "Scenario": f"Demand {label}",
+            "PV Benefits ($M)": round(v["pvb"], 1),
+            "PV Costs ($M)": round(v["pvc"], 1),
+            "NPV ($M)": round(v["npv"], 1),
+            "BCR": round(v["bcr"], 2),
+        })
+    df_sens = pd.DataFrame(rows)
+
+    def highlight_rows(row):
+        styles = [""] * len(row)
+        if f"Discount Rate {int(discount_rate)}%" in row["Scenario"] or row["Scenario"] == "Demand Central":
+            styles = ["background-color: rgba(13, 110, 253, 0.1); font-weight: 700"] * len(row)
+        bcr_idx = df_sens.columns.get_loc("BCR")
+        if row["BCR"] >= 1:
+            styles[bcr_idx] += "; color: #198754; font-weight: 700"
+        else:
+            styles[bcr_idx] += "; color: #dc3545; font-weight: 700"
+        return styles
+
+    styled = df_sens.style.apply(highlight_rows, axis=1).format({
+        "PV Benefits ($M)": "{:.1f}",
+        "PV Costs ($M)": "{:.1f}",
+        "NPV ($M)": "{:.1f}",
+        "BCR": "{:.2f}",
     })
-    st.dataframe(crash_df, hide_index=True, use_container_width=True)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
-with st.expander("Environmental Externalities"):
-    env_df = pd.DataFrame([
-        {"Parameter": "CO₂ Social Cost ($/tonne)", "Urban": f"${PARAMS['carbon_per_tonne']}", "Rural": f"${PARAMS['carbon_per_tonne']}"},
-        {"Parameter": "Air Pollution — Car ($/veh-km)", "Urban": f"${PARAMS['air_pollution']['urban']['car']:.3f}", "Rural": f"${PARAMS['air_pollution']['rural']['car']:.3f}"},
-        {"Parameter": "Air Pollution — Rigid Truck ($/veh-km)", "Urban": f"${PARAMS['air_pollution']['urban']['rigid']:.3f}", "Rural": f"${PARAMS['air_pollution']['rural']['rigid']:.3f}"},
-        {"Parameter": "Noise — Car ($/veh-km)", "Urban": f"${PARAMS['noise']['urban']['car']:.3f}", "Rural": f"${PARAMS['noise']['rural']['car']:.3f}"},
-        {"Parameter": "Noise — Heavy Vehicle ($/veh-km)", "Urban": f"${PARAMS['noise']['urban']['rigid']:.3f}", "Rural": f"${PARAMS['noise']['rural']['rigid']:.3f}"},
-    ])
-    st.dataframe(env_df, hide_index=True, use_container_width=True)
+    # --- First-Year Benefit Breakdown ---
+    st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
+    fy = results["first_year"]
+    fy_cols = st.columns(7)
+    for i, (key, label) in enumerate(TYPE_LABELS.items()):
+        with fy_cols[i]:
+            st.metric(label, f"${fy[key]:.2f}M")
+    with fy_cols[6]:
+        st.metric("Total", f"${fy['total']:.2f}M")
 
-with st.expander("Active Transport Health Benefits ($/person-km)"):
-    health_df = pd.DataFrame({
-        "Mode": ["Walking", "Cycling"],
-        "Health Benefit": [f"${PARAMS['health_benefits']['walking']:.2f}", f"${PARAMS['health_benefits']['cycling']:.2f}"],
-    })
-    st.dataframe(health_df, hide_index=True, use_container_width=True)
+    # ─────────────────────────────────────────────────────────────────────────
+    # INTERACTIVE SENSITIVITY SLIDERS + TORNADO CHART
+    # ─────────────────────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header">Interactive Parameter Sensitivity</div>', unsafe_allow_html=True)
+    st.caption("Drag sliders to explore how each parameter affects the BCR. "
+               "The tornado chart shows the BCR range from varying each parameter independently.")
 
-with st.expander("Other Key Parameters"):
-    other_df = pd.DataFrame({
-        "Parameter": ["Value of Statistical Life (VSL)", "Reliability Ratio", "Central Discount Rate",
-                       "Low Discount Rate (sensitivity)", "High Discount Rate (sensitivity)", "Working Days per Year"],
-        "Value": [f"${PARAMS['vsl']/1e6:.1f}M", f"{PARAMS['reliability_ratio']}", "7%", "4%", "10%",
-                  f"{PARAMS['working_days_per_year']}"],
-    })
-    st.dataframe(other_df, hide_index=True, use_container_width=True)
+    sens_params = {
+        "AADT": {"key": "aadt", "min_val": max(1000, int(aadt * 0.5)), "max_val": int(aadt * 1.5),
+                 "default": aadt, "step": 500},
+        "Traffic Growth (%/yr)": {"key": "traffic_growth", "min_val": 0.0, "max_val": 5.0,
+                                   "default": traffic_growth, "step": 0.1},
+        "Construction Cost ($M)": {"key": "cap_construction", "min_val": max(1.0, cap_construction * 0.5),
+                                    "max_val": cap_construction * 1.5, "default": cap_construction, "step": 1.0},
+        "Discount Rate (%)": {"key": "discount_rate", "min_val": 3.0, "max_val": 12.0,
+                               "default": discount_rate, "step": 0.5},
+        "Evaluation Period (yrs)": {"key": "evaluation_period", "min_val": 10, "max_val": 50,
+                                     "default": eval_period, "step": 1},
+    }
 
-with st.expander("Default Traffic Composition (%)"):
-    comp_df = pd.DataFrame({
-        "Vehicle Type": ["Car", "Light Commercial", "Rigid Truck", "Articulated Truck"],
-        "Urban": [f"{PARAMS['traffic_composition']['urban'][k]*100:.0f}%" for k in ["car", "lgv", "rigid", "artic"]],
-        "Rural": [f"{PARAMS['traffic_composition']['rural'][k]*100:.0f}%" for k in ["car", "lgv", "rigid", "artic"]],
-    })
-    st.dataframe(comp_df, hide_index=True, use_container_width=True)
+    sl1, sl2 = st.columns(2)
+    slider_values = {}
+    for i, (label, cfg) in enumerate(sens_params.items()):
+        col = sl1 if i % 2 == 0 else sl2
+        with col:
+            slider_values[cfg["key"]] = st.slider(
+                label, min_value=cfg["min_val"], max_value=cfg["max_val"],
+                value=cfg["default"], step=cfg["step"],
+                key=f"sens_{cfg['key']}"
+            )
+
+    # Compute tornado data
+    baseline_bcr = results["bcr"]
+    tornado_data = []
+
+    for label, cfg in sens_params.items():
+        inputs_low = inputs.copy()
+        inputs_low[cfg["key"]] = cfg["min_val"]
+        bcr_low = calculate(inputs_low)["bcr"]
+
+        inputs_high = inputs.copy()
+        inputs_high[cfg["key"]] = cfg["max_val"]
+        bcr_high = calculate(inputs_high)["bcr"]
+
+        tornado_data.append({
+            "param": label,
+            "bcr_low": min(bcr_low, bcr_high),
+            "bcr_high": max(bcr_low, bcr_high),
+            "range": abs(bcr_high - bcr_low),
+        })
+
+    tornado_data.sort(key=lambda x: x["range"], reverse=True)
+
+    fig_tornado = go.Figure()
+    for item in tornado_data:
+        fig_tornado.add_trace(go.Bar(
+            y=[item["param"]],
+            x=[item["bcr_high"] - baseline_bcr],
+            base=[baseline_bcr],
+            orientation="h",
+            marker_color=COLORS["positive"],
+            showlegend=False,
+        ))
+        fig_tornado.add_trace(go.Bar(
+            y=[item["param"]],
+            x=[item["bcr_low"] - baseline_bcr],
+            base=[baseline_bcr],
+            orientation="h",
+            marker_color=COLORS["negative"],
+            showlegend=False,
+        ))
+
+    fig_tornado.add_vline(x=baseline_bcr, line_dash="dash", line_color="#6c757d",
+                          annotation_text=f"Baseline BCR: {baseline_bcr:.2f}")
+    fig_tornado.update_layout(
+        height=350, barmode="overlay",
+        xaxis_title="BCR", yaxis_title="",
+        margin=dict(t=30, b=30, l=150, r=30),
+        **PLOTLY_TRANSPARENT,
+    )
+    st.plotly_chart(fig_tornado, use_container_width=True)
+
+    # What-if calculation using all slider values simultaneously
+    inputs_whatif = inputs.copy()
+    for cfg in sens_params.values():
+        inputs_whatif[cfg["key"]] = slider_values[cfg["key"]]
+    results_whatif = calculate(inputs_whatif)
+
+    wi1, wi2, wi3 = st.columns(3)
+    with wi1:
+        st.metric("What-If BCR", f"{results_whatif['bcr']:.2f}",
+                  delta=f"{results_whatif['bcr'] - baseline_bcr:+.2f} vs baseline")
+    with wi2:
+        st.metric("What-If NPV", format_m(results_whatif["npv"]))
+    with wi3:
+        st.metric("What-If PV Benefits", format_m(results_whatif["pv_benefits"]))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4: PARAMETERS REFERENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_params:
+    st.markdown('<div class="section-header">TfNSW Economic Parameter Values Reference</div>', unsafe_allow_html=True)
+    st.caption("Source: TfNSW Economic Parameter Values (January 2025), indexed to June 2024 prices.")
+
+    with st.expander("Value of Travel Time Savings ($/person-hour)"):
+        vtts_df = pd.DataFrame({
+            "Trip Purpose": ["Commute", "Business", "Other / Private"],
+            "Urban": [f"${PARAMS['vtts']['urban'][k]:.2f}" for k in ["commute", "business", "other"]],
+            "Rural": [f"${PARAMS['vtts']['rural'][k]:.2f}" for k in ["commute", "business", "other"]],
+        })
+        st.dataframe(vtts_df, hide_index=True, use_container_width=True)
+
+    with st.expander("Vehicle Operating Costs — Urban ($/vehicle-km)"):
+        speeds_urban = [40, 50, 60, 70, 80, 90, 100]
+        voc_rows = []
+        for s in speeds_urban:
+            voc_rows.append({
+                "Speed (km/h)": s,
+                "Car": PARAMS["voc"]["urban"]["car"].get(s, "–"),
+                "LGV": PARAMS["voc"]["urban"]["lgv"].get(s, "–"),
+                "Rigid Truck": PARAMS["voc"]["urban"]["rigid"].get(s, "–"),
+                "Articulated Truck": PARAMS["voc"]["urban"]["artic"].get(s, "–"),
+            })
+        st.dataframe(pd.DataFrame(voc_rows), hide_index=True, use_container_width=True)
+
+    with st.expander("Vehicle Operating Costs — Rural ($/vehicle-km)"):
+        speeds_rural = [60, 80, 100, 110]
+        voc_rows_r = []
+        for s in speeds_rural:
+            voc_rows_r.append({
+                "Speed (km/h)": s,
+                "Car": PARAMS["voc"]["rural"]["car"].get(s, "–"),
+                "LGV": PARAMS["voc"]["rural"]["lgv"].get(s, "–"),
+                "Rigid Truck": PARAMS["voc"]["rural"]["rigid"].get(s, "–"),
+                "Articulated Truck": PARAMS["voc"]["rural"]["artic"].get(s, "–"),
+            })
+        st.dataframe(pd.DataFrame(voc_rows_r), hide_index=True, use_container_width=True)
+
+    with st.expander("Crash Costs ($/crash)"):
+        crash_df = pd.DataFrame({
+            "Severity": ["Fatal", "Serious Injury", "Moderate Injury", "Minor Injury", "Property Damage Only"],
+            "Cost per Crash": [
+                f"${PARAMS['crash_costs']['fatal']:,.0f}",
+                f"${PARAMS['crash_costs']['serious']:,.0f}",
+                f"${PARAMS['crash_costs']['moderate']:,.0f}",
+                f"${PARAMS['crash_costs']['minor']:,.0f}",
+                f"${PARAMS['crash_costs']['pdo']:,.0f}",
+            ],
+        })
+        st.dataframe(crash_df, hide_index=True, use_container_width=True)
+
+    with st.expander("Environmental Externalities"):
+        env_df = pd.DataFrame([
+            {"Parameter": "CO₂ Social Cost ($/tonne)", "Urban": f"${PARAMS['carbon_per_tonne']}", "Rural": f"${PARAMS['carbon_per_tonne']}"},
+            {"Parameter": "Air Pollution — Car ($/veh-km)", "Urban": f"${PARAMS['air_pollution']['urban']['car']:.3f}", "Rural": f"${PARAMS['air_pollution']['rural']['car']:.3f}"},
+            {"Parameter": "Air Pollution — Rigid Truck ($/veh-km)", "Urban": f"${PARAMS['air_pollution']['urban']['rigid']:.3f}", "Rural": f"${PARAMS['air_pollution']['rural']['rigid']:.3f}"},
+            {"Parameter": "Noise — Car ($/veh-km)", "Urban": f"${PARAMS['noise']['urban']['car']:.3f}", "Rural": f"${PARAMS['noise']['rural']['car']:.3f}"},
+            {"Parameter": "Noise — Heavy Vehicle ($/veh-km)", "Urban": f"${PARAMS['noise']['urban']['rigid']:.3f}", "Rural": f"${PARAMS['noise']['rural']['rigid']:.3f}"},
+        ])
+        st.dataframe(env_df, hide_index=True, use_container_width=True)
+
+    with st.expander("Active Transport Health Benefits ($/person-km)"):
+        health_df = pd.DataFrame({
+            "Mode": ["Walking", "Cycling"],
+            "Health Benefit": [f"${PARAMS['health_benefits']['walking']:.2f}", f"${PARAMS['health_benefits']['cycling']:.2f}"],
+        })
+        st.dataframe(health_df, hide_index=True, use_container_width=True)
+
+    with st.expander("Other Key Parameters"):
+        other_df = pd.DataFrame({
+            "Parameter": ["Value of Statistical Life (VSL)", "Reliability Ratio", "Central Discount Rate",
+                           "Low Discount Rate (sensitivity)", "High Discount Rate (sensitivity)", "Working Days per Year"],
+            "Value": [f"${PARAMS['vsl']/1e6:.1f}M", f"{PARAMS['reliability_ratio']}", "7%", "4%", "10%",
+                      f"{PARAMS['working_days_per_year']}"],
+        })
+        st.dataframe(other_df, hide_index=True, use_container_width=True)
+
+    with st.expander("Default Traffic Composition (%)"):
+        comp_df = pd.DataFrame({
+            "Vehicle Type": ["Car", "Light Commercial", "Rigid Truck", "Articulated Truck"],
+            "Urban": [f"{PARAMS['traffic_composition']['urban'][k]*100:.0f}%" for k in ["car", "lgv", "rigid", "artic"]],
+            "Rural": [f"{PARAMS['traffic_composition']['rural'][k]*100:.0f}%" for k in ["car", "lgv", "rigid", "artic"]],
+        })
+        st.dataframe(comp_df, hide_index=True, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOOTER
