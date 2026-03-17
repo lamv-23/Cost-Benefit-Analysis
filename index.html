@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transport CBA Dashboard — TfNSW Framework</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js"></script>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <header>
+        <div class="header-inner">
+            <div class="header-left">
+                <h1>Transport Cost-Benefit Analysis</h1>
+                <p class="subtitle">TfNSW Economic Parameter Values (Jan 2025) · June 2024 prices</p>
+            </div>
+            <div class="header-right">
+                <button id="btnExportPdf" class="btn btn-outline" onclick="window.print()">Print / PDF</button>
+                <button id="btnExportCsv" class="btn btn-primary" onclick="CBA.exportCSV()">Export CSV</button>
+            </div>
+        </div>
+    </header>
+
+    <main>
+        <!-- PROJECT DETAILS -->
+        <section class="card" id="project-details">
+            <h2>Project Details</h2>
+            <div class="form-grid cols-3">
+                <div class="form-group">
+                    <label for="projectName">Project Name</label>
+                    <input type="text" id="projectName" value="Sample Road Upgrade" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="evaluationPeriod">Evaluation Period (years)</label>
+                    <input type="number" id="evaluationPeriod" value="30" min="1" max="50" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="constructionYears">Construction Period (years)</label>
+                    <input type="number" id="constructionYears" value="3" min="1" max="10" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="baseYear">Base Year</label>
+                    <input type="number" id="baseYear" value="2026" min="2020" max="2040" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="discountRate">Discount Rate (%)</label>
+                    <input type="number" id="discountRate" value="7" min="0" max="20" step="0.5" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="projectContext">Context</label>
+                    <select id="projectContext" onchange="CBA.calculate()">
+                        <option value="urban" selected>Urban</option>
+                        <option value="rural">Rural</option>
+                    </select>
+                </div>
+            </div>
+        </section>
+
+        <!-- CAPITAL & OPERATING COSTS -->
+        <section class="card" id="costs-section">
+            <h2>Costs</h2>
+            <div class="form-grid cols-2">
+                <div class="cost-block">
+                    <h3>Capital Costs ($M, undiscounted)</h3>
+                    <div class="form-group">
+                        <label for="capitalPlanning">Planning &amp; Design</label>
+                        <input type="number" id="capitalPlanning" value="5" min="0" step="0.1" oninput="CBA.calculate()">
+                    </div>
+                    <div class="form-group">
+                        <label for="capitalLand">Land Acquisition</label>
+                        <input type="number" id="capitalLand" value="10" min="0" step="0.1" oninput="CBA.calculate()">
+                    </div>
+                    <div class="form-group">
+                        <label for="capitalConstruction">Construction</label>
+                        <input type="number" id="capitalConstruction" value="120" min="0" step="0.1" oninput="CBA.calculate()">
+                    </div>
+                    <div class="form-group">
+                        <label for="capitalContingency">Contingency (%)</label>
+                        <input type="number" id="capitalContingency" value="20" min="0" max="100" step="1" oninput="CBA.calculate()">
+                    </div>
+                </div>
+                <div class="cost-block">
+                    <h3>Recurrent Costs ($M/year, undiscounted)</h3>
+                    <div class="form-group">
+                        <label for="opexMaintenance">Maintenance</label>
+                        <input type="number" id="opexMaintenance" value="1.5" min="0" step="0.1" oninput="CBA.calculate()">
+                    </div>
+                    <div class="form-group">
+                        <label for="opexOperating">Operating</label>
+                        <input type="number" id="opexOperating" value="0.8" min="0" step="0.1" oninput="CBA.calculate()">
+                    </div>
+                    <div class="form-group">
+                        <label for="residualValue">Residual Value ($M)</label>
+                        <input type="number" id="residualValue" value="15" min="0" step="0.1" oninput="CBA.calculate()">
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- TRAFFIC & DEMAND -->
+        <section class="card" id="demand-section">
+            <h2>Traffic &amp; Demand</h2>
+            <div class="form-grid cols-3">
+                <div class="form-group">
+                    <label for="aadtBase">Base AADT (vehicles/day)</label>
+                    <input type="number" id="aadtBase" value="25000" min="0" step="100" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="trafficGrowth">Traffic Growth (%/year)</label>
+                    <input type="number" id="trafficGrowth" value="1.5" min="0" max="10" step="0.1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="avgTripLength">Average Trip Length (km)</label>
+                    <input type="number" id="avgTripLength" value="12" min="0.1" step="0.1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="avgOccupancy">Avg Vehicle Occupancy</label>
+                    <input type="number" id="avgOccupancy" value="1.4" min="1" max="5" step="0.1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="pctCommute">% Commute Trips</label>
+                    <input type="number" id="pctCommute" value="35" min="0" max="100" step="1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="pctBusiness">% Business Trips</label>
+                    <input type="number" id="pctBusiness" value="15" min="0" max="100" step="1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="pctHeavyVehicles">% Heavy Vehicles</label>
+                    <input type="number" id="pctHeavyVehicles" value="8" min="0" max="100" step="0.5" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="speedBase">Base Case Speed (km/h)</label>
+                    <input type="number" id="speedBase" value="45" min="5" max="130" step="1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="speedProject">Project Case Speed (km/h)</label>
+                    <input type="number" id="speedProject" value="65" min="5" max="130" step="1" oninput="CBA.calculate()">
+                </div>
+            </div>
+        </section>
+
+        <!-- SAFETY -->
+        <section class="card" id="safety-section">
+            <h2>Safety Benefits</h2>
+            <p class="param-note">Crash costs per TfNSW EPV (Jan 2025), June 2024 prices. Enter annual crash reductions.</p>
+            <div class="form-grid cols-3">
+                <div class="form-group">
+                    <label for="crashFatal">Fatal Crash Reduction (per year)</label>
+                    <input type="number" id="crashFatal" value="0.3" min="0" step="0.01" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="crashSerious">Serious Injury Reduction (per year)</label>
+                    <input type="number" id="crashSerious" value="1.5" min="0" step="0.1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="crashModerate">Moderate Injury Reduction (per year)</label>
+                    <input type="number" id="crashModerate" value="3" min="0" step="0.1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="crashMinor">Minor Injury Reduction (per year)</label>
+                    <input type="number" id="crashMinor" value="5" min="0" step="0.1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="crashPDO">Property Damage Only Reduction (per year)</label>
+                    <input type="number" id="crashPDO" value="10" min="0" step="0.5" oninput="CBA.calculate()">
+                </div>
+            </div>
+        </section>
+
+        <!-- ENVIRONMENTAL -->
+        <section class="card" id="env-section">
+            <h2>Environmental Externalities</h2>
+            <p class="param-note">Based on TfNSW EPV (Jan 2025). Carbon values per NSW Treasury TPG24-29.</p>
+            <div class="form-grid cols-3">
+                <div class="form-group">
+                    <label for="emissionReduction">Annual CO₂ Reduction (tonnes)</label>
+                    <input type="number" id="emissionReduction" value="500" min="0" step="10" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="airPollutionReduction">Annual Air Pollution Reduction ($000s)</label>
+                    <input type="number" id="airPollutionReduction" value="85" min="0" step="1" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="noiseReduction">Annual Noise Cost Reduction ($000s)</label>
+                    <input type="number" id="noiseReduction" value="30" min="0" step="1" oninput="CBA.calculate()">
+                </div>
+            </div>
+        </section>
+
+        <!-- ACTIVE TRANSPORT -->
+        <section class="card" id="active-section">
+            <h2>Active Transport Benefits</h2>
+            <p class="param-note">Health benefits per TfNSW EPV: Walking $3.17/km, Cycling $1.60/km (June 2024 prices).</p>
+            <div class="form-grid cols-2">
+                <div class="form-group">
+                    <label for="walkKmPerDay">Additional Daily Walking (person-km)</label>
+                    <input type="number" id="walkKmPerDay" value="0" min="0" step="10" oninput="CBA.calculate()">
+                </div>
+                <div class="form-group">
+                    <label for="cycleKmPerDay">Additional Daily Cycling (person-km)</label>
+                    <input type="number" id="cycleKmPerDay" value="0" min="0" step="10" oninput="CBA.calculate()">
+                </div>
+            </div>
+        </section>
+
+        <!-- RESULTS DASHBOARD -->
+        <section class="card results-card" id="results-section">
+            <h2>Results Summary</h2>
+            <div class="kpi-grid">
+                <div class="kpi">
+                    <span class="kpi-label">Net Present Value</span>
+                    <span class="kpi-value" id="kpiNPV">$0M</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-label">Benefit-Cost Ratio</span>
+                    <span class="kpi-value" id="kpiBCR">0.0</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-label">PV Benefits</span>
+                    <span class="kpi-value" id="kpiPVB">$0M</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-label">PV Costs</span>
+                    <span class="kpi-value" id="kpiPVC">$0M</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-label">First Year Rate of Return</span>
+                    <span class="kpi-value" id="kpiFYRR">0%</span>
+                </div>
+                <div class="kpi">
+                    <span class="kpi-label">Payback Period</span>
+                    <span class="kpi-value" id="kpiPayback">– years</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- CHARTS -->
+        <section class="card" id="charts-section">
+            <h2>Analysis Charts</h2>
+            <div class="chart-grid">
+                <div class="chart-container">
+                    <h3>Benefit Composition (PV $M)</h3>
+                    <canvas id="chartBenefitPie"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>NPV Waterfall ($M)</h3>
+                    <canvas id="chartWaterfall"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Annual Cashflow Profile ($M, undiscounted)</h3>
+                    <canvas id="chartCashflow"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Cumulative Discounted Net Benefits ($M)</h3>
+                    <canvas id="chartCumulative"></canvas>
+                </div>
+            </div>
+        </section>
+
+        <!-- SENSITIVITY -->
+        <section class="card" id="sensitivity-section">
+            <h2>Sensitivity Analysis</h2>
+            <p class="param-note">BCR at alternate discount rates and demand scenarios per TfNSW CBA Guide.</p>
+            <div class="sensitivity-grid">
+                <div class="chart-container">
+                    <h3>Discount Rate Sensitivity (BCR)</h3>
+                    <canvas id="chartSensDiscount"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Switching Values — Change Required to Achieve BCR = 1.0</h3>
+                    <canvas id="chartSwitching"></canvas>
+                </div>
+            </div>
+            <div id="sensitivityTable" class="sensitivity-table-wrap"></div>
+        </section>
+
+        <!-- PARAMETER REFERENCE -->
+        <section class="card" id="params-section">
+            <h2>TfNSW Economic Parameter Values Reference</h2>
+            <p class="param-note">Source: <em>TfNSW Economic Parameter Values</em> (January 2025), indexed to June 2024 prices.<br>
+            Refer to the <a href="https://www.transport.nsw.gov.au/news-and-events/reports-and-publications/tfnsw-economic-parameter-values" target="_blank">full document</a> for detailed guidance.</p>
+            <div id="paramTables"></div>
+        </section>
+    </main>
+
+    <footer>
+        <p>Transport CBA Dashboard · Parameters based on TfNSW Economic Parameter Values (Jan 2025) · For practitioner use · Not for public distribution</p>
+    </footer>
+
+    <script src="cba-engine.js"></script>
+    <script src="charts.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
