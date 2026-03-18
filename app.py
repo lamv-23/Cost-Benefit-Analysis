@@ -238,6 +238,111 @@ def interpolate_modelling_years(modelling_years: list, values: list, eval_year: 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MATRIX UI HELPERS — Step 3
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_traffic_matrix(metric: str, unit_label: str) -> None:
+    """Render st.data_editor tables for one traffic metric across all cases.
+
+    Displays one editable table per case (Base Case + N project cases), then a
+    colour-coded read-only incremental table (Project − Base) beneath.
+    Reads and writes ``st.session_state.traffic_data`` in-place.
+
+    Args:
+        metric:     One of "vht", "vkt", "stops", "demand".
+        unit_label: Human-readable unit string shown in the table header.
+    """
+    years: list = st.session_state.modelling_years
+    n: int = st.session_state.n_project_cases
+    case_keys = ["base_case"] + [f"project_{i}" for i in range(1, n + 1)]
+    case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
+
+    col_cfg = {
+        str(y): st.column_config.NumberColumn(str(y), min_value=0.0, format="%.0f")
+        for y in years
+    }
+
+    # ── Editable input tables ──────────────────────────────────────────────
+    for case_key, case_label in zip(case_keys, case_labels):
+        st.markdown(f"**{case_label}** &nbsp;·&nbsp; <small>{unit_label}</small>",
+                    unsafe_allow_html=True)
+
+        # Build DataFrame: rows = vehicle types, columns = modelling years
+        row_data = {
+            str(y): {
+                vt: st.session_state.traffic_data[case_key][vt][metric][y_idx]
+                for vt in VTYPES
+            }
+            for y_idx, y in enumerate(years)
+        }
+        df_edit = pd.DataFrame(row_data, index=VTYPES)
+
+        edited = st.data_editor(
+            df_edit,
+            num_rows="fixed",
+            key=f"de_{metric}_{case_key}",
+            use_container_width=True,
+            column_config=col_cfg,
+        )
+
+        # Persist edits back to session_state
+        for y_idx, y in enumerate(years):
+            for vt in VTYPES:
+                try:
+                    val = float(edited.loc[vt, str(y)])
+                except (KeyError, ValueError, TypeError):
+                    val = 0.0
+                st.session_state.traffic_data[case_key][vt][metric][y_idx] = val
+
+        # Auto-sum totals (read-only caption below each table)
+        totals = edited.sum()
+        st.caption(
+            "  Total: " + "   |   ".join(f"{y}: {totals[str(y)]:.0f}" for y in years)
+        )
+
+    # ── Incremental tables (Project − Base) ───────────────────────────────
+    if n >= 1:
+        st.divider()
+        st.markdown("**Incremental (Project − Base)**")
+
+        base_data = {
+            str(y): {
+                vt: st.session_state.traffic_data["base_case"][vt][metric][y_idx]
+                for vt in VTYPES
+            }
+            for y_idx, y in enumerate(years)
+        }
+        base_df = pd.DataFrame(base_data, index=VTYPES)
+
+        for i in range(1, n + 1):
+            proj_data = {
+                str(y): {
+                    vt: st.session_state.traffic_data[f"project_{i}"][vt][metric][y_idx]
+                    for vt in VTYPES
+                }
+                for y_idx, y in enumerate(years)
+            }
+            proj_df = pd.DataFrame(proj_data, index=VTYPES)
+            incr_df = proj_df - base_df
+
+            if n > 1:
+                st.caption(f"Project {i} − Base")
+
+            def _style_incr(val):
+                if isinstance(val, (int, float)):
+                    if val < 0:
+                        return "background-color:rgba(220,53,69,0.12);color:#dc3545"
+                    if val > 0:
+                        return "background-color:rgba(25,135,84,0.12);color:#198754"
+                return ""
+
+            st.dataframe(
+                incr_df.style.applymap(_style_incr).format("{:+.0f}"),
+                use_container_width=True,
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CALCULATION ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -563,11 +668,100 @@ st.markdown("""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE INITIALISATION — Step 2
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _init_session_state() -> None:
+    """Initialise session_state keys for the matrix input UI (run once per session)."""
+    if "modelling_years" not in st.session_state:
+        st.session_state["modelling_years"] = list(DEFAULT_MODELLING_YEARS)
+    if "n_project_cases" not in st.session_state:
+        st.session_state["n_project_cases"] = 1
+    if "annualisation" not in st.session_state:
+        st.session_state["annualisation"] = {
+            "peak_hours": 2.0,
+            "expansion_factor": 10.0,
+            "days_per_year": 365,
+        }
+    _years = st.session_state["modelling_years"]
+    _n = st.session_state["n_project_cases"]
+    # (Re-)initialise traffic / crash / cost data when structure changes
+    td = st.session_state.get("traffic_data")
+    needs_reset = (
+        td is None
+        or td.get("base_case", {}).get("years") != _years
+        or f"project_{_n}" not in td
+    )
+    if needs_reset:
+        st.session_state["traffic_data"] = make_traffic_data(_years, _n)
+        st.session_state["crash_data"] = make_crash_data(_years, _n)
+        st.session_state["cost_data"] = make_cost_data(_n)
+
+
+_init_session_state()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR — ALL INPUTS
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Transport CBA")
     st.caption("TfNSW Economic Parameter Values (Jan 2025) · June 2024 prices")
+
+    # ── Matrix Input Configuration (Step 2) ──────────────────────────────────
+    st.markdown("### Modelling Configuration")
+
+    # Number of project cases
+    _n_input = st.number_input(
+        "Number of Project Cases", min_value=1, max_value=5,
+        value=st.session_state["n_project_cases"], step=1,
+        key="n_project_cases_widget",
+    )
+    if _n_input != st.session_state["n_project_cases"]:
+        st.session_state["n_project_cases"] = _n_input
+        _init_session_state()
+        st.rerun()
+
+    # Modelling years (comma-separated text input)
+    _years_raw = st.text_input(
+        "Modelling Years (comma-separated)",
+        value=", ".join(str(y) for y in st.session_state["modelling_years"]),
+        key="modelling_years_widget",
+        help="e.g. 2026, 2031, 2041, 2056",
+    )
+    try:
+        _parsed_years = [int(y.strip()) for y in _years_raw.split(",") if y.strip()]
+        if len(_parsed_years) >= 1 and _parsed_years != st.session_state["modelling_years"]:
+            st.session_state["modelling_years"] = _parsed_years
+            _init_session_state()
+            st.rerun()
+    except ValueError:
+        st.error("Invalid year format — enter integers separated by commas.")
+
+    # Annualisation parameters panel
+    with st.expander("Annualisation Parameters", expanded=False):
+        st.caption("Convert peak-period inputs → annual totals used in calculate()")
+        _ann = st.session_state["annualisation"]
+        _ann["peak_hours"] = st.number_input(
+            "Peak Period Hours (hr)", min_value=0.5, max_value=12.0,
+            value=_ann["peak_hours"], step=0.5,
+            help="Length of the modelled peak period",
+        )
+        _ann["expansion_factor"] = st.number_input(
+            "Peak-to-Daily Expansion Factor", min_value=1.0, max_value=50.0,
+            value=_ann["expansion_factor"], step=0.5,
+            help="Multiplier: peak-period VHT/VKT → daily total (e.g. 10 means peak = 1/10 of daily)",
+        )
+        _ann["days_per_year"] = st.number_input(
+            "Days per Year", min_value=1, max_value=365,
+            value=int(_ann["days_per_year"]), step=1,
+        )
+        st.caption(
+            f"Annual VHT = Peak VHT × {_ann['expansion_factor']:.1f} × {int(_ann['days_per_year'])} days"
+        )
+        st.session_state["annualisation"] = _ann
+
+    st.divider()
 
     # --- Comparison mode toggle ---
     comparison_mode = st.toggle("Compare Scenarios", value=False, key="comparison_mode")
@@ -811,9 +1005,70 @@ st.download_button(
 # ─────────────────────────────────────────────────────────────────────────────
 # TABBED LAYOUT
 # ─────────────────────────────────────────────────────────────────────────────
-tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
-    ["Dashboard", "Detailed Cashflow", "Sensitivity", "Parameters"]
+tab_datainput, tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
+    ["Data Input", "Dashboard", "Detailed Cashflow", "Sensitivity", "Parameters"]
 )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 0: DATA INPUT — Step 3 (traffic matrices) + Steps 4-5 (crashes, costs)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_datainput:
+    st.markdown('<div class="section-header">Traffic & Project Data Entry</div>',
+                unsafe_allow_html=True)
+
+    _ann = st.session_state["annualisation"]
+    st.caption(
+        f"Modelling years: **{', '.join(str(y) for y in st.session_state['modelling_years'])}** · "
+        f"Peak-period inputs · Annual = Peak × {_ann['expansion_factor']:.1f} × "
+        f"{int(_ann['days_per_year'])} days"
+    )
+
+    # ── Sub-tabs: one per traffic metric + Crashes + Costs ────────────────
+    sub_vht, sub_vkt, sub_stops, sub_demand, sub_crashes, sub_costs = st.tabs(
+        ["VHT", "VKT", "Stops", "Demand", "Crashes", "Costs"]
+    )
+
+    # ── VHT sub-tab ───────────────────────────────────────────────────────
+    with sub_vht:
+        st.caption(
+            "Vehicle Hours Travelled per peak period (veh-hrs/peak period). "
+            "Used directly for Travel Time Savings calculation. "
+            "Speed = VKT / VHT (derived, not entered)."
+        )
+        render_traffic_matrix("vht", "veh-hrs / peak period")
+
+    # ── VKT sub-tab ───────────────────────────────────────────────────────
+    with sub_vkt:
+        st.caption(
+            "Vehicle Kilometres Travelled per peak period (veh-km/peak period). "
+            "Used for VOC, emissions, air pollution, and noise calculations. "
+            "Speed (km/h) = VKT ÷ VHT — shown as read-only in the VHT tab."
+        )
+        render_traffic_matrix("vkt", "veh-km / peak period")
+
+    # ── Stops sub-tab ─────────────────────────────────────────────────────
+    with sub_stops:
+        st.caption("Vehicle stops per peak period (stops/peak period). Captured for reference.")
+        render_traffic_matrix("stops", "stops / peak period")
+
+    # ── Demand sub-tab ────────────────────────────────────────────────────
+    with sub_demand:
+        st.caption(
+            "Person-trips per peak period (person-trips/peak period). "
+            "Captured for reference; TTS is driven by VHT, not demand."
+        )
+        render_traffic_matrix("demand", "person-trips / peak period")
+
+    # ── Crashes sub-tab ───────────────────────────────────────────────────
+    with sub_crashes:
+        st.caption("Annual crash counts by severity — base case and each project case.")
+        st.info("Crash data entry tables — coming in next increment (Step 4).")
+
+    # ── Costs sub-tab ─────────────────────────────────────────────────────
+    with sub_costs:
+        st.caption("Capital and recurrent costs per project case ($M, undiscounted).")
+        st.info("Cost entry forms — coming in next increment (Step 5).")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1: DASHBOARD — Charts
