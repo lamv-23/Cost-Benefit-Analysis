@@ -69,7 +69,108 @@ PARAMS = {
         "urban": {"car": 0.84, "lgv": 0.08, "rigid": 0.05, "artic": 0.03},
         "rural": {"car": 0.75, "lgv": 0.10, "rigid": 0.08, "artic": 0.07},
     },
+    # Phase 0a: Emission cost per vehicle-km ($/veh-km), combining emission factor × carbon price
+    # Derived from NTC fleet-average emission factors × $123/tCO₂e (June 2024)
+    "emission_cost": {
+        "urban": {"car": 0.023, "lgv": 0.027, "rigid": 0.071, "bus": 0.101},
+        "rural": {"car": 0.007, "lgv": 0.009, "rigid": 0.022, "bus": 0.032},
+    },
+    # Phase 0c: Occupancy per vehicle type (persons/vehicle)
+    # Car=1.4 (average auto), LCV/HCV=1.0 (driver only), Bus=45 (seated capacity)
+    "occupancy": {"Car": 1.4, "LCV": 1.0, "HCV": 1.0, "Bus": 45.0},
 }
+
+# Phase 0b: Vehicle type mapping — UI labels to PARAMS internal keys
+# Note: Bus approximated as artic for VOC/air/noise externality rates
+VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "artic"}
+
+# Canonical vehicle type list for matrix inputs
+VTYPES = ["Car", "LCV", "HCV", "Bus"]
+
+# Default modelling years
+DEFAULT_MODELLING_YEARS = [2026, 2031, 2041, 2056]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA SCHEMA — Step 1: factory functions for matrix input structures
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_traffic_case(years: list) -> dict:
+    """Return a zeroed traffic data dict for one case (base or project).
+
+    Structure:
+        {
+          "years": [2026, 2031, ...],
+          "Car":  {"vht": [...], "vkt": [...], "stops": [...], "demand": [...]},
+          "LCV":  {...},
+          "HCV":  {...},
+          "Bus":  {...},
+        }
+    """
+    n = len(years)
+    return {
+        "years": list(years),
+        **{
+            vt: {"vht": [0.0] * n, "vkt": [0.0] * n, "stops": [0.0] * n, "demand": [0.0] * n}
+            for vt in VTYPES
+        },
+    }
+
+
+def make_traffic_data(years: list, n_project_cases: int = 1) -> dict:
+    """Return a full traffic_data dict: base_case + project_1 … project_N.
+
+    Structure:
+        {
+          "base_case":  <traffic_case>,
+          "project_1":  <traffic_case>,
+          ...
+        }
+    """
+    data = {"base_case": make_traffic_case(years)}
+    for i in range(1, n_project_cases + 1):
+        data[f"project_{i}"] = make_traffic_case(years)
+    return data
+
+
+def make_crash_case(years: list) -> dict:
+    """Return a zeroed crash data dict for one case.
+
+    Structure:
+        {"fatal": [...], "serious": [...], "moderate": [...], "minor": [...], "pdo": [...]}
+    """
+    n = len(years)
+    severities = ["fatal", "serious", "moderate", "minor", "pdo"]
+    return {s: [0.0] * n for s in severities}
+
+
+def make_crash_data(years: list, n_project_cases: int = 1) -> dict:
+    """Return crash_data dict keyed by case name."""
+    data = {"base_case": make_crash_case(years)}
+    for i in range(1, n_project_cases + 1):
+        data[f"project_{i}"] = make_crash_case(years)
+    return data
+
+
+def make_cost_data(n_project_cases: int = 1) -> dict:
+    """Return cost_data dict keyed by project case (base has no costs).
+
+    Structure per project case:
+        {
+          "cap_planning": 0.0,   # $M
+          "cap_land": 0.0,       # $M
+          "cap_construction": 0.0,  # $M
+          "contingency_pct": 0.0,   # %
+          "opex_maint": 0.0,     # $M/year
+          "opex_op": 0.0,        # $M/year
+          "residual": 0.0,       # $M
+        }
+    """
+    template = {
+        "cap_planning": 0.0, "cap_land": 0.0, "cap_construction": 0.0,
+        "contingency_pct": 0.0, "opex_maint": 0.0, "opex_op": 0.0, "residual": 0.0,
+    }
+    return {f"project_{i}": dict(template) for i in range(1, n_project_cases + 1)}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -96,6 +197,44 @@ def format_m(value: float) -> str:
     if abs(value) >= 1000:
         return f"${value / 1000:.1f}B"
     return f"${value:.1f}M"
+
+
+def interpolate_modelling_years(modelling_years: list, values: list, eval_year: int) -> float:
+    """Linearly interpolate (or extrapolate) a value for eval_year from modelling year data.
+
+    Args:
+        modelling_years: Sorted list of modelling years (e.g. [2026, 2031, 2041, 2056]).
+        values: Values at each modelling year (same length as modelling_years).
+        eval_year: The evaluation year to interpolate for.
+
+    Returns:
+        Interpolated (or extrapolated) value for eval_year.
+    """
+    if len(modelling_years) == 0 or len(values) == 0:
+        return 0.0
+    if len(modelling_years) == 1:
+        return float(values[0])
+
+    years = modelling_years
+    # Clamp to range: extrapolate beyond last two points using last segment slope
+    if eval_year <= years[0]:
+        # Extrapolate below first modelling year using first two points
+        slope = (values[1] - values[0]) / (years[1] - years[0]) if years[1] != years[0] else 0.0
+        return float(values[0]) + slope * (eval_year - years[0])
+    if eval_year >= years[-1]:
+        # Extrapolate beyond last modelling year using last two points
+        slope = (values[-1] - values[-2]) / (years[-1] - years[-2]) if years[-1] != years[-2] else 0.0
+        return float(values[-1]) + slope * (eval_year - years[-1])
+
+    # Linear interpolation between bracketing modelling years
+    for i in range(len(years) - 1):
+        if years[i] <= eval_year <= years[i + 1]:
+            if years[i + 1] == years[i]:
+                return float(values[i])
+            ratio = (eval_year - years[i]) / (years[i + 1] - years[i])
+            return float(values[i]) + ratio * (float(values[i + 1]) - float(values[i]))
+
+    return float(values[-1])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
