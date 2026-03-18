@@ -12,6 +12,13 @@ import math
 import io
 import csv
 
+# Optional: Excel template generation (Step 6) — requires openpyxl
+try:
+    import openpyxl  # noqa: F401
+    _EXCEL_AVAILABLE = True
+except ImportError:
+    _EXCEL_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -340,6 +347,286 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
                 incr_df.style.applymap(_style_incr).format("{:+.0f}"),
                 use_container_width=True,
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRASH MATRIX UI HELPER — Step 4
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SEVERITIES = ["fatal", "serious", "moderate", "minor", "pdo"]
+_SEV_LABELS = {
+    "fatal": "Fatal",
+    "serious": "Serious Injury",
+    "moderate": "Moderate Injury",
+    "minor": "Minor Injury",
+    "pdo": "Property Damage Only",
+}
+
+
+def render_crash_matrix() -> None:
+    """Render annual crash count data_editor tables for all cases (Step 4).
+
+    Displays one editable table per case (Base + N projects), rows = severity
+    levels, columns = modelling years.  Below those tables shows a colour-coded
+    crash-reduction table (Base − Project): positive = fewer crashes = green.
+    Reads/writes ``st.session_state.crash_data`` in-place.
+    """
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+    case_keys = ["base_case"] + [f"project_{i}" for i in range(1, n + 1)]
+    case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
+    row_labels = [_SEV_LABELS[s] for s in _SEVERITIES]
+
+    col_cfg = {
+        str(y): st.column_config.NumberColumn(str(y), min_value=0.0, format="%.2f")
+        for y in years
+    }
+
+    # ── Editable input tables ──────────────────────────────────────────────
+    for case_key, case_label in zip(case_keys, case_labels):
+        st.markdown(f"**{case_label}** — annual crash counts")
+        row_data = {
+            str(y): {_SEV_LABELS[s]: st.session_state.crash_data[case_key][s][y_idx]
+                     for s in _SEVERITIES}
+            for y_idx, y in enumerate(years)
+        }
+        df_edit = pd.DataFrame(row_data, index=row_labels)
+
+        edited = st.data_editor(
+            df_edit, num_rows="fixed",
+            key=f"de_crash_{case_key}",
+            use_container_width=True,
+            column_config=col_cfg,
+        )
+
+        for y_idx, y in enumerate(years):
+            for s in _SEVERITIES:
+                try:
+                    val = float(edited.loc[_SEV_LABELS[s], str(y)])
+                except (KeyError, ValueError, TypeError):
+                    val = 0.0
+                st.session_state.crash_data[case_key][s][y_idx] = val
+
+    # ── Crash reduction (Base − Project): positive = benefit = green ───────
+    if n >= 1:
+        st.divider()
+        st.markdown(
+            "**Crash Reduction (Base − Project)** — "
+            "Positive = fewer crashes (benefit) · Negative = more crashes (disbenefit)"
+        )
+        base_data = {
+            str(y): {_SEV_LABELS[s]: st.session_state.crash_data["base_case"][s][y_idx]
+                     for s in _SEVERITIES}
+            for y_idx, y in enumerate(years)
+        }
+        base_df = pd.DataFrame(base_data, index=row_labels)
+
+        for i in range(1, n + 1):
+            proj_data = {
+                str(y): {_SEV_LABELS[s]: st.session_state.crash_data[f"project_{i}"][s][y_idx]
+                         for s in _SEVERITIES}
+                for y_idx, y in enumerate(years)
+            }
+            reduc_df = base_df - pd.DataFrame(proj_data, index=row_labels)
+            if n > 1:
+                st.caption(f"Project {i}: Base − Project")
+
+            def _style_crash(val):
+                if isinstance(val, (int, float)):
+                    if val > 0:
+                        return "background-color:rgba(25,135,84,0.12);color:#198754"
+                    if val < 0:
+                        return "background-color:rgba(220,53,69,0.12);color:#dc3545"
+                return ""
+
+            st.dataframe(
+                reduc_df.style.applymap(_style_crash).format("{:+.2f}"),
+                use_container_width=True,
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COST ENTRY UI HELPER — Step 5
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_cost_entry() -> None:
+    """Render cost input forms per project case (Step 5).
+
+    One expandable section per project case with capital costs (planning, land,
+    construction, contingency %), recurrent costs (maintenance, operating), and
+    residual value.  Updates ``st.session_state.cost_data`` in-place.
+    """
+    n = st.session_state.n_project_cases
+    for i in range(1, n + 1):
+        case_key = f"project_{i}"
+        cd = st.session_state.cost_data[case_key]
+
+        with st.expander(f"Project {i} — Costs", expanded=(i == 1)):
+            st.markdown("**Capital Costs ($M, undiscounted)**")
+            c1, c2 = st.columns(2)
+            with c1:
+                cd["cap_planning"] = st.number_input(
+                    "Planning & Design ($M)", min_value=0.0,
+                    value=float(cd["cap_planning"]), step=0.1, key=f"cost_planning_{i}",
+                )
+                cd["cap_construction"] = st.number_input(
+                    "Construction ($M)", min_value=0.0,
+                    value=float(cd["cap_construction"]), step=1.0, key=f"cost_construction_{i}",
+                )
+            with c2:
+                cd["cap_land"] = st.number_input(
+                    "Land Acquisition ($M)", min_value=0.0,
+                    value=float(cd["cap_land"]), step=0.1, key=f"cost_land_{i}",
+                )
+                cd["contingency_pct"] = st.number_input(
+                    "Contingency (%)", min_value=0.0, max_value=50.0,
+                    value=float(cd["contingency_pct"]), step=1.0, key=f"cost_contingency_{i}",
+                )
+
+            total_cap = (
+                (cd["cap_planning"] + cd["cap_land"] + cd["cap_construction"])
+                * (1 + cd["contingency_pct"] / 100)
+            )
+            st.metric(
+                f"Total Capital incl. {cd['contingency_pct']:.0f}% contingency ($M)",
+                f"${total_cap:.2f}M",
+            )
+
+            st.markdown("**Recurrent Costs ($M/year)**")
+            r1, r2 = st.columns(2)
+            with r1:
+                cd["opex_maint"] = st.number_input(
+                    "Maintenance ($M/yr)", min_value=0.0,
+                    value=float(cd["opex_maint"]), step=0.1, key=f"cost_maint_{i}",
+                )
+            with r2:
+                cd["opex_op"] = st.number_input(
+                    "Operating ($M/yr)", min_value=0.0,
+                    value=float(cd["opex_op"]), step=0.1, key=f"cost_op_{i}",
+                )
+
+            cd["residual"] = st.number_input(
+                "Residual Value ($M, at end of evaluation period)", min_value=0.0,
+                value=float(cd["residual"]), step=0.1, key=f"cost_residual_{i}",
+            )
+            st.session_state.cost_data[case_key] = cd
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE UPLOAD HELPERS — Step 6
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_template_excel():
+    """Generate a pre-structured Excel template for matrix traffic/crash data.
+
+    Returns raw bytes suitable for st.download_button, or None if openpyxl is
+    not installed.
+    """
+    if not _EXCEL_AVAILABLE:
+        return None
+
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+    case_keys = ["base_case"] + [f"project_{i}" for i in range(1, n + 1)]
+    case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # One sheet per traffic metric
+        for metric in ["VHT", "VKT", "Stops", "Demand"]:
+            rows = []
+            for case_key, case_label in zip(case_keys, case_labels):
+                for vt in VTYPES:
+                    row = {"Case": case_label, "Vehicle Type": vt}
+                    for y in years:
+                        row[str(y)] = 0.0
+                    rows.append(row)
+            pd.DataFrame(rows).to_excel(writer, sheet_name=metric, index=False)
+
+        # Crashes sheet
+        sev_labels_list = [_SEV_LABELS[s] for s in _SEVERITIES]
+        rows = []
+        for case_key, case_label in zip(case_keys, case_labels):
+            for sev_label in sev_labels_list:
+                row = {"Case": case_label, "Severity": sev_label}
+                for y in years:
+                    row[str(y)] = 0.0
+                rows.append(row)
+        pd.DataFrame(rows).to_excel(writer, sheet_name="Crashes", index=False)
+
+    return buf.getvalue()
+
+
+def _apply_template_df(df: pd.DataFrame, metric: str, years: list, n: int) -> None:
+    """Write a parsed template DataFrame into ``st.session_state.traffic_data``."""
+    case_labels_map = {
+        "Base Case": "base_case",
+        **{f"Project {i}": f"project_{i}" for i in range(1, n + 1)},
+    }
+    year_cols = [str(y) for y in years]
+    for _, row in df.iterrows():
+        case_key = case_labels_map.get(str(row.get("Case", "")).strip())
+        vt = str(row.get("Vehicle Type", "")).strip()
+        if case_key and vt in VTYPES and case_key in st.session_state.traffic_data:
+            for y_idx, yc in enumerate(year_cols):
+                try:
+                    val = float(row.get(yc, 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    val = 0.0
+                st.session_state.traffic_data[case_key][vt][metric][y_idx] = val
+
+
+def _apply_crash_template_df(df: pd.DataFrame, years: list, n: int) -> None:
+    """Write a parsed crash template DataFrame into ``st.session_state.crash_data``."""
+    case_labels_map = {
+        "Base Case": "base_case",
+        **{f"Project {i}": f"project_{i}" for i in range(1, n + 1)},
+    }
+    sev_map = {v: k for k, v in _SEV_LABELS.items()}  # label → key
+    sev_map["Property Damage Only"] = "pdo"            # alias used in template
+    year_cols = [str(y) for y in years]
+    for _, row in df.iterrows():
+        case_key = case_labels_map.get(str(row.get("Case", "")).strip())
+        sev_key = sev_map.get(str(row.get("Severity", "")).strip())
+        if case_key and sev_key and case_key in st.session_state.crash_data:
+            for y_idx, yc in enumerate(year_cols):
+                try:
+                    val = float(row.get(yc, 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    val = 0.0
+                st.session_state.crash_data[case_key][sev_key][y_idx] = val
+
+
+def _handle_template_upload(uploaded_file) -> None:
+    """Parse a file uploaded in Template mode and populate session_state data."""
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+            _apply_template_df(df, "vht", years, n)
+            st.success("Imported VHT data from CSV (for full import use Excel template).")
+        else:
+            xl = pd.ExcelFile(uploaded_file)
+            metrics_map = {"VHT": "vht", "VKT": "vkt", "Stops": "stops", "Demand": "demand"}
+            imported = []
+            for sheet_name, metric in metrics_map.items():
+                if sheet_name in xl.sheet_names:
+                    _apply_template_df(xl.parse(sheet_name), metric, years, n)
+                    imported.append(sheet_name)
+            if "Crashes" in xl.sheet_names:
+                _apply_crash_template_df(xl.parse("Crashes"), years, n)
+                imported.append("Crashes")
+            if imported:
+                st.success(f"Imported: {', '.join(imported)}")
+                st.rerun()
+            else:
+                st.warning(
+                    "No matching sheets found. Expected sheet names: "
+                    "VHT, VKT, Stops, Demand, Crashes."
+                )
+    except Exception as e:
+        st.error(f"Import failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1023,6 +1310,63 @@ with tab_datainput:
         f"{int(_ann['days_per_year'])} days"
     )
 
+    # ── File Upload / Template Download (Step 6) ──────────────────────────
+    with st.expander("Import Data from File", expanded=False):
+        up_col, tmpl_col = st.columns([2, 1])
+        with up_col:
+            st.markdown("**Upload CSV or Excel**")
+            parse_mode = st.radio(
+                "Parse mode",
+                ["Template", "Smart parse", "User mapping"],
+                horizontal=True,
+                help=(
+                    "**Template**: upload a file generated by the Download button. "
+                    "**Smart parse**: auto-detect headers (coming soon). "
+                    "**User mapping**: manually map columns (coming soon)."
+                ),
+            )
+            uploaded_file = st.file_uploader(
+                "Drop file here",
+                type=["csv", "xlsx"],
+                label_visibility="collapsed",
+            )
+            if uploaded_file is not None:
+                if parse_mode == "Template":
+                    _handle_template_upload(uploaded_file)
+                else:
+                    st.info(f"{parse_mode} mode — coming in next increment.")
+
+        with tmpl_col:
+            st.markdown("**Download blank template**")
+            tmpl_bytes = generate_template_excel()
+            if tmpl_bytes:
+                st.download_button(
+                    "Download Excel Template",
+                    tmpl_bytes,
+                    file_name="cba_data_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                # CSV fallback (VHT only) when openpyxl is absent
+                _yrs = st.session_state.modelling_years
+                _nc = st.session_state.n_project_cases
+                _case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, _nc + 1)]
+                csv_lines = ["Case,Vehicle Type," + ",".join(str(y) for y in _yrs)]
+                for cl in _case_labels:
+                    for vt in VTYPES:
+                        csv_lines.append(f"{cl},{vt}," + ",".join("0" for _ in _yrs))
+                st.download_button(
+                    "Download CSV Template (VHT)",
+                    "\n".join(csv_lines),
+                    file_name="cba_vht_template.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+                st.caption("Install openpyxl for the full Excel template.")
+
+    st.divider()
+
     # ── Sub-tabs: one per traffic metric + Crashes + Costs ────────────────
     sub_vht, sub_vkt, sub_stops, sub_demand, sub_crashes, sub_costs = st.tabs(
         ["VHT", "VKT", "Stops", "Demand", "Crashes", "Costs"]
@@ -1061,13 +1405,21 @@ with tab_datainput:
 
     # ── Crashes sub-tab ───────────────────────────────────────────────────
     with sub_crashes:
-        st.caption("Annual crash counts by severity — base case and each project case.")
-        st.info("Crash data entry tables — coming in next increment (Step 4).")
+        st.caption(
+            "Annual crash counts by severity for each modelling year. "
+            "Crash cost unit values are drawn from PARAMS (see Parameters tab). "
+            "Safety benefit = (Base − Project) crashes × cost per crash."
+        )
+        render_crash_matrix()
 
     # ── Costs sub-tab ─────────────────────────────────────────────────────
     with sub_costs:
-        st.caption("Capital and recurrent costs per project case ($M, undiscounted).")
-        st.info("Cost entry forms — coming in next increment (Step 5).")
+        st.caption(
+            "Capital and recurrent costs per project case ($M, undiscounted). "
+            "Base Case has no project costs. Construction cost is spread evenly over "
+            "the construction period defined in Project Details (sidebar)."
+        )
+        render_cost_entry()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
