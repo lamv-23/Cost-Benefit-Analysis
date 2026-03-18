@@ -91,6 +91,9 @@ PARAMS = {
 # Note: Bus approximated as artic for VOC/air/noise externality rates
 VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "artic"}
 
+# Separate mapping for emission_cost (uses "bus" key, not "artic")
+EMISSION_VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "bus"}
+
 # Canonical vehicle type list for matrix inputs
 VTYPES = ["Car", "LCV", "HCV", "Bus"]
 
@@ -840,6 +843,266 @@ def calculate(inputs: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MATRIX CALCULATION ENGINE — Step 7
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_matrix(
+    inputs: dict,
+    base_traffic: dict,
+    proj_traffic: dict,
+    crash_base: dict,
+    crash_proj: dict,
+    cost: dict,
+    annualisation: dict,
+) -> dict:
+    """Compute CBA for one project case using the matrix traffic data model.
+
+    Args:
+        inputs:        Project config keys: context, evaluation_period,
+                       construction_years, discount_rate, base_year,
+                       pct_commute, pct_business.
+        base_traffic:  traffic_case dict for the base case.
+        proj_traffic:  traffic_case dict for this project case.
+        crash_base:    crash_case dict for the base case.
+        crash_proj:    crash_case dict for this project case.
+        cost:          cost_data entry for this project case.
+        annualisation: expansion_factor, days_per_year, peak_hours.
+
+    Returns:
+        Result dict with the same keys as the legacy ``calculate()`` output so
+        existing dashboard/export code is compatible.
+    """
+    ctx = inputs["context"]
+    eval_period = inputs["evaluation_period"]
+    const_years = inputs["construction_years"]
+    dr = inputs["discount_rate"]
+    base_year = inputs.get("base_year", 2026)
+    pct_commute = inputs["pct_commute"] / 100
+    pct_business = inputs["pct_business"] / 100
+    pct_other = max(0.0, 1.0 - pct_commute - pct_business)
+
+    # Annualisation: peak-period → annual
+    exp_factor = annualisation["expansion_factor"]
+    days = annualisation["days_per_year"]
+    ann_factor = exp_factor * days
+
+    # VTTS weighted across trip purposes
+    vtts_set = PARAMS["vtts"][ctx]
+    vtts_weighted = (
+        vtts_set["commute"] * pct_commute
+        + vtts_set["business"] * pct_business
+        + vtts_set["other"] * pct_other
+    )
+
+    # Capital and recurrent costs
+    raw_cap = cost["cap_planning"] + cost["cap_land"] + cost["cap_construction"]
+    total_capital = raw_cap * (1 + cost["contingency_pct"] / 100)
+    annual_capital = total_capital / const_years if const_years > 0 else 0.0
+    opex = cost["opex_maint"] + cost["opex_op"]
+    residual = cost["residual"]
+
+    modelling_years = base_traffic["years"]
+    total_years = const_years + eval_period
+
+    annual_costs: list = []
+    annual_benefits: list = []
+    benefits_by_type: dict = {k: [] for k in ("tts", "reliability", "voc", "safety", "env", "active")}
+    annual_net: list = []
+    disc_costs: list = []
+    disc_benefits: list = []
+    disc_net: list = []
+    cum_disc_net: list = []
+
+    pv_costs = 0.0
+    pv_benefits = 0.0
+    cum = 0.0
+    payback_year = None
+
+    for y in range(total_years):
+        df_factor = discount_factor(dr, y)
+        eval_year = base_year + y
+        cost_y = 0.0
+        b_tts = b_rel = b_voc = b_safety = b_env = b_active = 0.0
+
+        if y < const_years:
+            cost_y = annual_capital
+        else:
+            cost_y = opex
+
+            # ── TTS: per vehicle type ───────────────────────────────────────
+            for vt in VTYPES:
+                vht_base = interpolate_modelling_years(
+                    modelling_years, base_traffic[vt]["vht"], eval_year
+                )
+                vht_proj = interpolate_modelling_years(
+                    modelling_years, proj_traffic[vt]["vht"], eval_year
+                )
+                annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factor
+                b_tts += annual_vht_saving * PARAMS["occupancy"][vt] * vtts_weighted / 1e6
+
+            b_rel = b_tts * PARAMS["reliability_ratio"] * 0.3
+
+            # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
+            for vt in VTYPES:
+                param_vt = VTYPE_MAP[vt]
+                voc_table = PARAMS["voc"][ctx].get(param_vt, {})
+                if not voc_table:
+                    continue
+
+                vht_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vht"], eval_year)
+                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], eval_year)
+                vht_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vht"], eval_year)
+                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], eval_year)
+
+                spd_b = vkt_b / vht_b if vht_b > 0 else 0.0
+                spd_p = vkt_p / vht_p if vht_p > 0 else 0.0
+
+                voc_b = interpolate_voc(voc_table, spd_b) if spd_b > 0 else 0.0
+                voc_p = interpolate_voc(voc_table, spd_p) if spd_p > 0 else 0.0
+
+                annual_vkt_b = vkt_b * ann_factor
+                annual_vkt_p = vkt_p * ann_factor
+                voc_saving = annual_vkt_b * voc_b - annual_vkt_p * voc_p
+                b_voc += max(0.0, voc_saving) / 1e6
+
+            # ── Safety: crash reduction per severity ────────────────────────
+            for s in _SEVERITIES:
+                c_base = interpolate_modelling_years(modelling_years, crash_base[s], eval_year)
+                c_proj = interpolate_modelling_years(modelling_years, crash_proj[s], eval_year)
+                b_safety += max(0.0, c_base - c_proj) * PARAMS["crash_costs"][s] / 1e6
+
+            # ── Environmental: emission + air + noise per vtype × VKT Δ ────
+            for vt in VTYPES:
+                param_vt = VTYPE_MAP[vt]
+                emit_vt = EMISSION_VTYPE_MAP[vt]
+                emit_rate = PARAMS["emission_cost"][ctx].get(emit_vt, 0.0)
+                air_rate = PARAMS["air_pollution"][ctx].get(param_vt, 0.0)
+                noise_rate = PARAMS["noise"][ctx].get(param_vt, 0.0)
+
+                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], eval_year)
+                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], eval_year)
+                vkt_delta = (vkt_b - vkt_p) * ann_factor
+                b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
+
+        benefit_y = b_tts + b_rel + b_voc + b_safety + b_env + b_active
+        if y == total_years - 1:
+            benefit_y += residual
+
+        net = benefit_y - cost_y
+        annual_costs.append(cost_y)
+        annual_benefits.append(benefit_y)
+        for k, v in zip(("tts", "reliability", "voc", "safety", "env", "active"),
+                        (b_tts, b_rel, b_voc, b_safety, b_env, b_active)):
+            benefits_by_type[k].append(v)
+        annual_net.append(net)
+        disc_costs.append(cost_y * df_factor)
+        disc_benefits.append(benefit_y * df_factor)
+        disc_net.append(net * df_factor)
+        pv_costs += cost_y * df_factor
+        pv_benefits += benefit_y * df_factor
+        cum += net * df_factor
+        cum_disc_net.append(cum)
+        if payback_year is None and cum >= 0 and y >= const_years:
+            payback_year = y + 1
+
+    npv = pv_benefits - pv_costs
+    bcr = pv_benefits / pv_costs if pv_costs > 0 else 0.0
+    first_op = const_years if const_years < total_years else 0
+    fyrr = (annual_benefits[first_op] / total_capital * 100) if total_capital > 0 else 0.0
+
+    pv_by_type = {
+        t: sum(benefits_by_type[t][y] * discount_factor(dr, y) for y in range(total_years))
+        for t in benefits_by_type
+    }
+
+    sensitivity_dr = {}
+    for r in [3, 4, 5, 7, 10, 12]:
+        s_pvb = sum(annual_benefits[y] * discount_factor(r, y) for y in range(total_years))
+        s_pvc = sum(annual_costs[y] * discount_factor(r, y) for y in range(total_years))
+        sensitivity_dr[r] = {
+            "pvb": s_pvb, "pvc": s_pvc,
+            "npv": s_pvb - s_pvc,
+            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0.0,
+        }
+
+    switching = {}
+    if pv_benefits > 0 and pv_costs > 0:
+        switching["Total Benefits"] = -((pv_benefits - pv_costs) / pv_benefits) * 100
+        switching["Total Costs"] = ((pv_benefits - pv_costs) / pv_costs) * 100
+        for t, label in TYPE_LABELS.items():
+            if pv_by_type.get(t, 0) > 0:
+                switching[label] = -((pv_benefits - pv_costs) / pv_by_type[t]) * 100
+
+    scenarios = {}
+    for label, factor in [("Low (-20%)", 0.8), ("Central", 1.0), ("High (+20%)", 1.2)]:
+        s_pvb = sum(annual_benefits[y] * factor * discount_factor(dr, y) for y in range(total_years))
+        s_pvc = sum(annual_costs[y] * discount_factor(dr, y) for y in range(total_years))
+        scenarios[label] = {
+            "pvb": s_pvb, "pvc": s_pvc,
+            "npv": s_pvb - s_pvc,
+            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0.0,
+        }
+
+    return {
+        "npv": npv, "bcr": bcr, "pv_benefits": pv_benefits, "pv_costs": pv_costs,
+        "fyrr": fyrr, "payback_year": payback_year, "total_capital": total_capital,
+        "annual_costs": annual_costs, "annual_benefits": annual_benefits,
+        "annual_net": annual_net,
+        "disc_costs": disc_costs, "disc_benefits": disc_benefits, "disc_net": disc_net,
+        "cum_disc_net": cum_disc_net,
+        "pv_by_type": pv_by_type, "sensitivity_dr": sensitivity_dr,
+        "switching": switching, "scenarios": scenarios,
+        "const_years": const_years, "eval_period": eval_period,
+        "total_years": total_years, "dr": dr,
+        "benefits_by_type": benefits_by_type,
+        "first_year": {
+            t: benefits_by_type[t][first_op] for t in benefits_by_type
+        } | {"total": annual_benefits[first_op]},
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MULTI-CASE LOOP — Step 8
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_all_cases(
+    inputs: dict,
+    traffic_data: dict,
+    crash_data: dict,
+    cost_data: dict,
+    annualisation: dict,
+) -> dict:
+    """Run calculate_matrix for every active project case vs the base case.
+
+    Args:
+        inputs:       Project config (context, dr, eval_period, const_years,
+                      base_year, pct_commute, pct_business, n_project_cases).
+        traffic_data: Full traffic_data dict from session_state.
+        crash_data:   Full crash_data dict from session_state.
+        cost_data:    Full cost_data dict from session_state.
+        annualisation: Annualisation parameters from session_state.
+
+    Returns:
+        Dict keyed by "project_1" … "project_N", each value being the result
+        dict from ``calculate_matrix()``.
+    """
+    n = inputs.get("n_project_cases", 1)
+    results = {}
+    for i in range(1, n + 1):
+        case_key = f"project_{i}"
+        results[case_key] = calculate_matrix(
+            inputs=inputs,
+            base_traffic=traffic_data["base_case"],
+            proj_traffic=traffic_data[case_key],
+            crash_base=crash_data["base_case"],
+            crash_proj=crash_data[case_key],
+            cost=cost_data[case_key],
+            annualisation=annualisation,
+        )
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CSV EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1176,6 +1439,35 @@ inputs = {
 }
 
 results = calculate(inputs)
+
+# ── Matrix-based calculation (Steps 7-8) — runs alongside legacy calculate() ──
+# Builds matrix_inputs from the shared sidebar fields + session_state config.
+# matrix_results is keyed by "project_1"…"project_N"; consumed by future
+# dashboard/cashflow updates. Falls back to an empty dict on any error so the
+# existing dashboard is never blocked by incomplete matrix data.
+_matrix_inputs = {
+    "context": context,
+    "evaluation_period": eval_period,
+    "construction_years": const_years,
+    "discount_rate": discount_rate,
+    "base_year": base_year,
+    "pct_commute": pct_commute,
+    "pct_business": pct_business,
+    "n_project_cases": st.session_state.n_project_cases,
+}
+try:
+    matrix_results = calculate_all_cases(
+        inputs=_matrix_inputs,
+        traffic_data=st.session_state.traffic_data,
+        crash_data=st.session_state.crash_data,
+        cost_data=st.session_state.cost_data,
+        annualisation=st.session_state.annualisation,
+    )
+except Exception as _calc_err:
+    matrix_results = {}
+    # Surface the error only in debug mode to avoid cluttering the UI
+    if st.session_state.get("debug_mode"):
+        st.error(f"Matrix calculation error: {_calc_err}")
 
 # Scenario B calculation (if comparison mode)
 results_b = None
