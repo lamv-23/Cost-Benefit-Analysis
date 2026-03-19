@@ -1690,9 +1690,6 @@ with st.sidebar:
 
     st.divider()
 
-    # --- Comparison mode toggle ---
-    comparison_mode = st.toggle("Compare Scenarios", value=False, key="comparison_mode")
-
     # --- Project Details ---
     st.markdown("### Project Details")
     project_name = st.text_input("Project Name", value="Sample Road Upgrade")
@@ -1700,10 +1697,15 @@ with st.sidebar:
     with col1:
         eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30)
         base_year = st.number_input("Base Year", 2020, 2040, 2026)
+        pct_commute = st.number_input("% Commute Trips", 0.0, 100.0, 35.0, step=1.0)
     with col2:
         const_years = st.number_input("Construction Period (years)", 1, 10, 3)
         discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 7.0, step=0.5)
+        pct_business = st.number_input("% Business Trips", 0.0, 100.0, 15.0, step=1.0)
     context = st.selectbox("Context", ["urban", "rural"], format_func=str.title)
+
+    if pct_commute + pct_business > 100:
+        st.error("Commute + Business trips cannot exceed 100%")
 
     st.divider()
 
@@ -1726,102 +1728,10 @@ with st.sidebar:
         opex_op = st.number_input("Operating ($M/yr)", 0.0, value=0.8, step=0.1)
     residual = st.number_input("Residual Value ($M)", 0.0, value=15.0, step=0.1)
 
-    st.divider()
-
-    # --- Traffic & Demand ---
-    st.markdown("### Traffic & Demand")
-    aadt = st.number_input("Base AADT (vehicles/day)", 0, value=25000, step=100)
-    col1, col2 = st.columns(2)
-    with col1:
-        traffic_growth = st.number_input("Traffic Growth (%/yr)", 0.0, 10.0, 1.5, step=0.1)
-        avg_occupancy = st.number_input("Avg Occupancy (persons/veh)", 1.0, 5.0, 1.4, step=0.1)
-        pct_commute = st.number_input("% Commute Trips", 0.0, 100.0, 35.0, step=1.0)
-        pct_heavy = st.number_input("% Heavy Vehicles", 0.0, 100.0, 8.0, step=0.5)
-    with col2:
-        trip_length = st.number_input("Avg Trip Length (km)", 0.1, value=12.0, step=0.1)
-        speed_base = st.number_input("Base Speed (km/h)", 5.0, 130.0, 45.0, step=1.0)
-        pct_business = st.number_input("% Business Trips", 0.0, 100.0, 15.0, step=1.0)
-        speed_project = st.number_input("Project Speed (km/h)", 5.0, 130.0, 65.0, step=1.0)
-
-    if pct_commute + pct_business > 100:
-        st.error("Commute + Business trips cannot exceed 100%")
-
-    st.divider()
-
-    # --- Safety ---
-    st.markdown("### Safety — Annual Crash Reductions")
-    col1, col2 = st.columns(2)
-    with col1:
-        crash_fatal = st.number_input("Fatal (crashes/yr)", 0.0, value=0.3, step=0.01)
-        crash_moderate = st.number_input("Moderate Injury (crashes/yr)", 0.0, value=3.0, step=0.1)
-        crash_pdo = st.number_input("Property Damage Only (crashes/yr)", 0.0, value=10.0, step=0.5)
-    with col2:
-        crash_serious = st.number_input("Serious Injury (crashes/yr)", 0.0, value=1.5, step=0.1)
-        crash_minor = st.number_input("Minor Injury (crashes/yr)", 0.0, value=5.0, step=0.1)
-
-    st.divider()
-
-    # --- Environmental ---
-    st.markdown("### Environmental Externalities")
-    co2_reduction = st.number_input("Annual CO₂ Reduction (tonnes)", 0.0, value=500.0, step=10.0)
-    col1, col2 = st.columns(2)
-    with col1:
-        air_pollution_reduction = st.number_input("Air Pollution ($000s/yr)", 0.0, value=85.0, step=1.0)
-    with col2:
-        noise_reduction = st.number_input("Noise Cost ($000s/yr)", 0.0, value=30.0, step=1.0)
-
-    # --- Active Transport ---
-    st.markdown("### Active Transport")
-    col1, col2 = st.columns(2)
-    with col1:
-        walk_km = st.number_input("Daily Walking (person-km)", 0.0, value=0.0, step=10.0)
-    with col2:
-        cycle_km = st.number_input("Daily Cycling (person-km)", 0.0, value=0.0, step=10.0)
-
-    # --- Scenario B overrides (only shown when comparison mode is on) ---
-    if comparison_mode:
-        st.divider()
-        st.markdown("### Scenario B — Overrides")
-        st.caption("Parameters not overridden use Scenario A values")
-        b_name = st.text_input("Project Name (B)", value=project_name + " — Alt", key="b_name")
-        b_col1, b_col2 = st.columns(2)
-        with b_col1:
-            b_cap_construction = st.number_input("Construction ($M)", 0.0, value=cap_construction, step=1.0, key="b_construction")
-            b_speed_project = st.number_input("Project Speed (km/h)", 5.0, 130.0, speed_project, step=1.0, key="b_speed_project")
-            b_traffic_growth = st.number_input("Traffic Growth (%/yr)", 0.0, 10.0, traffic_growth, step=0.1, key="b_growth")
-        with b_col2:
-            b_contingency = st.number_input("Contingency (%)", 0.0, 100.0, contingency, step=1.0, key="b_contingency")
-            b_aadt = st.number_input("Base AADT", 0, value=aadt, step=100, key="b_aadt")
-            b_discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, discount_rate, step=0.5, key="b_dr")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RUN CALCULATION
 # ─────────────────────────────────────────────────────────────────────────────
-inputs = {
-    "context": context, "evaluation_period": eval_period,
-    "construction_years": const_years, "discount_rate": discount_rate,
-    "aadt": aadt, "traffic_growth": traffic_growth, "trip_length": trip_length,
-    "occupancy": avg_occupancy, "pct_commute": pct_commute,
-    "pct_business": pct_business, "pct_heavy": pct_heavy,
-    "speed_base": speed_base, "speed_project": speed_project,
-    "cap_planning": cap_planning, "cap_land": cap_land,
-    "cap_construction": cap_construction, "contingency": contingency,
-    "opex_maint": opex_maint, "opex_op": opex_op, "residual": residual,
-    "crash_fatal": crash_fatal, "crash_serious": crash_serious,
-    "crash_moderate": crash_moderate, "crash_minor": crash_minor,
-    "crash_pdo": crash_pdo, "co2_reduction": co2_reduction,
-    "air_pollution_reduction": air_pollution_reduction,
-    "noise_reduction": noise_reduction, "walk_km": walk_km, "cycle_km": cycle_km,
-}
-
-results = calculate(inputs)
-
-# ── Matrix-based calculation (Steps 7-8) — runs alongside legacy calculate() ──
-# Builds matrix_inputs from the shared sidebar fields + session_state config.
-# matrix_results is keyed by "project_1"…"project_N"; consumed by future
-# dashboard/cashflow updates. Falls back to an empty dict on any error so the
-# existing dashboard is never blocked by incomplete matrix data.
 _matrix_inputs = {
     "context": context,
     "evaluation_period": eval_period,
@@ -1843,23 +1753,8 @@ try:
     )
 except Exception as _calc_err:
     matrix_results = {}
-    # Surface the error only in debug mode to avoid cluttering the UI
     if st.session_state.get("debug_mode"):
         st.error(f"Matrix calculation error: {_calc_err}")
-
-# Scenario B calculation (if comparison mode)
-results_b = None
-if comparison_mode:
-    inputs_b = inputs.copy()
-    inputs_b.update({
-        "cap_construction": b_cap_construction,
-        "contingency": b_contingency,
-        "speed_project": b_speed_project,
-        "aadt": b_aadt,
-        "traffic_growth": b_traffic_growth,
-        "discount_rate": b_discount_rate,
-    })
-    results_b = calculate(inputs_b)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1884,7 +1779,7 @@ st.markdown(f"""
 _n_cases = st.session_state.n_project_cases
 
 if matrix_results and _n_cases > 1:
-    # Multi-case: one KPI column per project case from the matrix engine
+    # Multi-case: one KPI column per project case
     _case_cols = st.columns(min(_n_cases, 4))
     for _i, _col in enumerate(_case_cols, 1):
         _mr = matrix_results.get(f"project_{_i}", {})
@@ -1901,53 +1796,9 @@ if matrix_results and _n_cases > 1:
             st.metric("PV Costs", format_m(_mr.get("pv_costs", 0)))
             st.metric("FYRR", f"{_mr.get('fyrr', 0):.1f}%")
             st.metric("Payback", _pb)
-
-elif comparison_mode and results_b:
-    # Legacy comparison mode (Scenario A vs B)
-    col_a, col_b, col_delta = st.columns(3)
-    with col_a:
-        st.markdown(f"**Scenario A: {project_name}**")
-        st.metric("NPV", format_m(results["npv"]),
-                  delta="Positive" if results["npv"] >= 0 else "Negative",
-                  delta_color="normal" if results["npv"] >= 0 else "inverse")
-        st.metric("BCR", f"{results['bcr']:.2f}",
-                  delta="Above 1.0" if results["bcr"] >= 1 else "Below 1.0",
-                  delta_color="normal" if results["bcr"] >= 1 else "inverse")
-        st.metric("PV Benefits", format_m(results["pv_benefits"]))
-        st.metric("PV Costs", format_m(results["pv_costs"]))
-        st.metric("FYRR", f"{results['fyrr']:.1f}%")
-        pb_a = f"{results['payback_year']} yrs" if results["payback_year"] else "N/A"
-        st.metric("Payback", pb_a)
-    with col_b:
-        st.markdown(f"**Scenario B: {b_name}**")
-        st.metric("NPV", format_m(results_b["npv"]),
-                  delta="Positive" if results_b["npv"] >= 0 else "Negative",
-                  delta_color="normal" if results_b["npv"] >= 0 else "inverse")
-        st.metric("BCR", f"{results_b['bcr']:.2f}",
-                  delta="Above 1.0" if results_b["bcr"] >= 1 else "Below 1.0",
-                  delta_color="normal" if results_b["bcr"] >= 1 else "inverse")
-        st.metric("PV Benefits", format_m(results_b["pv_benefits"]))
-        st.metric("PV Costs", format_m(results_b["pv_costs"]))
-        st.metric("FYRR", f"{results_b['fyrr']:.1f}%")
-        pb_b = f"{results_b['payback_year']} yrs" if results_b["payback_year"] else "N/A"
-        st.metric("Payback", pb_b)
-    with col_delta:
-        st.markdown("**Delta (B - A)**")
-        delta_npv = results_b["npv"] - results["npv"]
-        st.metric("NPV Delta", format_m(delta_npv),
-                  delta="Better" if delta_npv > 0 else "Worse",
-                  delta_color="normal" if delta_npv > 0 else "inverse")
-        delta_bcr = results_b["bcr"] - results["bcr"]
-        st.metric("BCR Delta", f"{delta_bcr:+.2f}",
-                  delta="Better" if delta_bcr > 0 else "Worse",
-                  delta_color="normal" if delta_bcr > 0 else "inverse")
-        st.metric("PV Benefits Delta", format_m(results_b["pv_benefits"] - results["pv_benefits"]))
-        st.metric("PV Costs Delta", format_m(results_b["pv_costs"] - results["pv_costs"]))
-        st.metric("FYRR Delta", f"{results_b['fyrr'] - results['fyrr']:+.1f}%")
-
-else:
-    # Single case: prefer matrix_results["project_1"], fall back to legacy results
-    _r_kpi = matrix_results.get("project_1") or results
+elif matrix_results:
+    # Single project case
+    _r_kpi = matrix_results["project_1"]
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     with k1:
         st.metric("Net Present Value", format_m(_r_kpi["npv"]),
@@ -1966,18 +1817,22 @@ else:
     with k6:
         pb = f"{_r_kpi['payback_year']} years" if _r_kpi["payback_year"] else "N/A"
         st.metric("Payback Period", pb)
+else:
+    st.info("Enter traffic data in the **Data Input** tab to see results.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXPORT BUTTON
 # ─────────────────────────────────────────────────────────────────────────────
-csv_data = generate_csv(results, project_name)
-st.download_button(
-    "Download CSV Export",
-    csv_data,
-    file_name="cba-results.csv",
-    mime="text/csv",
-    use_container_width=False,
-)
+_export_r = matrix_results.get("project_1", {})
+if _export_r:
+    csv_data = generate_csv(_export_r, project_name)
+    st.download_button(
+        "Download CSV Export",
+        csv_data,
+        file_name="cba-results.csv",
+        mime="text/csv",
+        use_container_width=False,
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TABBED LAYOUT
@@ -2124,7 +1979,11 @@ with tab_dash:
     _n_dash = st.session_state.n_project_cases
     _CASE_PALETTE = ["#0d6efd", "#fd7e14", "#198754", "#dc3545", "#6610f2"]
 
-    if matrix_results and _n_dash > 1:
+    if not matrix_results:
+        st.info("Enter traffic data in the **Data Input** tab to see charts.")
+        st.stop()
+
+    if _n_dash > 1:
         _dash_case = st.selectbox(
             "Project case to display in charts",
             options=[f"project_{i}" for i in range(1, _n_dash + 1)],
@@ -2133,7 +1992,7 @@ with tab_dash:
         )
         _r = matrix_results[_dash_case]
     else:
-        _r = matrix_results.get("project_1") or results
+        _r = matrix_results["project_1"]
 
     chart1, chart2 = st.columns(2)
 
@@ -2252,15 +2111,8 @@ with tab_dash:
                 fill="tozeroy", mode="lines",
                 line=dict(color=COLORS["neutral"], width=2.5),
                 fillcolor="rgba(13, 110, 253, 0.15)",
-                name="Scenario A" if comparison_mode else "Cumulative NPV",
+                name="Cumulative NPV",
             ))
-            if comparison_mode and results_b:
-                fig_cum.add_trace(go.Scatter(
-                    x=list(range(1, results_b["total_years"] + 1)),
-                    y=results_b["cum_disc_net"],
-                    mode="lines", name="Scenario B",
-                    line=dict(color="#fd7e14", width=2.5, dash="dash"),
-                ))
             if _r.get("payback_year"):
                 fig_cum.add_vline(
                     x=_r["payback_year"], line_dash="dot",
@@ -2287,9 +2139,12 @@ with tab_dash:
 with tab_cashflow:
     st.markdown('<div class="section-header">Year-by-Year Cashflow</div>', unsafe_allow_html=True)
 
-    # Case selector when matrix results available
-    _cf_case_keys = list(matrix_results.keys()) if matrix_results else []
-    if _cf_case_keys:
+    if not matrix_results:
+        st.info("Enter traffic data in the **Data Input** tab to see cashflow.")
+        st.stop()
+
+    _cf_case_keys = list(matrix_results.keys())
+    if len(_cf_case_keys) > 1:
         _cf_case_labels = {k: f"Project Case {k.split('_')[1]}" for k in _cf_case_keys}
         _cf_sel = st.selectbox(
             "Project Case",
@@ -2297,11 +2152,11 @@ with tab_cashflow:
             format_func=lambda k: _cf_case_labels[k],
             key="cf_case_sel",
         )
-        _r_cf = matrix_results[_cf_sel]
         _cf_filename_suffix = f"-{_cf_sel}"
     else:
-        _r_cf = results
+        _cf_sel = _cf_case_keys[0]
         _cf_filename_suffix = ""
+    _r_cf = matrix_results[_cf_sel]
 
     view_mode = st.radio("Values", ["Undiscounted", "Discounted"], horizontal=True, key="cf_view")
     years_list = list(range(1, _r_cf["total_years"] + 1))
@@ -2347,9 +2202,12 @@ with tab_sensitivity:
     # --- Existing sensitivity charts ---
     st.markdown('<div class="section-header">Sensitivity Analysis</div>', unsafe_allow_html=True)
 
-    # Case selector when matrix results available
-    _sens_case_keys = list(matrix_results.keys()) if matrix_results else []
-    if _sens_case_keys:
+    if not matrix_results:
+        st.info("Enter traffic data in the **Data Input** tab to see sensitivity analysis.")
+        st.stop()
+
+    _sens_case_keys = list(matrix_results.keys())
+    if len(_sens_case_keys) > 1:
         _sens_case_labels = {k: f"Project Case {k.split('_')[1]}" for k in _sens_case_keys}
         _sens_sel = st.selectbox(
             "Project Case",
@@ -2357,9 +2215,9 @@ with tab_sensitivity:
             format_func=lambda k: _sens_case_labels[k],
             key="sens_case_sel",
         )
-        _r_sens = matrix_results[_sens_sel]
     else:
-        _r_sens = results
+        _sens_sel = _sens_case_keys[0]
+    _r_sens = matrix_results[_sens_sel]
 
     sen1, sen2 = st.columns(2)
 
@@ -2455,102 +2313,6 @@ with tab_sensitivity:
     with fy_cols[6]:
         st.metric("Total", f"${fy['total']:.2f}M")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # INTERACTIVE SENSITIVITY SLIDERS + TORNADO CHART
-    # ─────────────────────────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">Interactive Parameter Sensitivity</div>', unsafe_allow_html=True)
-    st.caption("Drag sliders to explore how each parameter affects the BCR. "
-               "The tornado chart shows the BCR range from varying each parameter independently.")
-
-    sens_params = {
-        "AADT": {"key": "aadt", "min_val": max(1000, int(aadt * 0.5)), "max_val": int(aadt * 1.5),
-                 "default": aadt, "step": 500},
-        "Traffic Growth (%/yr)": {"key": "traffic_growth", "min_val": 0.0, "max_val": 5.0,
-                                   "default": traffic_growth, "step": 0.1},
-        "Construction Cost ($M)": {"key": "cap_construction", "min_val": max(1.0, cap_construction * 0.5),
-                                    "max_val": cap_construction * 1.5, "default": cap_construction, "step": 1.0},
-        "Discount Rate (%)": {"key": "discount_rate", "min_val": 3.0, "max_val": 12.0,
-                               "default": discount_rate, "step": 0.5},
-        "Evaluation Period (yrs)": {"key": "evaluation_period", "min_val": 10, "max_val": 50,
-                                     "default": eval_period, "step": 1},
-    }
-
-    sl1, sl2 = st.columns(2)
-    slider_values = {}
-    for i, (label, cfg) in enumerate(sens_params.items()):
-        col = sl1 if i % 2 == 0 else sl2
-        with col:
-            slider_values[cfg["key"]] = st.slider(
-                label, min_value=cfg["min_val"], max_value=cfg["max_val"],
-                value=cfg["default"], step=cfg["step"],
-                key=f"sens_{cfg['key']}"
-            )
-
-    # Compute tornado data
-    baseline_bcr = _r_sens["bcr"]
-    tornado_data = []
-
-    for label, cfg in sens_params.items():
-        inputs_low = inputs.copy()
-        inputs_low[cfg["key"]] = cfg["min_val"]
-        bcr_low = calculate(inputs_low)["bcr"]
-
-        inputs_high = inputs.copy()
-        inputs_high[cfg["key"]] = cfg["max_val"]
-        bcr_high = calculate(inputs_high)["bcr"]
-
-        tornado_data.append({
-            "param": label,
-            "bcr_low": min(bcr_low, bcr_high),
-            "bcr_high": max(bcr_low, bcr_high),
-            "range": abs(bcr_high - bcr_low),
-        })
-
-    tornado_data.sort(key=lambda x: x["range"], reverse=True)
-
-    fig_tornado = go.Figure()
-    for item in tornado_data:
-        fig_tornado.add_trace(go.Bar(
-            y=[item["param"]],
-            x=[item["bcr_high"] - baseline_bcr],
-            base=[baseline_bcr],
-            orientation="h",
-            marker_color=COLORS["positive"],
-            showlegend=False,
-        ))
-        fig_tornado.add_trace(go.Bar(
-            y=[item["param"]],
-            x=[item["bcr_low"] - baseline_bcr],
-            base=[baseline_bcr],
-            orientation="h",
-            marker_color=COLORS["negative"],
-            showlegend=False,
-        ))
-
-    fig_tornado.add_vline(x=baseline_bcr, line_dash="dash", line_color="#6c757d",
-                          annotation_text=f"Baseline BCR: {baseline_bcr:.2f}")
-    fig_tornado.update_layout(
-        height=350, barmode="overlay",
-        xaxis_title="BCR", yaxis_title="",
-        margin=dict(t=30, b=30, l=150, r=30),
-        **PLOTLY_TRANSPARENT,
-    )
-    st.plotly_chart(fig_tornado, use_container_width=True)
-
-    # What-if calculation using all slider values simultaneously
-    inputs_whatif = inputs.copy()
-    for cfg in sens_params.values():
-        inputs_whatif[cfg["key"]] = slider_values[cfg["key"]]
-    results_whatif = calculate(inputs_whatif)
-
-    wi1, wi2, wi3 = st.columns(3)
-    with wi1:
-        st.metric("What-If BCR", f"{results_whatif['bcr']:.2f}",
-                  delta=f"{results_whatif['bcr'] - baseline_bcr:+.2f} vs baseline")
-    with wi2:
-        st.metric("What-If NPV", format_m(results_whatif["npv"]))
-    with wi3:
-        st.metric("What-If PV Benefits", format_m(results_whatif["pv_benefits"]))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 4: PARAMETERS (EDITABLE)
