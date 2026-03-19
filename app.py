@@ -633,6 +633,195 @@ def _handle_template_upload(uploaded_file) -> None:
         st.error(f"Import failed: {e}")
 
 
+def _smart_parse_upload(uploaded_file) -> None:
+    """Attempt automatic column detection for arbitrary CSV/Excel files."""
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            dfs = {"Sheet1": pd.read_csv(uploaded_file)}
+        else:
+            xl = pd.ExcelFile(uploaded_file)
+            # If it looks like our own template, delegate to the template handler
+            template_sheets = {"VHT", "VKT", "Stops", "Demand", "Crashes"}
+            if template_sheets & set(xl.sheet_names):
+                _handle_template_upload(uploaded_file)
+                return
+            dfs = {sh: xl.parse(sh) for sh in xl.sheet_names}
+
+        case_labels_norm = {
+            "base case": "Base Case", "base": "Base Case",
+            **{f"project {i}": f"Project {i}" for i in range(1, n + 1)},
+            **{f"project_{i}": f"Project {i}" for i in range(1, n + 1)},
+            **{f"project{i}": f"Project {i}" for i in range(1, n + 1)},
+        }
+
+        imported = []
+        for sheet_name, df in dfs.items():
+            df.columns = [str(c).strip() for c in df.columns]
+
+            # Detect year columns: 4-digit integers 2020-2100
+            year_cols = [c for c in df.columns if c.isdigit() and 2020 <= int(c) <= 2100]
+            if not year_cols:
+                continue
+
+            case_col = next((c for c in df.columns if c.lower() in
+                             ("case", "scenario", "project")), None)
+            vt_col = next((c for c in df.columns if c.lower() in
+                           ("vehicle type", "vehicletype", "vtype", "vehicle")), None)
+
+            # Infer metric from sheet name
+            inferred_metric = next(
+                (m for m in ("vht", "vkt", "stops", "demand") if m in sheet_name.lower()),
+                "vht",
+            )
+
+            norm_rows = []
+            for _, row in df.iterrows():
+                raw_case = str(row[case_col]).strip().lower() if case_col else "base case"
+                norm_case = case_labels_norm.get(raw_case, "Base Case")
+
+                raw_vt = str(row[vt_col]).strip() if vt_col else "Car"
+                vt_match = next(
+                    (vt for vt in VTYPES if raw_vt.lower() in (vt.lower(), vt[:3].lower())),
+                    None,
+                )
+                if vt_match is None:
+                    continue
+
+                norm_row = {"Case": norm_case, "Vehicle Type": vt_match}
+                for yc in year_cols:
+                    norm_row[yc] = row.get(yc, 0.0)
+                norm_rows.append(norm_row)
+
+            if norm_rows:
+                _apply_template_df(pd.DataFrame(norm_rows), inferred_metric, years, n)
+                imported.append(f"{sheet_name} → {inferred_metric.upper()}")
+
+        if imported:
+            st.success(f"Smart parse imported: {', '.join(imported)}")
+            st.rerun()
+        else:
+            st.warning(
+                "Could not detect year columns (expecting 4-digit years ≥ 2020) or no "
+                "matching vehicle types found. Try **Template** mode instead."
+            )
+    except Exception as e:
+        st.error(f"Smart parse failed: {e}")
+
+
+def _render_user_mapping_upload(uploaded_file) -> None:
+    """Render a column-mapping UI for arbitrary CSV/Excel files."""
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            xl = pd.ExcelFile(uploaded_file)
+            sheet = st.selectbox("Sheet", xl.sheet_names, key="um_sheet")
+            df = xl.parse(sheet)
+
+        df.columns = [str(c).strip() for c in df.columns]
+        all_cols = list(df.columns)
+        none_opt = "(none)"
+        col_opts = [none_opt] + all_cols
+
+        st.markdown("**Map columns to fields:**")
+        m1, m2 = st.columns(2)
+        with m1:
+            _case_default = next(
+                (i + 1 for i, c in enumerate(all_cols) if c.lower() in ("case", "scenario")), 0
+            )
+            case_col = st.selectbox("Case column", col_opts, index=_case_default, key="um_case_col")
+            _vt_default = next(
+                (i + 1 for i, c in enumerate(all_cols)
+                 if "vehicle" in c.lower() or "vtype" in c.lower()), 0
+            )
+            vt_col = st.selectbox("Vehicle Type column", col_opts, index=_vt_default, key="um_vt_col")
+
+        with m2:
+            metric = st.selectbox(
+                "Metric", ["vht", "vkt", "stops", "demand", "crashes"], key="um_metric"
+            )
+            year_cols_detected = [
+                c for c in all_cols if c.isdigit() and 2020 <= int(c) <= 2100
+            ]
+            year_cols_sel = st.multiselect(
+                "Year columns", all_cols, default=year_cols_detected, key="um_year_cols"
+            )
+
+        # Case value → standard name mapping
+        if case_col and case_col != none_opt:
+            unique_cases = [str(v) for v in df[case_col].dropna().unique()[:6]]
+            standard_cases = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
+            st.markdown("**Map case values to standard names:**")
+            case_map: dict = {}
+            for uc in unique_cases:
+                case_map[uc] = st.selectbox(
+                    f'"{uc}"', standard_cases, key=f"um_casemap_{uc}"
+                )
+        else:
+            case_map = {}
+
+        if st.button("Apply Mapping", key="um_apply"):
+            if not year_cols_sel:
+                st.error("Select at least one year column.")
+                return
+
+            norm_rows = []
+            for _, row in df.iterrows():
+                raw_case = (
+                    str(row[case_col]).strip() if case_col and case_col != none_opt else "Base Case"
+                )
+                norm_case = case_map.get(raw_case, raw_case)
+
+                if metric == "crashes":
+                    sev_col = next(
+                        (c for c in all_cols if "sever" in c.lower()), None
+                    )
+                    raw_sev = str(row[sev_col]).strip() if sev_col else ""
+                    norm_row = {"Case": norm_case, "Severity": raw_sev}
+                    for yc in year_cols_sel:
+                        norm_row[str(yc)] = row.get(yc, 0.0)
+                    norm_rows.append(norm_row)
+                else:
+                    raw_vt = (
+                        str(row[vt_col]).strip() if vt_col and vt_col != none_opt else "Car"
+                    )
+                    vt_match = next(
+                        (vt for vt in VTYPES
+                         if raw_vt.lower() in (vt.lower(), vt[:3].lower())),
+                        None,
+                    )
+                    if vt_match is None:
+                        continue
+                    norm_row = {"Case": norm_case, "Vehicle Type": vt_match}
+                    for yc in year_cols_sel:
+                        norm_row[str(yc)] = row.get(yc, 0.0)
+                    norm_rows.append(norm_row)
+
+            if not norm_rows:
+                st.warning(
+                    "No rows matched after mapping. Check column selections and "
+                    "case/vehicle type values."
+                )
+                return
+
+            norm_df = pd.DataFrame(norm_rows)
+            if metric == "crashes":
+                _apply_crash_template_df(norm_df, years, n)
+            else:
+                _apply_template_df(norm_df, metric, years, n)
+            st.success(f"Applied mapping: {len(norm_rows)} rows → {metric.upper()}")
+            st.rerun()
+
+    except Exception as e:
+        st.error(f"User mapping failed: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CALCULATION ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1522,19 +1711,19 @@ with st.sidebar:
     st.markdown("### Capital Costs ($M, undiscounted)")
     col1, col2 = st.columns(2)
     with col1:
-        cap_planning = st.number_input("Planning & Design", 0.0, value=5.0, step=0.1)
-        cap_construction = st.number_input("Construction", 0.0, value=120.0, step=1.0)
+        cap_planning = st.number_input("Planning & Design ($M)", 0.0, value=5.0, step=0.1)
+        cap_construction = st.number_input("Construction ($M)", 0.0, value=120.0, step=1.0)
     with col2:
-        cap_land = st.number_input("Land Acquisition", 0.0, value=10.0, step=0.1)
+        cap_land = st.number_input("Land Acquisition ($M)", 0.0, value=10.0, step=0.1)
         contingency = st.number_input("Contingency (%)", 0.0, 100.0, 20.0, step=1.0)
 
     # --- Recurrent Costs ---
     st.markdown("### Recurrent Costs ($M/year)")
     col1, col2 = st.columns(2)
     with col1:
-        opex_maint = st.number_input("Maintenance", 0.0, value=1.5, step=0.1)
+        opex_maint = st.number_input("Maintenance ($M/yr)", 0.0, value=1.5, step=0.1)
     with col2:
-        opex_op = st.number_input("Operating", 0.0, value=0.8, step=0.1)
+        opex_op = st.number_input("Operating ($M/yr)", 0.0, value=0.8, step=0.1)
     residual = st.number_input("Residual Value ($M)", 0.0, value=15.0, step=0.1)
 
     st.divider()
@@ -1545,7 +1734,7 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         traffic_growth = st.number_input("Traffic Growth (%/yr)", 0.0, 10.0, 1.5, step=0.1)
-        avg_occupancy = st.number_input("Avg Occupancy", 1.0, 5.0, 1.4, step=0.1)
+        avg_occupancy = st.number_input("Avg Occupancy (persons/veh)", 1.0, 5.0, 1.4, step=0.1)
         pct_commute = st.number_input("% Commute Trips", 0.0, 100.0, 35.0, step=1.0)
         pct_heavy = st.number_input("% Heavy Vehicles", 0.0, 100.0, 8.0, step=0.5)
     with col2:
@@ -1563,12 +1752,12 @@ with st.sidebar:
     st.markdown("### Safety — Annual Crash Reductions")
     col1, col2 = st.columns(2)
     with col1:
-        crash_fatal = st.number_input("Fatal", 0.0, value=0.3, step=0.01)
-        crash_moderate = st.number_input("Moderate Injury", 0.0, value=3.0, step=0.1)
-        crash_pdo = st.number_input("Property Damage Only", 0.0, value=10.0, step=0.5)
+        crash_fatal = st.number_input("Fatal (crashes/yr)", 0.0, value=0.3, step=0.01)
+        crash_moderate = st.number_input("Moderate Injury (crashes/yr)", 0.0, value=3.0, step=0.1)
+        crash_pdo = st.number_input("Property Damage Only (crashes/yr)", 0.0, value=10.0, step=0.5)
     with col2:
-        crash_serious = st.number_input("Serious Injury", 0.0, value=1.5, step=0.1)
-        crash_minor = st.number_input("Minor Injury", 0.0, value=5.0, step=0.1)
+        crash_serious = st.number_input("Serious Injury (crashes/yr)", 0.0, value=1.5, step=0.1)
+        crash_minor = st.number_input("Minor Injury (crashes/yr)", 0.0, value=5.0, step=0.1)
 
     st.divider()
 
@@ -1822,8 +2011,8 @@ with tab_datainput:
                 horizontal=True,
                 help=(
                     "**Template**: upload a file generated by the Download button. "
-                    "**Smart parse**: auto-detect headers (coming soon). "
-                    "**User mapping**: manually map columns (coming soon)."
+                    "**Smart parse**: auto-detect year columns and vehicle types. "
+                    "**User mapping**: manually map columns to fields."
                 ),
             )
             uploaded_file = st.file_uploader(
@@ -1834,8 +2023,10 @@ with tab_datainput:
             if uploaded_file is not None:
                 if parse_mode == "Template":
                     _handle_template_upload(uploaded_file)
+                elif parse_mode == "Smart parse":
+                    _smart_parse_upload(uploaded_file)
                 else:
-                    st.info(f"{parse_mode} mode — coming in next increment.")
+                    _render_user_mapping_upload(uploaded_file)
 
         with tmpl_col:
             st.markdown("**Download blank template**")
