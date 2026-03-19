@@ -34,9 +34,12 @@ st.set_page_config(
 # TfNSW ECONOMIC PARAMETER VALUES (Jan 2025, June 2024 prices)
 # ─────────────────────────────────────────────────────────────────────────────
 PARAMS = {
+    # Value of travel time savings $/person-hr, by vehicle type.
+    # Car/Bus use commute rate (personal travel); LCV/HCV use business rate (freight/commercial).
+    # Source: TfNSW EPV Jan 2025, Table 3
     "vtts": {
-        "urban": {"commute": 19.76, "business": 54.87, "other": 9.35},
-        "rural": {"commute": 17.78, "business": 49.38, "other": 8.42},
+        "urban": {"Car": 19.76, "LCV": 54.87, "HCV": 54.87, "Bus": 19.76},
+        "rural": {"Car": 17.78, "LCV": 49.38, "HCV": 49.38, "Bus": 17.78},
     },
     "voc": {
         "urban": {
@@ -1050,8 +1053,7 @@ def calculate_matrix(
 
     Args:
         inputs:        Project config keys: context, evaluation_period,
-                       construction_years, discount_rate, base_year,
-                       pct_commute, pct_business.
+                       construction_years, discount_rate, base_year.
         base_traffic:  traffic_case dict for the base case.
         proj_traffic:  traffic_case dict for this project case.
         crash_base:    crash_case dict for the base case.
@@ -1069,22 +1071,14 @@ def calculate_matrix(
     const_years = inputs["construction_years"]
     dr = inputs["discount_rate"]
     base_year = inputs.get("base_year", 2026)
-    pct_commute = inputs["pct_commute"] / 100
-    pct_business = inputs["pct_business"] / 100
-    pct_other = max(0.0, 1.0 - pct_commute - pct_business)
 
     # Annualisation: peak-period → annual
     exp_factor = annualisation["expansion_factor"]
     days = annualisation["days_per_year"]
     ann_factor = exp_factor * days
 
-    # VTTS weighted across trip purposes
-    vtts_set = _p["vtts"][ctx]
-    vtts_weighted = (
-        vtts_set["commute"] * pct_commute
-        + vtts_set["business"] * pct_business
-        + vtts_set["other"] * pct_other
-    )
+    # VTTS by vehicle type ($/person-hr)
+    vtts_by_vtype = _p["vtts"][ctx]
 
     # Capital and recurrent costs
     raw_cap = cost["cap_planning"] + cost["cap_land"] + cost["cap_construction"]
@@ -1130,7 +1124,7 @@ def calculate_matrix(
                     modelling_years, proj_traffic[vt]["vht"], eval_year
                 )
                 annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factor
-                b_tts += annual_vht_saving * _p["occupancy"][vt] * vtts_weighted / 1e6
+                b_tts += annual_vht_saving * _p["occupancy"][vt] * vtts_by_vtype[vt] / 1e6
 
             b_rel = b_tts * _p["reliability_ratio"] * 0.3
 
@@ -1269,7 +1263,7 @@ def calculate_all_cases(
 
     Args:
         inputs:       Project config (context, dr, eval_period, const_years,
-                      base_year, pct_commute, pct_business, n_project_cases).
+                      base_year, n_project_cases).
         traffic_data: Full traffic_data dict from session_state.
         crash_data:   Full crash_data dict from session_state.
         cost_data:    Full cost_data dict from session_state.
@@ -1387,10 +1381,10 @@ def build_effective_params() -> dict:
     p = copy.deepcopy(PARAMS)
     ss = st.session_state
     for _ctx in ("urban", "rural"):
-        for _pur in ("commute", "business", "other"):
-            _k = f"param_vtts_{_ctx}_{_pur}"
+        for _vt in ("Car", "LCV", "HCV", "Bus"):
+            _k = f"param_vtts_{_ctx}_{_vt}"
             if _k in ss:
-                p["vtts"][_ctx][_pur] = float(ss[_k])
+                p["vtts"][_ctx][_vt] = float(ss[_k])
     if "param_reliability_ratio" in ss:
         p["reliability_ratio"] = float(ss["param_reliability_ratio"])
     for _sev in ("fatal", "serious", "moderate", "minor", "pdo"):
@@ -1697,15 +1691,10 @@ with st.sidebar:
     with col1:
         eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30)
         base_year = st.number_input("Base Year", 2020, 2040, 2026)
-        pct_commute = st.number_input("% Commute Trips", 0.0, 100.0, 35.0, step=1.0)
     with col2:
         const_years = st.number_input("Construction Period (years)", 1, 10, 3)
         discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 7.0, step=0.5)
-        pct_business = st.number_input("% Business Trips", 0.0, 100.0, 15.0, step=1.0)
     context = st.selectbox("Context", ["urban", "rural"], format_func=str.title)
-
-    if pct_commute + pct_business > 100:
-        st.error("Commute + Business trips cannot exceed 100%")
 
     st.divider()
 
@@ -1738,8 +1727,6 @@ _matrix_inputs = {
     "construction_years": const_years,
     "discount_rate": discount_rate,
     "base_year": base_year,
-    "pct_commute": pct_commute,
-    "pct_business": pct_business,
     "n_project_cases": st.session_state.n_project_cases,
 }
 try:
@@ -2331,13 +2318,15 @@ with tab_params:
     # ── Value of Travel Time Savings ─────────────────────────────────────────
     with st.expander("Value of Travel Time Savings ($/person-hour)", expanded=True):
         _src_vtts = "TfNSW EPV Jan 2025, Table 3"
+        st.caption("Applied per vehicle type: Car/Bus use commute rate; LCV/HCV use business rate.")
         for _ctx in ("urban", "rural"):
             st.markdown(f"**{_ctx.title()}**")
-            for _pur, _label in [("commute", "Commute"), ("business", "Business"), ("other", "Other/Private")]:
+            for _vt, _label in [("Car", "Car"), ("LCV", "Light Commercial (LCV)"),
+                                 ("HCV", "Heavy Commercial (HCV)"), ("Bus", "Bus")]:
                 param_editor(
                     label=f"{_label} — {_ctx.title()}",
-                    key=f"param_vtts_{_ctx}_{_pur}",
-                    default=PARAMS["vtts"][_ctx][_pur],
+                    key=f"param_vtts_{_ctx}_{_vt}",
+                    default=PARAMS["vtts"][_ctx][_vt],
                     min_val=0.0, max_val=200.0, step=0.5,
                     unit="$/person-hr", source=_src_vtts,
                 )
