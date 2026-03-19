@@ -1139,6 +1139,101 @@ def generate_csv(results: dict, project_name: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# INCREMENTAL BENEFITS SUMMARY HELPER — Step 11
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_incremental_summary() -> None:
+    """Step 11: Render the Incremental Benefits Summary table.
+
+    Shows base-case and project-case absolute traffic/crash values at a chosen
+    modelling year, plus colour-coded Δ columns (Project − Base).
+    Negative Δ = green (reduction = improvement for VHT/VKT/crashes).
+    Positive Δ = red (increase = disbenefit for the same metrics).
+    """
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+    td = st.session_state.traffic_data
+    cd = st.session_state.crash_data
+
+    if not years or not td:
+        return
+
+    st.markdown(
+        '<div class="section-header">Incremental Benefits Summary</div>',
+        unsafe_allow_html=True,
+    )
+
+    sel_year = st.selectbox(
+        "Display modelling year",
+        options=years,
+        key="incr_summary_year_sel",
+    )
+    y_idx = years.index(sel_year)
+
+    _TRAFFIC_ROWS = [
+        ("VHT (veh-hrs/peak period)", "vht"),
+        ("VKT (veh-km/peak period)", "vkt"),
+        ("Stops (stops/peak period)", "stops"),
+        ("Demand (person-trips/peak period)", "demand"),
+    ]
+    _CRASH_ROWS = [
+        ("Fatal crashes (annual)", "fatal"),
+        ("Serious injury crashes (annual)", "serious"),
+        ("Moderate injury crashes (annual)", "moderate"),
+        ("Minor injury crashes (annual)", "minor"),
+        ("PDO crashes (annual)", "pdo"),
+    ]
+
+    rows_data = {}
+
+    # Traffic rows: sum across vehicle types at selected modelling year
+    for label, metric in _TRAFFIC_ROWS:
+        base_val = sum(td["base_case"][vt][metric][y_idx] for vt in VTYPES)
+        row: dict = {"Base Case": base_val}
+        for i in range(1, n + 1):
+            proj_val = sum(td[f"project_{i}"][vt][metric][y_idx] for vt in VTYPES)
+            row[f"Project {i}"] = proj_val
+            row[f"Δ{i}"] = proj_val - base_val
+        rows_data[label] = row
+
+    # Crash rows: per severity
+    for label, sev in _CRASH_ROWS:
+        base_val = cd["base_case"][sev][y_idx]
+        row = {"Base Case": base_val}
+        for i in range(1, n + 1):
+            proj_val = cd[f"project_{i}"][sev][y_idx]
+            row[f"Project {i}"] = proj_val
+            row[f"Δ{i}"] = proj_val - base_val
+        rows_data[label] = row
+
+    df_inc = pd.DataFrame.from_dict(rows_data, orient="index")
+    delta_cols = [c for c in df_inc.columns if str(c).startswith("Δ")]
+
+    def _colour_delta(val):
+        if isinstance(val, (int, float)):
+            if val < 0:
+                return "background-color:rgba(25,135,84,0.12);color:#198754"
+            if val > 0:
+                return "background-color:rgba(220,53,69,0.12);color:#dc3545"
+        return ""
+
+    fmt: dict = {}
+    fmt.update({col: "{:+.0f}" for col in delta_cols})
+    fmt.update({col: "{:.0f}" for col in df_inc.columns if col not in delta_cols})
+
+    styled = df_inc.style.format(fmt)
+    for col in delta_cols:
+        styled = styled.applymap(_colour_delta, subset=[col])
+
+    st.dataframe(styled, use_container_width=True)
+    st.caption(
+        f"Values are totals across Car, LCV, HCV, Bus at modelling year {sel_year}. "
+        "Δ = Project − Base. "
+        "Green (negative) = reduction = improvement for VHT, VKT, and crash counts."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # COLOUR PALETTE
 # ─────────────────────────────────────────────────────────────────────────────
 COLORS = {
@@ -1501,10 +1596,31 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KPI METRICS
+# KPI METRICS — Step 10: multi-case aware
 # ─────────────────────────────────────────────────────────────────────────────
-if comparison_mode and results_b:
-    # Side-by-side KPIs for comparison mode
+_n_cases = st.session_state.n_project_cases
+
+if matrix_results and _n_cases > 1:
+    # Multi-case: one KPI column per project case from the matrix engine
+    _case_cols = st.columns(min(_n_cases, 4))
+    for _i, _col in enumerate(_case_cols, 1):
+        _mr = matrix_results.get(f"project_{_i}", {})
+        _pb = f"{_mr['payback_year']} yrs" if _mr.get("payback_year") else "N/A"
+        with _col:
+            st.markdown(f"**Project {_i}**")
+            st.metric("NPV", format_m(_mr.get("npv", 0)),
+                      delta="Positive" if _mr.get("npv", 0) >= 0 else "Negative",
+                      delta_color="normal" if _mr.get("npv", 0) >= 0 else "inverse")
+            st.metric("BCR", f"{_mr.get('bcr', 0):.2f}",
+                      delta="≥ 1.0" if _mr.get("bcr", 0) >= 1 else "< 1.0",
+                      delta_color="normal" if _mr.get("bcr", 0) >= 1 else "inverse")
+            st.metric("PV Benefits", format_m(_mr.get("pv_benefits", 0)))
+            st.metric("PV Costs", format_m(_mr.get("pv_costs", 0)))
+            st.metric("FYRR", f"{_mr.get('fyrr', 0):.1f}%")
+            st.metric("Payback", _pb)
+
+elif comparison_mode and results_b:
+    # Legacy comparison mode (Scenario A vs B)
     col_a, col_b, col_delta = st.columns(3)
     with col_a:
         st.markdown(f"**Scenario A: {project_name}**")
@@ -1542,31 +1658,30 @@ if comparison_mode and results_b:
         st.metric("BCR Delta", f"{delta_bcr:+.2f}",
                   delta="Better" if delta_bcr > 0 else "Worse",
                   delta_color="normal" if delta_bcr > 0 else "inverse")
-        delta_pvb = results_b["pv_benefits"] - results["pv_benefits"]
-        st.metric("PV Benefits Delta", format_m(delta_pvb))
-        delta_pvc = results_b["pv_costs"] - results["pv_costs"]
-        st.metric("PV Costs Delta", format_m(delta_pvc))
-        delta_fyrr = results_b["fyrr"] - results["fyrr"]
-        st.metric("FYRR Delta", f"{delta_fyrr:+.1f}%")
+        st.metric("PV Benefits Delta", format_m(results_b["pv_benefits"] - results["pv_benefits"]))
+        st.metric("PV Costs Delta", format_m(results_b["pv_costs"] - results["pv_costs"]))
+        st.metric("FYRR Delta", f"{results_b['fyrr'] - results['fyrr']:+.1f}%")
+
 else:
-    # Standard single-scenario KPIs
+    # Single case: prefer matrix_results["project_1"], fall back to legacy results
+    _r_kpi = matrix_results.get("project_1") or results
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     with k1:
-        st.metric("Net Present Value", format_m(results["npv"]),
-                  delta="Positive" if results["npv"] >= 0 else "Negative",
-                  delta_color="normal" if results["npv"] >= 0 else "inverse")
+        st.metric("Net Present Value", format_m(_r_kpi["npv"]),
+                  delta="Positive" if _r_kpi["npv"] >= 0 else "Negative",
+                  delta_color="normal" if _r_kpi["npv"] >= 0 else "inverse")
     with k2:
-        st.metric("Benefit-Cost Ratio", f"{results['bcr']:.2f}",
-                  delta="Above 1.0" if results["bcr"] >= 1 else "Below 1.0",
-                  delta_color="normal" if results["bcr"] >= 1 else "inverse")
+        st.metric("Benefit-Cost Ratio", f"{_r_kpi['bcr']:.2f}",
+                  delta="Above 1.0" if _r_kpi["bcr"] >= 1 else "Below 1.0",
+                  delta_color="normal" if _r_kpi["bcr"] >= 1 else "inverse")
     with k3:
-        st.metric("PV Benefits", format_m(results["pv_benefits"]))
+        st.metric("PV Benefits", format_m(_r_kpi["pv_benefits"]))
     with k4:
-        st.metric("PV Costs", format_m(results["pv_costs"]))
+        st.metric("PV Costs", format_m(_r_kpi["pv_costs"]))
     with k5:
-        st.metric("First Year Rate of Return", f"{results['fyrr']:.1f}%")
+        st.metric("First Year Rate of Return", f"{_r_kpi['fyrr']:.1f}%")
     with k6:
-        pb = f"{results['payback_year']} years" if results["payback_year"] else "N/A"
+        pb = f"{_r_kpi['payback_year']} years" if _r_kpi["payback_year"] else "N/A"
         st.metric("Payback Period", pb)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1720,16 +1835,29 @@ with tab_datainput:
 with tab_dash:
     st.markdown('<div class="section-header">Analysis Charts</div>', unsafe_allow_html=True)
 
+    # ── Case selector (Step 10): pick which project case drives pie & waterfall ─
+    _n_dash = st.session_state.n_project_cases
+    _CASE_PALETTE = ["#0d6efd", "#fd7e14", "#198754", "#dc3545", "#6610f2"]
+
+    if matrix_results and _n_dash > 1:
+        _dash_case = st.selectbox(
+            "Project case to display in charts",
+            options=[f"project_{i}" for i in range(1, _n_dash + 1)],
+            format_func=lambda k: f"Project {k.split('_')[1]}",
+            key="dash_case_sel",
+        )
+        _r = matrix_results[_dash_case]
+    else:
+        _r = matrix_results.get("project_1") or results
+
     chart1, chart2 = st.columns(2)
 
     with chart1:
         st.subheader("Benefit Composition (PV $M)")
-        pv = results["pv_by_type"]
-        labels_list = []
-        values_list = []
-        colors_list = []
+        pv = _r["pv_by_type"]
+        labels_list, values_list, colors_list = [], [], []
         for t in ["tts", "reliability", "voc", "safety", "env", "active"]:
-            if pv[t] > 0:
+            if pv.get(t, 0) > 0:
                 labels_list.append(TYPE_LABELS[t])
                 values_list.append(round(pv[t], 2))
                 colors_list.append(COLORS[t])
@@ -1750,8 +1878,8 @@ with tab_dash:
     with chart2:
         st.subheader("NPV Waterfall ($M)")
         wf_labels = list(TYPE_LABELS.values()) + ["Total Benefits", "Costs", "NPV"]
-        wf_values = [pv[t] for t in TYPE_LABELS] + [
-            results["pv_benefits"], -results["pv_costs"], results["npv"]
+        wf_values = [pv.get(t, 0) for t in TYPE_LABELS] + [
+            _r["pv_benefits"], -_r["pv_costs"], _r["npv"]
         ]
         wf_measures = ["relative"] * 6 + ["total", "relative", "total"]
         fig_wf = go.Figure(go.Waterfall(
@@ -1770,27 +1898,40 @@ with tab_dash:
         )
         st.plotly_chart(fig_wf, use_container_width=True)
 
-    # --- Row 2: Cashflow & Cumulative ---
+    # ── Row 2: Cashflow & Cumulative ─────────────────────────────────────────
     chart3, chart4 = st.columns(2)
-    years = list(range(1, results["total_years"] + 1))
+    _years_dash = list(range(1, _r["total_years"] + 1))
 
     with chart3:
-        st.subheader("Annual Cashflow ($M, undiscounted)")
+        st.subheader("Annual Net Cashflow ($M, undiscounted)")
         fig_cf = go.Figure()
-        fig_cf.add_trace(go.Bar(
-            x=years, y=[-c for c in results["annual_costs"]],
-            name="Costs", marker_color=COLORS["negative"], opacity=0.7,
-        ))
-        fig_cf.add_trace(go.Bar(
-            x=years, y=results["annual_benefits"],
-            name="Benefits", marker_color=COLORS["positive"], opacity=0.7,
-        ))
-        fig_cf.add_trace(go.Scatter(
-            x=years, y=results["annual_net"],
-            name="Net", mode="lines+markers",
-            line=dict(color=COLORS["neutral"], width=2),
-            marker=dict(size=4),
-        ))
+        if matrix_results and _n_dash > 1:
+            # Overlay net cashflow for every project case
+            for _i in range(1, _n_dash + 1):
+                _mr_i = matrix_results.get(f"project_{_i}", {})
+                if _mr_i:
+                    fig_cf.add_trace(go.Scatter(
+                        x=list(range(1, _mr_i["total_years"] + 1)),
+                        y=_mr_i["annual_net"],
+                        name=f"Project {_i} Net", mode="lines+markers",
+                        line=dict(color=_CASE_PALETTE[(_i - 1) % len(_CASE_PALETTE)], width=2),
+                        marker=dict(size=4),
+                    ))
+        else:
+            fig_cf.add_trace(go.Bar(
+                x=_years_dash, y=[-c for c in _r["annual_costs"]],
+                name="Costs", marker_color=COLORS["negative"], opacity=0.7,
+            ))
+            fig_cf.add_trace(go.Bar(
+                x=_years_dash, y=_r["annual_benefits"],
+                name="Benefits", marker_color=COLORS["positive"], opacity=0.7,
+            ))
+            fig_cf.add_trace(go.Scatter(
+                x=_years_dash, y=_r["annual_net"],
+                name="Net", mode="lines+markers",
+                line=dict(color=COLORS["neutral"], width=2),
+                marker=dict(size=4),
+            ))
         fig_cf.update_layout(
             barmode="relative", height=400,
             margin=dict(t=20, b=20, l=20, r=20),
@@ -1803,29 +1944,46 @@ with tab_dash:
     with chart4:
         st.subheader("Cumulative Discounted Net Benefits ($M)")
         fig_cum = go.Figure()
-        fig_cum.add_trace(go.Scatter(
-            x=years, y=results["cum_disc_net"],
-            fill="tozeroy", mode="lines",
-            line=dict(color=COLORS["neutral"], width=2.5),
-            fillcolor="rgba(13, 110, 253, 0.15)",
-            name="Scenario A" if comparison_mode else "Cumulative NPV",
-        ))
-        # Overlay Scenario B if comparison mode
-        if comparison_mode and results_b:
-            years_b = list(range(1, results_b["total_years"] + 1))
+        if matrix_results and _n_dash > 1:
+            # Overlay cumulative NPV for every project case
+            for _i in range(1, _n_dash + 1):
+                _mr_i = matrix_results.get(f"project_{_i}", {})
+                if _mr_i:
+                    _col_i = _CASE_PALETTE[(_i - 1) % len(_CASE_PALETTE)]
+                    fig_cum.add_trace(go.Scatter(
+                        x=list(range(1, _mr_i["total_years"] + 1)),
+                        y=_mr_i["cum_disc_net"],
+                        mode="lines", name=f"Project {_i}",
+                        line=dict(color=_col_i, width=2),
+                    ))
+                    if _mr_i.get("payback_year"):
+                        fig_cum.add_vline(
+                            x=_mr_i["payback_year"], line_dash="dot",
+                            line_color=_col_i, opacity=0.5,
+                        )
+        else:
             fig_cum.add_trace(go.Scatter(
-                x=years_b, y=results_b["cum_disc_net"],
-                mode="lines", name="Scenario B",
-                line=dict(color="#fd7e14", width=2.5, dash="dash"),
+                x=_years_dash, y=_r["cum_disc_net"],
+                fill="tozeroy", mode="lines",
+                line=dict(color=COLORS["neutral"], width=2.5),
+                fillcolor="rgba(13, 110, 253, 0.15)",
+                name="Scenario A" if comparison_mode else "Cumulative NPV",
             ))
+            if comparison_mode and results_b:
+                fig_cum.add_trace(go.Scatter(
+                    x=list(range(1, results_b["total_years"] + 1)),
+                    y=results_b["cum_disc_net"],
+                    mode="lines", name="Scenario B",
+                    line=dict(color="#fd7e14", width=2.5, dash="dash"),
+                ))
+            if _r.get("payback_year"):
+                fig_cum.add_vline(
+                    x=_r["payback_year"], line_dash="dot",
+                    line_color=COLORS["positive"], opacity=0.7,
+                    annotation_text=f"Payback: Year {_r['payback_year']}",
+                    annotation_position="top right",
+                )
         fig_cum.add_hline(y=0, line_dash="dash", line_color="#6c757d", opacity=0.5)
-        if results["payback_year"]:
-            fig_cum.add_vline(
-                x=results["payback_year"], line_dash="dot",
-                line_color=COLORS["positive"], opacity=0.7,
-                annotation_text=f"Payback: Year {results['payback_year']}",
-                annotation_position="top right",
-            )
         fig_cum.update_layout(
             height=400, margin=dict(t=20, b=20, l=20, r=20),
             xaxis_title="Year", yaxis_title="$M",
@@ -1833,6 +1991,10 @@ with tab_dash:
             **PLOTLY_TRANSPARENT,
         )
         st.plotly_chart(fig_cum, use_container_width=True)
+
+    # ── Incremental Benefits Summary (Step 11) ───────────────────────────────
+    st.divider()
+    render_incremental_summary()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 2: DETAILED CASHFLOW
