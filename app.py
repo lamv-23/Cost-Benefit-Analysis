@@ -11,6 +11,7 @@ import plotly.express as px
 import math
 import io
 import csv
+import copy
 
 # Optional: Excel template generation (Step 6) — requires openpyxl
 try:
@@ -854,6 +855,7 @@ def calculate_matrix(
     crash_proj: dict,
     cost: dict,
     annualisation: dict,
+    params: dict = None,
 ) -> dict:
     """Compute CBA for one project case using the matrix traffic data model.
 
@@ -872,6 +874,7 @@ def calculate_matrix(
         Result dict with the same keys as the legacy ``calculate()`` output so
         existing dashboard/export code is compatible.
     """
+    _p = params if params is not None else PARAMS
     ctx = inputs["context"]
     eval_period = inputs["evaluation_period"]
     const_years = inputs["construction_years"]
@@ -887,7 +890,7 @@ def calculate_matrix(
     ann_factor = exp_factor * days
 
     # VTTS weighted across trip purposes
-    vtts_set = PARAMS["vtts"][ctx]
+    vtts_set = _p["vtts"][ctx]
     vtts_weighted = (
         vtts_set["commute"] * pct_commute
         + vtts_set["business"] * pct_business
@@ -938,14 +941,14 @@ def calculate_matrix(
                     modelling_years, proj_traffic[vt]["vht"], eval_year
                 )
                 annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factor
-                b_tts += annual_vht_saving * PARAMS["occupancy"][vt] * vtts_weighted / 1e6
+                b_tts += annual_vht_saving * _p["occupancy"][vt] * vtts_weighted / 1e6
 
-            b_rel = b_tts * PARAMS["reliability_ratio"] * 0.3
+            b_rel = b_tts * _p["reliability_ratio"] * 0.3
 
             # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
             for vt in VTYPES:
                 param_vt = VTYPE_MAP[vt]
-                voc_table = PARAMS["voc"][ctx].get(param_vt, {})
+                voc_table = _p["voc"][ctx].get(param_vt, {})
                 if not voc_table:
                     continue
 
@@ -969,15 +972,15 @@ def calculate_matrix(
             for s in _SEVERITIES:
                 c_base = interpolate_modelling_years(modelling_years, crash_base[s], eval_year)
                 c_proj = interpolate_modelling_years(modelling_years, crash_proj[s], eval_year)
-                b_safety += max(0.0, c_base - c_proj) * PARAMS["crash_costs"][s] / 1e6
+                b_safety += max(0.0, c_base - c_proj) * _p["crash_costs"][s] / 1e6
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
             for vt in VTYPES:
                 param_vt = VTYPE_MAP[vt]
                 emit_vt = EMISSION_VTYPE_MAP[vt]
-                emit_rate = PARAMS["emission_cost"][ctx].get(emit_vt, 0.0)
-                air_rate = PARAMS["air_pollution"][ctx].get(param_vt, 0.0)
-                noise_rate = PARAMS["noise"][ctx].get(param_vt, 0.0)
+                emit_rate = _p["emission_cost"][ctx].get(emit_vt, 0.0)
+                air_rate = _p["air_pollution"][ctx].get(param_vt, 0.0)
+                noise_rate = _p["noise"][ctx].get(param_vt, 0.0)
 
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], eval_year)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], eval_year)
@@ -1071,6 +1074,7 @@ def calculate_all_cases(
     crash_data: dict,
     cost_data: dict,
     annualisation: dict,
+    params: dict = None,
 ) -> dict:
     """Run calculate_matrix for every active project case vs the base case.
 
@@ -1098,6 +1102,7 @@ def calculate_all_cases(
             crash_proj=crash_data[case_key],
             cost=cost_data[case_key],
             annualisation=annualisation,
+            params=params,
         )
     return results
 
@@ -1136,6 +1141,94 @@ def generate_csv(results: dict, project_name: str) -> str:
             f"{r['cum_disc_net'][y]:.3f}",
         ])
     return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER EDITOR HELPERS — Phase 0e
+# ─────────────────────────────────────────────────────────────────────────────
+
+def param_editor(label: str, key: str, default: float,
+                 min_val: float, max_val: float, step: float,
+                 unit: str, source: str = "") -> float:
+    """Render a synchronized number_input + slider for one economic parameter.
+
+    Writes the current value to ``st.session_state[key]``.  A delta badge is
+    shown when the value has been changed from its TfNSW default.
+
+    Returns the current (possibly overridden) value.
+    """
+    current = float(st.session_state.get(key, default))
+    col_lbl, col_num, col_sl = st.columns([2, 1, 2])
+    with col_lbl:
+        st.write(f"**{label}** `{unit}`")
+        if source:
+            st.caption(source)
+        if current != default and default != 0:
+            pct = (current - default) / abs(default) * 100
+            arrow = "↑" if current > default else "↓"
+            st.caption(f"{arrow} {abs(pct):.0f}% from default")
+    with col_num:
+        num_val = st.number_input(
+            "", key=f"{key}_num", value=current,
+            min_value=float(min_val), max_value=float(max_val), step=float(step),
+            label_visibility="collapsed",
+        )
+    with col_sl:
+        sl_val = st.slider(
+            "", key=f"{key}_sl", value=current,
+            min_value=float(min_val), max_value=float(max_val), step=float(step),
+            label_visibility="collapsed",
+        )
+    # Slider takes precedence when it differs from the number input
+    new_val = sl_val if sl_val != current else num_val
+    if new_val != st.session_state.get(key, default):
+        st.session_state[key] = new_val
+        st.rerun()
+    st.session_state[key] = new_val
+    return new_val
+
+
+def build_effective_params() -> dict:
+    """Return a deep copy of PARAMS with any session_state overrides applied.
+
+    The Parameters tab writes overrides to session_state under ``param_*`` keys.
+    This function merges those back into the canonical PARAMS structure so that
+    ``calculate_matrix()`` uses user-edited values without mutating the global.
+    """
+    p = copy.deepcopy(PARAMS)
+    ss = st.session_state
+    for _ctx in ("urban", "rural"):
+        for _pur in ("commute", "business", "other"):
+            _k = f"param_vtts_{_ctx}_{_pur}"
+            if _k in ss:
+                p["vtts"][_ctx][_pur] = float(ss[_k])
+    if "param_reliability_ratio" in ss:
+        p["reliability_ratio"] = float(ss["param_reliability_ratio"])
+    for _sev in ("fatal", "serious", "moderate", "minor", "pdo"):
+        _k = f"param_crash_{_sev}"
+        if _k in ss:
+            p["crash_costs"][_sev] = float(ss[_k])
+    for _ctx in ("urban", "rural"):
+        for _vt in ("car", "lgv", "rigid", "bus"):
+            _k = f"param_emission_{_ctx}_{_vt}"
+            if _k in ss:
+                p["emission_cost"][_ctx][_vt] = float(ss[_k])
+        for _vt in ("car", "lgv", "rigid", "artic"):
+            _k = f"param_air_{_ctx}_{_vt}"
+            if _k in ss:
+                p["air_pollution"][_ctx][_vt] = float(ss[_k])
+            _k = f"param_noise_{_ctx}_{_vt}"
+            if _k in ss:
+                p["noise"][_ctx][_vt] = float(ss[_k])
+    for _mode in ("walking", "cycling"):
+        _k = f"param_health_{_mode}"
+        if _k in ss:
+            p["health_benefits"][_mode] = float(ss[_k])
+    for _vt in ("Car", "LCV", "HCV", "Bus"):
+        _k = f"param_occupancy_{_vt}"
+        if _k in ss:
+            p["occupancy"][_vt] = float(ss[_k])
+    return p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1557,6 +1650,7 @@ try:
         crash_data=st.session_state.crash_data,
         cost_data=st.session_state.cost_data,
         annualisation=st.session_state.annualisation,
+        params=build_effective_params(),
     )
 except Exception as _calc_err:
     matrix_results = {}
@@ -2002,29 +2096,45 @@ with tab_dash:
 with tab_cashflow:
     st.markdown('<div class="section-header">Year-by-Year Cashflow</div>', unsafe_allow_html=True)
 
+    # Case selector when matrix results available
+    _cf_case_keys = list(matrix_results.keys()) if matrix_results else []
+    if _cf_case_keys:
+        _cf_case_labels = {k: f"Project Case {k.split('_')[1]}" for k in _cf_case_keys}
+        _cf_sel = st.selectbox(
+            "Project Case",
+            options=_cf_case_keys,
+            format_func=lambda k: _cf_case_labels[k],
+            key="cf_case_sel",
+        )
+        _r_cf = matrix_results[_cf_sel]
+        _cf_filename_suffix = f"-{_cf_sel}"
+    else:
+        _r_cf = results
+        _cf_filename_suffix = ""
+
     view_mode = st.radio("Values", ["Undiscounted", "Discounted"], horizontal=True, key="cf_view")
-    years_list = list(range(1, results["total_years"] + 1))
+    years_list = list(range(1, _r_cf["total_years"] + 1))
 
     if view_mode == "Undiscounted":
         df_cf = pd.DataFrame({
             "Year": years_list,
-            "Costs ($M)": [round(c, 3) for c in results["annual_costs"]],
-            "Benefits ($M)": [round(b, 3) for b in results["annual_benefits"]],
-            "TTS ($M)": [round(v, 3) for v in results["benefits_by_type"]["tts"]],
-            "Reliability ($M)": [round(v, 3) for v in results["benefits_by_type"]["reliability"]],
-            "VOC ($M)": [round(v, 3) for v in results["benefits_by_type"]["voc"]],
-            "Safety ($M)": [round(v, 3) for v in results["benefits_by_type"]["safety"]],
-            "Environmental ($M)": [round(v, 3) for v in results["benefits_by_type"]["env"]],
-            "Active Transport ($M)": [round(v, 3) for v in results["benefits_by_type"]["active"]],
-            "Net ($M)": [round(n, 3) for n in results["annual_net"]],
+            "Costs ($M)": [round(c, 3) for c in _r_cf["annual_costs"]],
+            "Benefits ($M)": [round(b, 3) for b in _r_cf["annual_benefits"]],
+            "TTS ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["tts"]],
+            "Reliability ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["reliability"]],
+            "VOC ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["voc"]],
+            "Safety ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["safety"]],
+            "Environmental ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["env"]],
+            "Active Transport ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["active"]],
+            "Net ($M)": [round(n, 3) for n in _r_cf["annual_net"]],
         })
     else:
         df_cf = pd.DataFrame({
             "Year": years_list,
-            "Costs ($M)": [round(c, 3) for c in results["disc_costs"]],
-            "Benefits ($M)": [round(b, 3) for b in results["disc_benefits"]],
-            "Net ($M)": [round(n, 3) for n in results["disc_net"]],
-            "Cumulative Net ($M)": [round(c, 3) for c in results["cum_disc_net"]],
+            "Costs ($M)": [round(c, 3) for c in _r_cf["disc_costs"]],
+            "Benefits ($M)": [round(b, 3) for b in _r_cf["disc_benefits"]],
+            "Net ($M)": [round(n, 3) for n in _r_cf["disc_net"]],
+            "Cumulative Net ($M)": [round(c, 3) for c in _r_cf["cum_disc_net"]],
         })
 
     st.dataframe(df_cf, use_container_width=True, hide_index=True)
@@ -2034,7 +2144,7 @@ with tab_cashflow:
     st.download_button(
         f"Download {view_mode} Cashflow CSV",
         cf_csv,
-        file_name=f"cashflow-{view_mode.lower()}.csv",
+        file_name=f"cashflow-{view_mode.lower()}{_cf_filename_suffix}.csv",
         mime="text/csv",
         key="dl_cashflow",
     )
@@ -2046,12 +2156,26 @@ with tab_sensitivity:
     # --- Existing sensitivity charts ---
     st.markdown('<div class="section-header">Sensitivity Analysis</div>', unsafe_allow_html=True)
 
+    # Case selector when matrix results available
+    _sens_case_keys = list(matrix_results.keys()) if matrix_results else []
+    if _sens_case_keys:
+        _sens_case_labels = {k: f"Project Case {k.split('_')[1]}" for k in _sens_case_keys}
+        _sens_sel = st.selectbox(
+            "Project Case",
+            options=_sens_case_keys,
+            format_func=lambda k: _sens_case_labels[k],
+            key="sens_case_sel",
+        )
+        _r_sens = matrix_results[_sens_sel]
+    else:
+        _r_sens = results
+
     sen1, sen2 = st.columns(2)
 
     with sen1:
         st.subheader("Discount Rate Sensitivity (BCR)")
-        dr_rates = sorted(results["sensitivity_dr"].keys())
-        dr_bcrs = [results["sensitivity_dr"][r]["bcr"] for r in dr_rates]
+        dr_rates = sorted(_r_sens["sensitivity_dr"].keys())
+        dr_bcrs = [_r_sens["sensitivity_dr"][r]["bcr"] for r in dr_rates]
         bar_colors = [COLORS["positive"] if b >= 1 else COLORS["negative"] for b in dr_bcrs]
         fig_dr = go.Figure(go.Bar(
             x=[f"{r}%" for r in dr_rates], y=dr_bcrs,
@@ -2069,7 +2193,7 @@ with tab_sensitivity:
 
     with sen2:
         st.subheader("Switching Values (% change for BCR = 1.0)")
-        sw = results["switching"]
+        sw = _r_sens["switching"]
         if sw:
             sw_labels = list(sw.keys())
             sw_values = list(sw.values())
@@ -2092,8 +2216,8 @@ with tab_sensitivity:
     # --- Scenario Analysis Table ---
     st.subheader("Scenario Analysis")
     rows = []
-    for r_val in sorted(results["sensitivity_dr"].keys()):
-        v = results["sensitivity_dr"][r_val]
+    for r_val in sorted(_r_sens["sensitivity_dr"].keys()):
+        v = _r_sens["sensitivity_dr"][r_val]
         rows.append({
             "Scenario": f"Discount Rate {r_val}%",
             "PV Benefits ($M)": round(v["pvb"], 1),
@@ -2101,7 +2225,7 @@ with tab_sensitivity:
             "NPV ($M)": round(v["npv"], 1),
             "BCR": round(v["bcr"], 2),
         })
-    for label, v in results["scenarios"].items():
+    for label, v in _r_sens["scenarios"].items():
         rows.append({
             "Scenario": f"Demand {label}",
             "PV Benefits ($M)": round(v["pvb"], 1),
@@ -2132,7 +2256,7 @@ with tab_sensitivity:
 
     # --- First-Year Benefit Breakdown ---
     st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
-    fy = results["first_year"]
+    fy = _r_sens["first_year"]
     fy_cols = st.columns(7)
     for i, (key, label) in enumerate(TYPE_LABELS.items()):
         with fy_cols[i]:
@@ -2172,7 +2296,7 @@ with tab_sensitivity:
             )
 
     # Compute tornado data
-    baseline_bcr = results["bcr"]
+    baseline_bcr = _r_sens["bcr"]
     tornado_data = []
 
     for label, cfg in sens_params.items():
@@ -2238,22 +2362,138 @@ with tab_sensitivity:
         st.metric("What-If PV Benefits", format_m(results_whatif["pv_benefits"]))
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4: PARAMETERS REFERENCE
+# TAB 4: PARAMETERS (EDITABLE)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_params:
-    st.markdown('<div class="section-header">TfNSW Economic Parameter Values Reference</div>', unsafe_allow_html=True)
-    st.caption("Source: TfNSW Economic Parameter Values (January 2025), indexed to June 2024 prices.")
+    st.markdown('<div class="section-header">Economic Parameters</div>', unsafe_allow_html=True)
+    st.caption("Edit values below. Changes take effect immediately in all calculations. "
+               "Source: TfNSW Economic Parameter Values (January 2025), June 2024 prices.")
 
-    with st.expander("Value of Travel Time Savings ($/person-hour)"):
-        vtts_df = pd.DataFrame({
-            "Trip Purpose": ["Commute", "Business", "Other / Private"],
-            "Urban": [f"${PARAMS['vtts']['urban'][k]:.2f}" for k in ["commute", "business", "other"]],
-            "Rural": [f"${PARAMS['vtts']['rural'][k]:.2f}" for k in ["commute", "business", "other"]],
-        })
-        st.dataframe(vtts_df, hide_index=True, use_container_width=True)
+    if st.button("Reset All to Defaults", key="reset_params"):
+        for _k in list(st.session_state.keys()):
+            if _k.startswith("param_"):
+                del st.session_state[_k]
+        st.rerun()
 
-    with st.expander("Vehicle Operating Costs — Urban ($/vehicle-km)"):
-        speeds_urban = [40, 50, 60, 70, 80, 90, 100]
+    # ── Value of Travel Time Savings ─────────────────────────────────────────
+    with st.expander("Value of Travel Time Savings ($/person-hour)", expanded=True):
+        _src_vtts = "TfNSW EPV Jan 2025, Table 3"
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _pur, _label in [("commute", "Commute"), ("business", "Business"), ("other", "Other/Private")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_vtts_{_ctx}_{_pur}",
+                    default=PARAMS["vtts"][_ctx][_pur],
+                    min_val=0.0, max_val=200.0, step=0.5,
+                    unit="$/person-hr", source=_src_vtts,
+                )
+
+    # ── Reliability Ratio ────────────────────────────────────────────────────
+    with st.expander("Reliability Ratio"):
+        param_editor(
+            label="Reliability Ratio (of VTTS)",
+            key="param_reliability_ratio",
+            default=PARAMS["reliability_ratio"],
+            min_val=0.0, max_val=2.0, step=0.05,
+            unit="ratio", source="TfNSW EPV Jan 2025, §4.3",
+        )
+
+    # ── Crash Costs ──────────────────────────────────────────────────────────
+    with st.expander("Crash Costs ($/crash)"):
+        _src_crash = "TfNSW EPV Jan 2025, Table 10"
+        _crash_labels = [
+            ("fatal", "Fatal"),
+            ("serious", "Serious Injury"),
+            ("moderate", "Moderate Injury"),
+            ("minor", "Minor Injury"),
+            ("pdo", "Property Damage Only"),
+        ]
+        for _sev, _label in _crash_labels:
+            _default = PARAMS["crash_costs"][_sev]
+            param_editor(
+                label=_label,
+                key=f"param_crash_{_sev}",
+                default=_default,
+                min_val=0.0, max_val=_default * 3.0, step=max(1.0, _default * 0.01),
+                unit="$/crash", source=_src_crash,
+            )
+
+    # ── Emission Costs (CO₂) ─────────────────────────────────────────────────
+    with st.expander("Emission Costs — CO₂ ($/veh-km)"):
+        _src_emit = "TfNSW EPV Jan 2025, Table 14"
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _vt, _label in [("car", "Car"), ("lgv", "LGV"), ("rigid", "Rigid Truck"), ("bus", "Bus")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_emission_{_ctx}_{_vt}",
+                    default=PARAMS["emission_cost"][_ctx][_vt],
+                    min_val=0.0, max_val=1.0, step=0.001,
+                    unit="$/veh-km", source=_src_emit,
+                )
+
+    # ── Air Pollution ────────────────────────────────────────────────────────
+    with st.expander("Air Pollution Costs ($/veh-km)"):
+        _src_air = "TfNSW EPV Jan 2025, Table 15"
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _vt, _label in [("car", "Car"), ("lgv", "LGV"), ("rigid", "Rigid Truck"), ("artic", "Articulated Truck")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_air_{_ctx}_{_vt}",
+                    default=PARAMS["air_pollution"][_ctx][_vt],
+                    min_val=0.0, max_val=1.0, step=0.001,
+                    unit="$/veh-km", source=_src_air,
+                )
+
+    # ── Noise ────────────────────────────────────────────────────────────────
+    with st.expander("Noise Costs ($/veh-km)"):
+        _src_noise = "TfNSW EPV Jan 2025, Table 16"
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _vt, _label in [("car", "Car"), ("lgv", "LGV"), ("rigid", "Rigid Truck"), ("artic", "Articulated Truck")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_noise_{_ctx}_{_vt}",
+                    default=PARAMS["noise"][_ctx][_vt],
+                    min_val=0.0, max_val=1.0, step=0.001,
+                    unit="$/veh-km", source=_src_noise,
+                )
+
+    # ── Active Transport Health Benefits ─────────────────────────────────────
+    with st.expander("Active Transport Health Benefits ($/person-km)"):
+        _src_health = "TfNSW EPV Jan 2025, Table 18"
+        param_editor(
+            label="Walking",
+            key="param_health_walking",
+            default=PARAMS["health_benefits"]["walking"],
+            min_val=0.0, max_val=5.0, step=0.01,
+            unit="$/person-km", source=_src_health,
+        )
+        param_editor(
+            label="Cycling",
+            key="param_health_cycling",
+            default=PARAMS["health_benefits"]["cycling"],
+            min_val=0.0, max_val=5.0, step=0.01,
+            unit="$/person-km", source=_src_health,
+        )
+
+    # ── Vehicle Occupancy ────────────────────────────────────────────────────
+    with st.expander("Vehicle Occupancy (persons/vehicle)"):
+        _src_occ = "TfNSW EPV Jan 2025, Table 6"
+        for _vt in ("Car", "LCV", "HCV", "Bus"):
+            param_editor(
+                label=_vt,
+                key=f"param_occupancy_{_vt}",
+                default=PARAMS["occupancy"][_vt],
+                min_val=0.5, max_val=100.0, step=0.1,
+                unit="persons/veh", source=_src_occ,
+            )
+
+    # ── VOC Speed Tables (read-only reference) ───────────────────────────────
+    with st.expander("Vehicle Operating Costs — Urban ($/veh-km, read-only)"):
+        speeds_urban = sorted(set().union(*[PARAMS["voc"]["urban"][v].keys() for v in ("car", "lgv", "rigid", "artic")]))
         voc_rows = []
         for s in speeds_urban:
             voc_rows.append({
@@ -2265,8 +2505,8 @@ with tab_params:
             })
         st.dataframe(pd.DataFrame(voc_rows), hide_index=True, use_container_width=True)
 
-    with st.expander("Vehicle Operating Costs — Rural ($/vehicle-km)"):
-        speeds_rural = [60, 80, 100, 110]
+    with st.expander("Vehicle Operating Costs — Rural ($/veh-km, read-only)"):
+        speeds_rural = sorted(set().union(*[PARAMS["voc"]["rural"][v].keys() for v in ("car", "lgv", "rigid", "artic")]))
         voc_rows_r = []
         for s in speeds_rural:
             voc_rows_r.append({
@@ -2277,53 +2517,6 @@ with tab_params:
                 "Articulated Truck": PARAMS["voc"]["rural"]["artic"].get(s, "–"),
             })
         st.dataframe(pd.DataFrame(voc_rows_r), hide_index=True, use_container_width=True)
-
-    with st.expander("Crash Costs ($/crash)"):
-        crash_df = pd.DataFrame({
-            "Severity": ["Fatal", "Serious Injury", "Moderate Injury", "Minor Injury", "Property Damage Only"],
-            "Cost per Crash": [
-                f"${PARAMS['crash_costs']['fatal']:,.0f}",
-                f"${PARAMS['crash_costs']['serious']:,.0f}",
-                f"${PARAMS['crash_costs']['moderate']:,.0f}",
-                f"${PARAMS['crash_costs']['minor']:,.0f}",
-                f"${PARAMS['crash_costs']['pdo']:,.0f}",
-            ],
-        })
-        st.dataframe(crash_df, hide_index=True, use_container_width=True)
-
-    with st.expander("Environmental Externalities"):
-        env_df = pd.DataFrame([
-            {"Parameter": "CO₂ Social Cost ($/tonne)", "Urban": f"${PARAMS['carbon_per_tonne']}", "Rural": f"${PARAMS['carbon_per_tonne']}"},
-            {"Parameter": "Air Pollution — Car ($/veh-km)", "Urban": f"${PARAMS['air_pollution']['urban']['car']:.3f}", "Rural": f"${PARAMS['air_pollution']['rural']['car']:.3f}"},
-            {"Parameter": "Air Pollution — Rigid Truck ($/veh-km)", "Urban": f"${PARAMS['air_pollution']['urban']['rigid']:.3f}", "Rural": f"${PARAMS['air_pollution']['rural']['rigid']:.3f}"},
-            {"Parameter": "Noise — Car ($/veh-km)", "Urban": f"${PARAMS['noise']['urban']['car']:.3f}", "Rural": f"${PARAMS['noise']['rural']['car']:.3f}"},
-            {"Parameter": "Noise — Heavy Vehicle ($/veh-km)", "Urban": f"${PARAMS['noise']['urban']['rigid']:.3f}", "Rural": f"${PARAMS['noise']['rural']['rigid']:.3f}"},
-        ])
-        st.dataframe(env_df, hide_index=True, use_container_width=True)
-
-    with st.expander("Active Transport Health Benefits ($/person-km)"):
-        health_df = pd.DataFrame({
-            "Mode": ["Walking", "Cycling"],
-            "Health Benefit": [f"${PARAMS['health_benefits']['walking']:.2f}", f"${PARAMS['health_benefits']['cycling']:.2f}"],
-        })
-        st.dataframe(health_df, hide_index=True, use_container_width=True)
-
-    with st.expander("Other Key Parameters"):
-        other_df = pd.DataFrame({
-            "Parameter": ["Value of Statistical Life (VSL)", "Reliability Ratio", "Central Discount Rate",
-                           "Low Discount Rate (sensitivity)", "High Discount Rate (sensitivity)", "Working Days per Year"],
-            "Value": [f"${PARAMS['vsl']/1e6:.1f}M", f"{PARAMS['reliability_ratio']}", "7%", "4%", "10%",
-                      f"{PARAMS['working_days_per_year']}"],
-        })
-        st.dataframe(other_df, hide_index=True, use_container_width=True)
-
-    with st.expander("Default Traffic Composition (%)"):
-        comp_df = pd.DataFrame({
-            "Vehicle Type": ["Car", "Light Commercial", "Rigid Truck", "Articulated Truck"],
-            "Urban": [f"{PARAMS['traffic_composition']['urban'][k]*100:.0f}%" for k in ["car", "lgv", "rigid", "artic"]],
-            "Rural": [f"{PARAMS['traffic_composition']['rural'][k]*100:.0f}%" for k in ["car", "lgv", "rigid", "artic"]],
-        })
-        st.dataframe(comp_df, hide_index=True, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOOTER
