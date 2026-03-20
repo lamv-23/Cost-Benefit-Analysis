@@ -860,8 +860,10 @@ def calculate_matrix(
     construction_start_year = inputs.get("construction_start_year", discount_base_year)
     zero_growth_after_last_year = inputs.get("zero_growth_after_last_year", False)
 
-    # Annualisation: modelled-period VHT/VKT → annual
-    ann_factor = annualisation["annualisation_factor"] * annualisation["days_per_year"]
+    # Annualisation: modelled-period VHT/VKT → annual (per vehicle type)
+    _dpy = annualisation["days_per_year"]
+    ann_factors = {vt: annualisation.get(vt, annualisation.get("annualisation_factor", 10.0)) * _dpy
+                   for vt in VTYPES}
 
     # VTTS by vehicle type ($/person-hr)
     vtts_by_vtype = _p["vtts"][ctx]
@@ -917,7 +919,7 @@ def calculate_matrix(
                 vht_proj = interpolate_modelling_years(
                     modelling_years, proj_traffic[vt]["vht"], eval_year
                 )
-                annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factor
+                annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factors[vt]
                 vt_tts = annual_vht_saving * vtts_by_vtype[vt] / 1e6
                 b_tts_by_vt[vt] = vt_tts
                 b_tts += vt_tts
@@ -942,8 +944,8 @@ def calculate_matrix(
                 voc_b = interpolate_voc(voc_table, spd_b) if spd_b > 0 else 0.0
                 voc_p = interpolate_voc(voc_table, spd_p) if spd_p > 0 else 0.0
 
-                annual_vkt_b = vkt_b * ann_factor
-                annual_vkt_p = vkt_p * ann_factor
+                annual_vkt_b = vkt_b * ann_factors[vt]
+                annual_vkt_p = vkt_p * ann_factors[vt]
                 voc_saving = annual_vkt_b * voc_b - annual_vkt_p * voc_p
                 b_voc += max(0.0, voc_saving) / 1e6
 
@@ -963,7 +965,7 @@ def calculate_matrix(
 
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
-                vkt_delta = (vkt_b - vkt_p) * ann_factor
+                vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
                 b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
 
         benefit_y = b_tts + b_rel + b_voc + b_safety + b_env + b_active
@@ -1399,9 +1401,16 @@ def _init_session_state() -> None:
         st.session_state["n_project_cases"] = 1
     if "annualisation" not in st.session_state:
         st.session_state["annualisation"] = {
-            "annualisation_factor": 10.0,
+            "Car": 10.0, "LCV": 10.0, "HCV": 10.0, "Bus": 10.0,
             "days_per_year": 365,
         }
+    else:
+        # Migrate old single-factor structure
+        _ann = st.session_state["annualisation"]
+        if "annualisation_factor" in _ann and "Car" not in _ann:
+            _f = _ann.pop("annualisation_factor")
+            for _vt in ("Car", "LCV", "HCV", "Bus"):
+                _ann.setdefault(_vt, _f)
     _years = st.session_state["modelling_years"]
     _n = st.session_state["n_project_cases"]
     # (Re-)initialise traffic / crash / cost data when structure changes
@@ -1460,17 +1469,23 @@ with st.sidebar:
     # Annualisation parameters panel
     with st.expander("Annualisation Parameters", expanded=False):
         _ann = st.session_state["annualisation"]
-        _ann["annualisation_factor"] = st.number_input(
-            "Annualisation Factor", min_value=1.0, max_value=50.0,
-            value=_ann["annualisation_factor"], step=0.5,
-            help="Multiplier converting modelled-period VHT/VKT to a daily total",
-        )
+        st.caption("Annualisation factor converts modelled-period VHT/VKT to a daily total (may differ by vehicle type).")
+        _cols = st.columns(4)
+        for _vt, _col in zip(("Car", "LCV", "HCV", "Bus"), _cols):
+            _ann[_vt] = _col.number_input(
+                f"{_vt}", min_value=0.1, max_value=100.0,
+                value=float(_ann.get(_vt, 10.0)), step=0.5,
+                key=f"ann_{_vt}",
+            )
         _ann["days_per_year"] = st.number_input(
             "Days per Year", min_value=1, max_value=365,
             value=int(_ann["days_per_year"]), step=1,
         )
         st.caption(
-            f"Annual VHT = Modelled VHT × {_ann['annualisation_factor']:.1f} × {int(_ann['days_per_year'])} days"
+            "  |  ".join(
+                f"{vt}: {_ann[vt]:.1f} × {int(_ann['days_per_year'])} = **{int(_ann[vt]*_ann['days_per_year'])}**"
+                for vt in ("Car", "LCV", "HCV", "Bus")
+            )
         )
         st.session_state["annualisation"] = _ann
 
@@ -1641,8 +1656,10 @@ with tab_datainput:
     _ann = st.session_state["annualisation"]
     st.caption(
         f"Modelling years: **{', '.join(str(y) for y in st.session_state['modelling_years'])}** · "
-        f"Annual = Modelled × {_ann['annualisation_factor']:.1f} × "
-        f"{int(_ann['days_per_year'])} days"
+        f"Expansion factors (× days): Car {int(_ann.get('Car',10)*_ann['days_per_year'])} · "
+        f"LCV {int(_ann.get('LCV',10)*_ann['days_per_year'])} · "
+        f"HCV {int(_ann.get('HCV',10)*_ann['days_per_year'])} · "
+        f"Bus {int(_ann.get('Bus',10)*_ann['days_per_year'])}"
     )
 
     # ── File Upload / Template Download (Step 6) ──────────────────────────
