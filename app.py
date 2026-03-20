@@ -857,7 +857,8 @@ def calculate_matrix(
     eval_period = inputs["evaluation_period"]
     const_years = inputs["construction_years"]
     dr = inputs["discount_rate"]
-    base_year = inputs.get("base_year", 2026)
+    discount_base_year = inputs.get("discount_base_year", 2026)
+    construction_start_year = inputs.get("construction_start_year", discount_base_year)
 
     # Annualisation: modelled-period VHT/VKT → annual
     ann_factor = annualisation["annualisation_factor"] * annualisation["days_per_year"]
@@ -890,8 +891,9 @@ def calculate_matrix(
     payback_year = None
 
     for y in range(total_years):
-        df_factor = discount_factor(dr, y)
-        eval_year = base_year + y
+        eval_year = construction_start_year + y
+        discount_exp = eval_year - discount_base_year
+        df_factor = discount_factor(dr, discount_exp)
         cost_y = 0.0
         b_tts = b_rel = b_voc = b_safety = b_env = b_active = 0.0
         b_tts_by_vt: dict = {vt: 0.0 for vt in VTYPES}
@@ -1474,7 +1476,10 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30)
-        base_year = st.number_input("Base Year", 2020, 2040, 2026)
+        discount_base_year = st.number_input("Discount Base Year", 2020, 2060, 2026,
+            help="Calendar year used as Year 0 for discounting (PV anchor).")
+        construction_start_year = st.number_input("Construction Start Year", 2020, 2060, 2026,
+            help="Calendar year construction begins. Benefits start after the construction period.")
     with col2:
         const_years = st.number_input("Construction Period (years)", 1, 10, 3)
         discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 7.0, step=0.5)
@@ -1510,7 +1515,8 @@ _matrix_inputs = {
     "evaluation_period": eval_period,
     "construction_years": const_years,
     "discount_rate": discount_rate,
-    "base_year": base_year,
+    "discount_base_year": discount_base_year,
+    "construction_start_year": construction_start_year,
     "n_project_cases": st.session_state.n_project_cases,
 }
 try:
