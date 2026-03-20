@@ -728,9 +728,9 @@ def calculate_matrix(
     cum = 0.0
     payback_year = None
 
-    # 1 July mid-year convention: cashflows occur at mid-year (0.5 years into each year).
-    # Base date is 1 July of discount_base_year, so exponent = eval_year - discount_base_year + 0.5.
-    base_offset = construction_start_year - discount_base_year + 0.5
+    # Start-of-year convention: discount exponent = eval_year - discount_base_year.
+    # First operational year has DF = 1.0 when discount_base_year = construction_start_year + const_years.
+    base_offset = construction_start_year - discount_base_year
 
     for y in range(total_years):
         eval_year = construction_start_year + y
