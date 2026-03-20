@@ -1122,7 +1122,7 @@ def calculate_matrix(
                     modelling_years, proj_traffic[vt]["vht"], eval_year
                 )
                 annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factor
-                b_tts += annual_vht_saving * _p["occupancy"][vt] * vtts_by_vtype[vt] / 1e6
+                b_tts += annual_vht_saving * vtts_by_vtype[vt] / 1e6
 
             b_rel = b_tts * _p["reliability_ratio"] * 0.3
 
