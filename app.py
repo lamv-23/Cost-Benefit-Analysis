@@ -55,12 +55,11 @@ PARAMS = {
             "artic": {60: 0.685, 80: 0.660, 100: 0.697, 110: 0.731},
         },
     },
-    "crash_costs": {
-        "fatal": 9_462_000,
-        "serious": 471_000,
-        "moderate": 28_200,
-        "minor": 13_100,
-        "pdo": 11_500,
+    "safety_vkt": {
+        "Car": 0.153,
+        "LCV": 0.098,
+        "HCV": 0.198,
+        "Bus": 0.167,
     },
     "vsl": 8_100_000,
     "carbon_per_tonne": 123,
@@ -140,25 +139,6 @@ def make_traffic_data(years: list, n_project_cases: int = 1) -> dict:
     data = {"base_case": make_traffic_case(years)}
     for i in range(1, n_project_cases + 1):
         data[f"project_{i}"] = make_traffic_case(years)
-    return data
-
-
-def make_crash_case(years: list) -> dict:
-    """Return a zeroed crash data dict for one case.
-
-    Structure:
-        {"fatal": [...], "serious": [...], "moderate": [...], "minor": [...], "pdo": [...]}
-    """
-    n = len(years)
-    severities = ["fatal", "serious", "moderate", "minor", "pdo"]
-    return {s: [0.0] * n for s in severities}
-
-
-def make_crash_data(years: list, n_project_cases: int = 1) -> dict:
-    """Return crash_data dict keyed by case name."""
-    data = {"base_case": make_crash_case(years)}
-    for i in range(1, n_project_cases + 1):
-        data[f"project_{i}"] = make_crash_case(years)
     return data
 
 
@@ -356,98 +336,6 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
 # CRASH MATRIX UI HELPER — Step 4
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SEVERITIES = ["fatal", "serious", "moderate", "minor", "pdo"]
-_SEV_LABELS = {
-    "fatal": "Fatal",
-    "serious": "Serious Injury",
-    "moderate": "Moderate Injury",
-    "minor": "Minor Injury",
-    "pdo": "Property Damage Only",
-}
-
-
-def render_crash_matrix() -> None:
-    """Render annual crash count data_editor tables for all cases (Step 4).
-
-    Displays one editable table per case (Base + N projects), rows = severity
-    levels, columns = modelling years.  Below those tables shows a colour-coded
-    crash-reduction table (Base − Project): positive = fewer crashes = green.
-    Reads/writes ``st.session_state.crash_data`` in-place.
-    """
-    years = st.session_state.modelling_years
-    n = st.session_state.n_project_cases
-    case_keys = ["base_case"] + [f"project_{i}" for i in range(1, n + 1)]
-    case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
-    row_labels = [_SEV_LABELS[s] for s in _SEVERITIES]
-
-    col_cfg = {
-        str(y): st.column_config.NumberColumn(str(y), min_value=0.0, format="%.2f")
-        for y in years
-    }
-
-    # ── Editable input tables ──────────────────────────────────────────────
-    for case_key, case_label in zip(case_keys, case_labels):
-        st.markdown(f"**{case_label}** — annual crash counts")
-        row_data = {
-            str(y): {_SEV_LABELS[s]: st.session_state.crash_data[case_key][s][y_idx]
-                     for s in _SEVERITIES}
-            for y_idx, y in enumerate(years)
-        }
-        df_edit = pd.DataFrame(row_data, index=row_labels)
-
-        edited = st.data_editor(
-            df_edit, num_rows="fixed",
-            key=f"de_crash_{case_key}",
-            use_container_width=True,
-            column_config=col_cfg,
-        )
-
-        for y_idx, y in enumerate(years):
-            for s in _SEVERITIES:
-                try:
-                    val = float(edited.loc[_SEV_LABELS[s], str(y)])
-                except (KeyError, ValueError, TypeError):
-                    val = 0.0
-                st.session_state.crash_data[case_key][s][y_idx] = val
-
-    # ── Crash reduction (Base − Project): positive = benefit = green ───────
-    if n >= 1:
-        st.divider()
-        st.markdown(
-            "**Crash Reduction (Base − Project)** — "
-            "Positive = fewer crashes (benefit) · Negative = more crashes (disbenefit)"
-        )
-        base_data = {
-            str(y): {_SEV_LABELS[s]: st.session_state.crash_data["base_case"][s][y_idx]
-                     for s in _SEVERITIES}
-            for y_idx, y in enumerate(years)
-        }
-        base_df = pd.DataFrame(base_data, index=row_labels)
-
-        for i in range(1, n + 1):
-            proj_data = {
-                str(y): {_SEV_LABELS[s]: st.session_state.crash_data[f"project_{i}"][s][y_idx]
-                         for s in _SEVERITIES}
-                for y_idx, y in enumerate(years)
-            }
-            reduc_df = base_df - pd.DataFrame(proj_data, index=row_labels)
-            if n > 1:
-                st.caption(f"Project {i}: Base − Project")
-
-            def _style_crash(val):
-                if isinstance(val, (int, float)):
-                    if val > 0:
-                        return "background-color:rgba(25,135,84,0.12);color:#198754"
-                    if val < 0:
-                        return "background-color:rgba(220,53,69,0.12);color:#dc3545"
-                return ""
-
-            st.dataframe(
-                reduc_df.style.applymap(_style_crash).format("{:+.2f}"),
-                use_container_width=True,
-            )
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # COST ENTRY UI HELPER — Step 5
 # ─────────────────────────────────────────────────────────────────────────────
@@ -520,7 +408,7 @@ def render_cost_entry() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_template_excel():
-    """Generate a pre-structured Excel template for matrix traffic/crash data.
+    """Generate a pre-structured Excel template for matrix traffic data.
 
     Returns raw bytes suitable for st.download_button, or None if openpyxl is
     not installed.
@@ -546,17 +434,6 @@ def generate_template_excel():
                     rows.append(row)
             pd.DataFrame(rows).to_excel(writer, sheet_name=metric, index=False)
 
-        # Crashes sheet
-        sev_labels_list = [_SEV_LABELS[s] for s in _SEVERITIES]
-        rows = []
-        for case_key, case_label in zip(case_keys, case_labels):
-            for sev_label in sev_labels_list:
-                row = {"Case": case_label, "Severity": sev_label}
-                for y in years:
-                    row[str(y)] = 0.0
-                rows.append(row)
-        pd.DataFrame(rows).to_excel(writer, sheet_name="Crashes", index=False)
-
     return buf.getvalue()
 
 
@@ -579,27 +456,6 @@ def _apply_template_df(df: pd.DataFrame, metric: str, years: list, n: int) -> No
                 st.session_state.traffic_data[case_key][vt][metric][y_idx] = val
 
 
-def _apply_crash_template_df(df: pd.DataFrame, years: list, n: int) -> None:
-    """Write a parsed crash template DataFrame into ``st.session_state.crash_data``."""
-    case_labels_map = {
-        "Base Case": "base_case",
-        **{f"Project {i}": f"project_{i}" for i in range(1, n + 1)},
-    }
-    sev_map = {v: k for k, v in _SEV_LABELS.items()}  # label → key
-    sev_map["Property Damage Only"] = "pdo"            # alias used in template
-    year_cols = [str(y) for y in years]
-    for _, row in df.iterrows():
-        case_key = case_labels_map.get(str(row.get("Case", "")).strip())
-        sev_key = sev_map.get(str(row.get("Severity", "")).strip())
-        if case_key and sev_key and case_key in st.session_state.crash_data:
-            for y_idx, yc in enumerate(year_cols):
-                try:
-                    val = float(row.get(yc, 0.0) or 0.0)
-                except (ValueError, TypeError):
-                    val = 0.0
-                st.session_state.crash_data[case_key][sev_key][y_idx] = val
-
-
 def _handle_template_upload(uploaded_file) -> None:
     """Parse a file uploaded in Template mode and populate session_state data."""
     years = st.session_state.modelling_years
@@ -617,16 +473,13 @@ def _handle_template_upload(uploaded_file) -> None:
                 if sheet_name in xl.sheet_names:
                     _apply_template_df(xl.parse(sheet_name), metric, years, n)
                     imported.append(sheet_name)
-            if "Crashes" in xl.sheet_names:
-                _apply_crash_template_df(xl.parse("Crashes"), years, n)
-                imported.append("Crashes")
             if imported:
                 st.success(f"Imported: {', '.join(imported)}")
                 st.rerun()
             else:
                 st.warning(
                     "No matching sheets found. Expected sheet names: "
-                    "VHT, VKT, Stops, Demand, Crashes."
+                    "VHT, VKT, Stops, Demand."
                 )
     except Exception as e:
         st.error(f"Import failed: {e}")
@@ -743,7 +596,7 @@ def _render_user_mapping_upload(uploaded_file) -> None:
 
         with m2:
             metric = st.selectbox(
-                "Metric", ["vht", "vkt", "stops", "demand", "crashes"], key="um_metric"
+                "Metric", ["vht", "vkt", "stops", "demand"], key="um_metric"
             )
             year_cols_detected = [
                 c for c in all_cols if c.isdigit() and 2020 <= int(c) <= 2100
@@ -777,30 +630,20 @@ def _render_user_mapping_upload(uploaded_file) -> None:
                 )
                 norm_case = case_map.get(raw_case, raw_case)
 
-                if metric == "crashes":
-                    sev_col = next(
-                        (c for c in all_cols if "sever" in c.lower()), None
-                    )
-                    raw_sev = str(row[sev_col]).strip() if sev_col else ""
-                    norm_row = {"Case": norm_case, "Severity": raw_sev}
-                    for yc in year_cols_sel:
-                        norm_row[str(yc)] = row.get(yc, 0.0)
-                    norm_rows.append(norm_row)
-                else:
-                    raw_vt = (
-                        str(row[vt_col]).strip() if vt_col and vt_col != none_opt else "Car"
-                    )
-                    vt_match = next(
-                        (vt for vt in VTYPES
-                         if raw_vt.lower() in (vt.lower(), vt[:3].lower())),
-                        None,
-                    )
-                    if vt_match is None:
-                        continue
-                    norm_row = {"Case": norm_case, "Vehicle Type": vt_match}
-                    for yc in year_cols_sel:
-                        norm_row[str(yc)] = row.get(yc, 0.0)
-                    norm_rows.append(norm_row)
+                raw_vt = (
+                    str(row[vt_col]).strip() if vt_col and vt_col != none_opt else "Car"
+                )
+                vt_match = next(
+                    (vt for vt in VTYPES
+                     if raw_vt.lower() in (vt.lower(), vt[:3].lower())),
+                    None,
+                )
+                if vt_match is None:
+                    continue
+                norm_row = {"Case": norm_case, "Vehicle Type": vt_match}
+                for yc in year_cols_sel:
+                    norm_row[str(yc)] = row.get(yc, 0.0)
+                norm_rows.append(norm_row)
 
             if not norm_rows:
                 st.warning(
@@ -810,10 +653,7 @@ def _render_user_mapping_upload(uploaded_file) -> None:
                 return
 
             norm_df = pd.DataFrame(norm_rows)
-            if metric == "crashes":
-                _apply_crash_template_df(norm_df, years, n)
-            else:
-                _apply_template_df(norm_df, metric, years, n)
+            _apply_template_df(norm_df, metric, years, n)
             st.success(f"Applied mapping: {len(norm_rows)} rows → {metric.upper()}")
             st.rerun()
 
@@ -829,8 +669,6 @@ def calculate_matrix(
     inputs: dict,
     base_traffic: dict,
     proj_traffic: dict,
-    crash_base: dict,
-    crash_proj: dict,
     cost: dict,
     annualisation: dict,
     params: dict = None,
@@ -842,10 +680,8 @@ def calculate_matrix(
                        construction_years, discount_rate, base_year.
         base_traffic:  traffic_case dict for the base case.
         proj_traffic:  traffic_case dict for this project case.
-        crash_base:    crash_case dict for the base case.
-        crash_proj:    crash_case dict for this project case.
         cost:          cost_data entry for this project case.
-        annualisation: annualisation_factor and days_per_year.
+        annualisation: annualisation factor and days_per_year per vehicle type.
 
     Returns:
         Result dict with the same keys as the legacy ``calculate()`` output so
@@ -947,11 +783,11 @@ def calculate_matrix(
                 voc_saving = annual_vkt_b * voc_b - annual_vkt_p * voc_p
                 b_voc += max(0.0, voc_saving) / 1e6
 
-            # ── Safety: crash reduction per severity ────────────────────────
-            for s in _SEVERITIES:
-                c_base = interpolate_modelling_years(modelling_years, crash_base[s], ey)
-                c_proj = interpolate_modelling_years(modelling_years, crash_proj[s], ey)
-                b_safety += max(0.0, c_base - c_proj) * _p["crash_costs"][s] / 1e6
+            # ── Safety: $/VKT per vehicle type ──────────────────────────────
+            for vt in VTYPES:
+                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
+                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
+                b_safety += max(0.0, vkt_b - vkt_p) * _p["safety_vkt"][vt] * ann_factors[vt] / 1e6
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
             for vt in VTYPES:
@@ -1052,7 +888,6 @@ def calculate_matrix(
 def calculate_all_cases(
     inputs: dict,
     traffic_data: dict,
-    crash_data: dict,
     cost_data: dict,
     annualisation: dict,
     params: dict = None,
@@ -1066,8 +901,6 @@ def calculate_all_cases(
             inputs=inputs,
             base_traffic=traffic_data["base_case"],
             proj_traffic=traffic_data[case_key],
-            crash_base=crash_data["base_case"],
-            crash_proj=crash_data[case_key],
             cost=cost_data[case_key],
             annualisation=annualisation,
             params=params,
@@ -1190,10 +1023,10 @@ def build_effective_params() -> dict:
                 p["vtts"][_ctx][_vt] = float(ss[_k])
     if "param_reliability_ratio" in ss:
         p["reliability_ratio"] = float(ss["param_reliability_ratio"])
-    for _sev in ("fatal", "serious", "moderate", "minor", "pdo"):
-        _k = f"param_crash_{_sev}"
+    for _vt in VTYPES:
+        _k = f"param_safety_vkt_{_vt}"
         if _k in ss:
-            p["crash_costs"][_sev] = float(ss[_k])
+            p["safety_vkt"][_vt] = float(ss[_k])
     for _ctx in ("urban", "rural"):
         for _vt in ("car", "lgv", "rigid", "bus"):
             _k = f"param_emission_{_ctx}_{_vt}"
@@ -1220,15 +1053,14 @@ def build_effective_params() -> dict:
 def render_incremental_summary() -> None:
     """Step 11: Render the Incremental Benefits Summary table.
 
-    Shows base-case and project-case absolute traffic/crash values at a chosen
+    Shows base-case and project-case absolute traffic values at a chosen
     modelling year, plus colour-coded Δ columns (Project − Base).
-    Negative Δ = green (reduction = improvement for VHT/VKT/crashes).
+    Negative Δ = green (reduction = improvement for VHT/VKT).
     Positive Δ = red (increase = disbenefit for the same metrics).
     """
     years = st.session_state.modelling_years
     n = st.session_state.n_project_cases
     td = st.session_state.traffic_data
-    cd = st.session_state.crash_data
 
     if not years or not td:
         return
@@ -1251,14 +1083,6 @@ def render_incremental_summary() -> None:
         ("Stops (stops/peak period)", "stops"),
         ("Demand (person-trips/peak period)", "demand"),
     ]
-    _CRASH_ROWS = [
-        ("Fatal crashes (annual)", "fatal"),
-        ("Serious injury crashes (annual)", "serious"),
-        ("Moderate injury crashes (annual)", "moderate"),
-        ("Minor injury crashes (annual)", "minor"),
-        ("PDO crashes (annual)", "pdo"),
-    ]
-
     rows_data = {}
 
     # Traffic rows: sum across vehicle types at selected modelling year
@@ -1267,16 +1091,6 @@ def render_incremental_summary() -> None:
         row: dict = {"Base Case": base_val}
         for i in range(1, n + 1):
             proj_val = sum(td[f"project_{i}"][vt][metric][y_idx] for vt in VTYPES)
-            row[f"Project {i}"] = proj_val
-            row[f"Δ{i}"] = proj_val - base_val
-        rows_data[label] = row
-
-    # Crash rows: per severity
-    for label, sev in _CRASH_ROWS:
-        base_val = cd["base_case"][sev][y_idx]
-        row = {"Base Case": base_val}
-        for i in range(1, n + 1):
-            proj_val = cd[f"project_{i}"][sev][y_idx]
             row[f"Project {i}"] = proj_val
             row[f"Δ{i}"] = proj_val - base_val
         rows_data[label] = row
@@ -1303,8 +1117,7 @@ def render_incremental_summary() -> None:
     st.dataframe(styled, use_container_width=True)
     st.caption(
         f"Values are totals across Car, LCV, HCV, Bus at modelling year {sel_year}. "
-        "Δ = Project − Base. "
-        "Green (negative) = reduction = improvement for VHT, VKT, and crash counts."
+        "Δ = Project − Base. Green (negative) = reduction = improvement."
     )
 
 
@@ -1411,7 +1224,7 @@ def _init_session_state() -> None:
                 _ann[_vt] = {"factor": _f, "days": int(_old_days)}
     _years = st.session_state["modelling_years"]
     _n = st.session_state["n_project_cases"]
-    # (Re-)initialise traffic / crash / cost data when structure changes
+    # (Re-)initialise traffic / cost data when structure changes
     td = st.session_state.get("traffic_data")
     needs_reset = (
         td is None
@@ -1420,7 +1233,6 @@ def _init_session_state() -> None:
     )
     if needs_reset:
         st.session_state["traffic_data"] = make_traffic_data(_years, _n)
-        st.session_state["crash_data"] = make_crash_data(_years, _n)
         st.session_state["cost_data"] = make_cost_data(_n)
 
 
@@ -1546,7 +1358,6 @@ try:
     matrix_results = calculate_all_cases(
         inputs=_matrix_inputs,
         traffic_data=st.session_state.traffic_data,
-        crash_data=st.session_state.crash_data,
         cost_data=st.session_state.cost_data,
         annualisation=st.session_state.annualisation,
         params=build_effective_params(),
@@ -1642,7 +1453,7 @@ tab_datainput, tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 0: DATA INPUT — Step 3 (traffic matrices) + Steps 4-5 (crashes, costs)
+# TAB 0: DATA INPUT — Step 3 (traffic matrices) + Step 4 (costs)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_datainput:
     st.markdown('<div class="section-header">Traffic & Project Data Entry</div>',
@@ -1717,8 +1528,8 @@ with tab_datainput:
     st.divider()
 
     # ── Sub-tabs: one per traffic metric + Crashes + Costs ────────────────
-    sub_vht, sub_vkt, sub_stops, sub_demand, sub_crashes, sub_costs = st.tabs(
-        ["VHT", "VKT", "Stops", "Demand", "Crashes", "Costs"]
+    sub_vht, sub_vkt, sub_stops, sub_demand, sub_costs = st.tabs(
+        ["VHT", "VKT", "Stops", "Demand", "Costs"]
     )
 
     # ── VHT sub-tab ───────────────────────────────────────────────────────
@@ -1751,15 +1562,6 @@ with tab_datainput:
             "Captured for reference; TTS is driven by VHT, not demand."
         )
         render_traffic_matrix("demand", "person-trips / peak period")
-
-    # ── Crashes sub-tab ───────────────────────────────────────────────────
-    with sub_crashes:
-        st.caption(
-            "Annual crash counts by severity for each modelling year. "
-            "Crash cost unit values are drawn from PARAMS (see Parameters tab). "
-            "Safety benefit = (Base − Project) crashes × cost per crash."
-        )
-        render_crash_matrix()
 
     # ── Costs sub-tab ─────────────────────────────────────────────────────
     with sub_costs:
@@ -2169,24 +1971,17 @@ with tab_params:
             unit="ratio", source="TfNSW EPV Jan 2025, §4.3",
         )
 
-    # ── Crash Costs ──────────────────────────────────────────────────────────
-    with st.expander("Crash Costs ($/crash)"):
-        _src_crash = "TfNSW EPV Jan 2025, Table 10"
-        _crash_labels = [
-            ("fatal", "Fatal"),
-            ("serious", "Serious Injury"),
-            ("moderate", "Moderate Injury"),
-            ("minor", "Minor Injury"),
-            ("pdo", "Property Damage Only"),
-        ]
-        for _sev, _label in _crash_labels:
-            _default = PARAMS["crash_costs"][_sev]
+    # ── Safety Cost ($/VKT) ───────────────────────────────────────────────────
+    with st.expander("Safety Cost ($/VKT by vehicle type)"):
+        st.caption("Safety benefit = (Base VKT − Project VKT) × rate × annualisation factor")
+        for _vt in VTYPES:
+            _default = PARAMS["safety_vkt"][_vt]
             param_editor(
-                label=_label,
-                key=f"param_crash_{_sev}",
+                label=_vt,
+                key=f"param_safety_vkt_{_vt}",
                 default=_default,
-                min_val=0.0, max_val=_default * 3.0, step=max(1.0, _default * 0.01),
-                unit="$/crash", source=_src_crash,
+                min_val=0.0, max_val=5.0, step=0.001,
+                unit="$/VKT", source="Agency default",
             )
 
     # ── Emission Costs (CO₂) ─────────────────────────────────────────────────
