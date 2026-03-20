@@ -859,6 +859,7 @@ def calculate_matrix(
     dr = inputs["discount_rate"]
     discount_base_year = inputs.get("discount_base_year", 2026)
     construction_start_year = inputs.get("construction_start_year", discount_base_year)
+    zero_growth_after_last_year = inputs.get("zero_growth_after_last_year", False)
 
     # Annualisation: modelled-period VHT/VKT → annual
     ann_factor = annualisation["annualisation_factor"] * annualisation["days_per_year"]
@@ -894,6 +895,8 @@ def calculate_matrix(
         eval_year = construction_start_year + y
         discount_exp = eval_year - discount_base_year
         df_factor = discount_factor(dr, discount_exp)
+        # Clamp traffic eval year to last modelling year when zero-growth is selected
+        ey = min(eval_year, modelling_years[-1]) if zero_growth_after_last_year else eval_year
         cost_y = 0.0
         b_tts = b_rel = b_voc = b_safety = b_env = b_active = 0.0
         b_tts_by_vt: dict = {vt: 0.0 for vt in VTYPES}
@@ -925,10 +928,10 @@ def calculate_matrix(
                 if not voc_table:
                     continue
 
-                vht_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vht"], eval_year)
-                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], eval_year)
-                vht_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vht"], eval_year)
-                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], eval_year)
+                vht_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vht"], ey)
+                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
+                vht_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vht"], ey)
+                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
 
                 spd_b = vkt_b / vht_b if vht_b > 0 else 0.0
                 spd_p = vkt_p / vht_p if vht_p > 0 else 0.0
@@ -943,8 +946,8 @@ def calculate_matrix(
 
             # ── Safety: crash reduction per severity ────────────────────────
             for s in _SEVERITIES:
-                c_base = interpolate_modelling_years(modelling_years, crash_base[s], eval_year)
-                c_proj = interpolate_modelling_years(modelling_years, crash_proj[s], eval_year)
+                c_base = interpolate_modelling_years(modelling_years, crash_base[s], ey)
+                c_proj = interpolate_modelling_years(modelling_years, crash_proj[s], ey)
                 b_safety += max(0.0, c_base - c_proj) * _p["crash_costs"][s] / 1e6
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
@@ -955,8 +958,8 @@ def calculate_matrix(
                 air_rate = _p["air_pollution"][ctx].get(param_vt, 0.0)
                 noise_rate = _p["noise"][ctx].get(param_vt, 0.0)
 
-                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], eval_year)
-                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], eval_year)
+                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
+                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
                 vkt_delta = (vkt_b - vkt_p) * ann_factor
                 b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
 
@@ -1484,6 +1487,12 @@ with st.sidebar:
         const_years = st.number_input("Construction Period (years)", 1, 10, 3)
         discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 7.0, step=0.5)
     context = st.selectbox("Context", ["urban", "rural"], format_func=str.title)
+    zero_growth_after_last_year = st.checkbox(
+        "Zero growth after last modelling year",
+        value=False,
+        help="When checked, traffic volumes (and all benefits) are held flat at the last "
+             "modelling year's values rather than extrapolating the trend.",
+    )
 
     st.divider()
 
@@ -1517,6 +1526,7 @@ _matrix_inputs = {
     "discount_rate": discount_rate,
     "discount_base_year": discount_base_year,
     "construction_start_year": construction_start_year,
+    "zero_growth_after_last_year": zero_growth_after_last_year,
     "n_project_cases": st.session_state.n_project_cases,
 }
 try:
