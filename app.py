@@ -1059,7 +1059,7 @@ def calculate_matrix(
         crash_base:    crash_case dict for the base case.
         crash_proj:    crash_case dict for this project case.
         cost:          cost_data entry for this project case.
-        annualisation: expansion_factor, days_per_year, peak_hours.
+        annualisation: annualisation_factor and days_per_year.
 
     Returns:
         Result dict with the same keys as the legacy ``calculate()`` output so
@@ -1072,10 +1072,8 @@ def calculate_matrix(
     dr = inputs["discount_rate"]
     base_year = inputs.get("base_year", 2026)
 
-    # Annualisation: peak-period → annual
-    exp_factor = annualisation["expansion_factor"]
-    days = annualisation["days_per_year"]
-    ann_factor = exp_factor * days
+    # Annualisation: modelled-period VHT/VKT → annual
+    ann_factor = annualisation["annualisation_factor"] * annualisation["days_per_year"]
 
     # VTTS by vehicle type ($/person-hr)
     vtts_by_vtype = _p["vtts"][ctx]
@@ -1259,20 +1257,7 @@ def calculate_all_cases(
     annualisation: dict,
     params: dict = None,
 ) -> dict:
-    """Run calculate_matrix for every active project case vs the base case.
-
-    Args:
-        inputs:       Project config (context, dr, eval_period, const_years,
-                      base_year, n_project_cases).
-        traffic_data: Full traffic_data dict from session_state.
-        crash_data:   Full crash_data dict from session_state.
-        cost_data:    Full cost_data dict from session_state.
-        annualisation: Annualisation parameters from session_state.
-
-    Returns:
-        Dict keyed by "project_1" … "project_N", each value being the result
-        dict from ``calculate_matrix()``.
-    """
+    """Run calculate_matrix for every active project case vs the base case."""
     n = inputs.get("n_project_cases", 1)
     results = {}
     for i in range(1, n + 1):
@@ -1618,8 +1603,7 @@ def _init_session_state() -> None:
         st.session_state["n_project_cases"] = 1
     if "annualisation" not in st.session_state:
         st.session_state["annualisation"] = {
-            "peak_hours": 2.0,
-            "expansion_factor": 10.0,
+            "annualisation_factor": 10.0,
             "days_per_year": 365,
         }
     _years = st.session_state["modelling_years"]
@@ -1679,24 +1663,18 @@ with st.sidebar:
 
     # Annualisation parameters panel
     with st.expander("Annualisation Parameters", expanded=False):
-        st.caption("Convert peak-period inputs → annual totals used in calculate()")
         _ann = st.session_state["annualisation"]
-        _ann["peak_hours"] = st.number_input(
-            "Peak Period Hours (hr)", min_value=0.5, max_value=12.0,
-            value=_ann["peak_hours"], step=0.5,
-            help="Length of the modelled peak period",
-        )
-        _ann["expansion_factor"] = st.number_input(
-            "Peak-to-Daily Expansion Factor", min_value=1.0, max_value=50.0,
-            value=_ann["expansion_factor"], step=0.5,
-            help="Multiplier: peak-period VHT/VKT → daily total (e.g. 10 means peak = 1/10 of daily)",
+        _ann["annualisation_factor"] = st.number_input(
+            "Annualisation Factor", min_value=1.0, max_value=50.0,
+            value=_ann["annualisation_factor"], step=0.5,
+            help="Multiplier converting modelled-period VHT/VKT to a daily total",
         )
         _ann["days_per_year"] = st.number_input(
             "Days per Year", min_value=1, max_value=365,
             value=int(_ann["days_per_year"]), step=1,
         )
         st.caption(
-            f"Annual VHT = Peak VHT × {_ann['expansion_factor']:.1f} × {int(_ann['days_per_year'])} days"
+            f"Annual VHT = Modelled VHT × {_ann['annualisation_factor']:.1f} × {int(_ann['days_per_year'])} days"
         )
         st.session_state["annualisation"] = _ann
 
@@ -1856,7 +1834,7 @@ with tab_datainput:
     _ann = st.session_state["annualisation"]
     st.caption(
         f"Modelling years: **{', '.join(str(y) for y in st.session_state['modelling_years'])}** · "
-        f"Peak-period inputs · Annual = Peak × {_ann['expansion_factor']:.1f} × "
+        f"Annual = Modelled × {_ann['annualisation_factor']:.1f} × "
         f"{int(_ann['days_per_year'])} days"
     )
 
