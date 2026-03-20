@@ -877,7 +877,7 @@ def calculate_matrix(
 
     annual_costs: list = []
     annual_benefits: list = []
-    benefits_by_type: dict = {k: [] for k in ("tts", "reliability", "voc", "safety", "env", "active")}
+    benefits_by_type: dict = {k: [] for k in ("tts", "tts_Car", "tts_LCV", "tts_HCV", "tts_Bus", "reliability", "voc", "safety", "env", "active")}
     annual_net: list = []
     disc_costs: list = []
     disc_benefits: list = []
@@ -894,6 +894,7 @@ def calculate_matrix(
         eval_year = base_year + y
         cost_y = 0.0
         b_tts = b_rel = b_voc = b_safety = b_env = b_active = 0.0
+        b_tts_by_vt: dict = {vt: 0.0 for vt in VTYPES}
 
         if y < const_years:
             cost_y = annual_capital
@@ -909,7 +910,9 @@ def calculate_matrix(
                     modelling_years, proj_traffic[vt]["vht"], eval_year
                 )
                 annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factor
-                b_tts += annual_vht_saving * vtts_by_vtype[vt] / 1e6
+                vt_tts = annual_vht_saving * vtts_by_vtype[vt] / 1e6
+                b_tts_by_vt[vt] = vt_tts
+                b_tts += vt_tts
 
             b_rel = b_tts * _p["reliability_ratio"] * 0.3
 
@@ -965,6 +968,8 @@ def calculate_matrix(
         for k, v in zip(("tts", "reliability", "voc", "safety", "env", "active"),
                         (b_tts, b_rel, b_voc, b_safety, b_env, b_active)):
             benefits_by_type[k].append(v)
+        for vt in VTYPES:
+            benefits_by_type[f"tts_{vt}"].append(b_tts_by_vt[vt])
         annual_net.append(net)
         disc_costs.append(cost_y * df_factor)
         disc_benefits.append(benefit_y * df_factor)
@@ -1927,17 +1932,29 @@ with tab_cashflow:
     view_mode = st.radio("Values", ["Undiscounted", "Discounted"], horizontal=True, key="cf_view")
     years_list = list(range(1, _r_cf["total_years"] + 1))
 
+    tts_breakdown = st.toggle("Show TTS by vehicle type", value=False, key="cf_tts_breakdown")
+
     if view_mode == "Undiscounted":
+        _bbt = _r_cf["benefits_by_type"]
+        _tts_cols: dict = {}
+        if tts_breakdown:
+            _tts_cols = {
+                "TTS — Car ($M)": [round(v, 3) for v in _bbt.get("tts_Car", [0.0] * _r_cf["total_years"])],
+                "TTS — LCV ($M)": [round(v, 3) for v in _bbt.get("tts_LCV", [0.0] * _r_cf["total_years"])],
+                "TTS — HCV ($M)": [round(v, 3) for v in _bbt.get("tts_HCV", [0.0] * _r_cf["total_years"])],
+                "TTS — Bus ($M)": [round(v, 3) for v in _bbt.get("tts_Bus", [0.0] * _r_cf["total_years"])],
+            }
         df_cf = pd.DataFrame({
             "Year": years_list,
             "Costs ($M)": [round(c, 3) for c in _r_cf["annual_costs"]],
             "Benefits ($M)": [round(b, 3) for b in _r_cf["annual_benefits"]],
-            "TTS ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["tts"]],
-            "Reliability ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["reliability"]],
-            "VOC ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["voc"]],
-            "Safety ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["safety"]],
-            "Environmental ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["env"]],
-            "Active Transport ($M)": [round(v, 3) for v in _r_cf["benefits_by_type"]["active"]],
+            "TTS ($M)": [round(v, 3) for v in _bbt["tts"]],
+            **_tts_cols,
+            "Reliability ($M)": [round(v, 3) for v in _bbt["reliability"]],
+            "VOC ($M)": [round(v, 3) for v in _bbt["voc"]],
+            "Safety ($M)": [round(v, 3) for v in _bbt["safety"]],
+            "Environmental ($M)": [round(v, 3) for v in _bbt["env"]],
+            "Active Transport ($M)": [round(v, 3) for v in _bbt["active"]],
             "Net ($M)": [round(n, 3) for n in _r_cf["annual_net"]],
         })
     else:
@@ -2106,7 +2123,7 @@ with tab_params:
                     label=f"{_label} — {_ctx.title()}",
                     key=f"param_vtts_{_ctx}_{_vt}",
                     default=PARAMS["vtts"][_ctx][_vt],
-                    min_val=0.0, max_val=200.0, step=0.5,
+                    min_val=0.0, max_val=10000.0, step=0.5,
                     unit="$/person-hr", source=_src_vtts,
                 )
 
