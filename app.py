@@ -210,16 +210,24 @@ def format_m(value: float) -> str:
     return f"${value:.1f}M"
 
 
+def _cagr_interpolate(v1: float, v2: float, y1: int, y2: int, eval_year: int) -> float:
+    """CAGR-based interpolation/extrapolation between two modelling years.
+
+    Mirrors the Excel formula: ((v2/v1)^(1/(y2-y1)))-1 applied as
+    v1 * (v2/v1)^((eval_year-y1)/(y2-y1)).  Returns 0 if either value is 0.
+    """
+    if v1 == 0 or v2 == 0 or y2 == y1:
+        return 0.0
+    return float(v1) * (float(v2) / float(v1)) ** ((eval_year - y1) / (y2 - y1))
+
+
 def interpolate_modelling_years(modelling_years: list, values: list, eval_year: int) -> float:
-    """Linearly interpolate (or extrapolate) a value for eval_year from modelling year data.
+    """CAGR interpolate (or extrapolate) a value for eval_year from modelling year data.
 
-    Args:
-        modelling_years: Sorted list of modelling years (e.g. [2026, 2031, 2041, 2056]).
-        values: Values at each modelling year (same length as modelling_years).
-        eval_year: The evaluation year to interpolate for.
-
-    Returns:
-        Interpolated (or extrapolated) value for eval_year.
+    Uses compound-growth interpolation matching the Excel CAGR formula:
+        rate = (v2/v1)^(1/(y2-y1)) - 1
+        value = v1 * (1+rate)^(eval_year - y1)
+    Returns 0 when either bracketing value is 0.
     """
     if len(modelling_years) == 0 or len(values) == 0:
         return 0.0
@@ -227,23 +235,14 @@ def interpolate_modelling_years(modelling_years: list, values: list, eval_year: 
         return float(values[0])
 
     years = modelling_years
-    # Clamp to range: extrapolate beyond last two points using last segment slope
     if eval_year <= years[0]:
-        # Extrapolate below first modelling year using first two points
-        slope = (values[1] - values[0]) / (years[1] - years[0]) if years[1] != years[0] else 0.0
-        return float(values[0]) + slope * (eval_year - years[0])
+        return _cagr_interpolate(values[0], values[1], years[0], years[1], eval_year)
     if eval_year >= years[-1]:
-        # Extrapolate beyond last modelling year using last two points
-        slope = (values[-1] - values[-2]) / (years[-1] - years[-2]) if years[-1] != years[-2] else 0.0
-        return float(values[-1]) + slope * (eval_year - years[-1])
+        return _cagr_interpolate(values[-2], values[-1], years[-2], years[-1], eval_year)
 
-    # Linear interpolation between bracketing modelling years
     for i in range(len(years) - 1):
         if years[i] <= eval_year <= years[i + 1]:
-            if years[i + 1] == years[i]:
-                return float(values[i])
-            ratio = (eval_year - years[i]) / (years[i + 1] - years[i])
-            return float(values[i]) + ratio * (float(values[i + 1]) - float(values[i]))
+            return _cagr_interpolate(values[i], values[i + 1], years[i], years[i + 1], eval_year)
 
     return float(values[-1])
 
