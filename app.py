@@ -1846,7 +1846,7 @@ with tab_dash:
 
     # ── Row 2: Cashflow & Cumulative ─────────────────────────────────────────
     chart3, chart4 = st.columns(2)
-    _years_dash = list(range(1, _r["total_years"] + 1))
+    _years_dash = list(range(construction_start_year, construction_start_year + _r["total_years"]))
 
     with chart3:
         st.subheader("Annual Net Cashflow ($M, undiscounted)")
@@ -1857,7 +1857,7 @@ with tab_dash:
                 _mr_i = matrix_results.get(f"project_{_i}", {})
                 if _mr_i:
                     fig_cf.add_trace(go.Scatter(
-                        x=list(range(1, _mr_i["total_years"] + 1)),
+                        x=list(range(construction_start_year, construction_start_year + _mr_i["total_years"])),
                         y=_mr_i["annual_net"],
                         name=f"Project {_i} Net", mode="lines+markers",
                         line=dict(color=_CASE_PALETTE[(_i - 1) % len(_CASE_PALETTE)], width=2),
@@ -1897,15 +1897,15 @@ with tab_dash:
                 if _mr_i:
                     _col_i = _CASE_PALETTE[(_i - 1) % len(_CASE_PALETTE)]
                     fig_cum.add_trace(go.Scatter(
-                        x=list(range(1, _mr_i["total_years"] + 1)),
+                        x=list(range(construction_start_year, construction_start_year + _mr_i["total_years"])),
                         y=_mr_i["cum_disc_net"],
                         mode="lines", name=f"Project {_i}",
                         line=dict(color=_col_i, width=2),
                     ))
                     if _mr_i.get("payback_year"):
                         fig_cum.add_vline(
-                            x=_mr_i["payback_year"], line_dash="dot",
-                            line_color=_col_i, opacity=0.5,
+                            x=construction_start_year + _mr_i["payback_year"] - 1,
+                            line_dash="dot", line_color=_col_i, opacity=0.5,
                         )
         else:
             fig_cum.add_trace(go.Scatter(
@@ -1916,10 +1916,11 @@ with tab_dash:
                 name="Cumulative NPV",
             ))
             if _r.get("payback_year"):
+                _pb_cal = construction_start_year + _r["payback_year"] - 1
                 fig_cum.add_vline(
-                    x=_r["payback_year"], line_dash="dot",
+                    x=_pb_cal, line_dash="dot",
                     line_color=COLORS["positive"], opacity=0.7,
-                    annotation_text=f"Payback: Year {_r['payback_year']}",
+                    annotation_text=f"Payback: {_pb_cal}",
                     annotation_position="top right",
                 )
         fig_cum.add_hline(y=0, line_dash="dash", line_color="#6c757d", opacity=0.5)
@@ -1961,7 +1962,7 @@ with tab_cashflow:
     _r_cf = matrix_results[_cf_sel]
 
     view_mode = st.radio("Values", ["Undiscounted", "Discounted"], horizontal=True, key="cf_view")
-    years_list = list(range(1, _r_cf["total_years"] + 1))
+    years_list = list(range(construction_start_year, construction_start_year + _r_cf["total_years"]))
 
     tts_breakdown = st.toggle("Show TTS by vehicle type", value=False, key="cf_tts_breakdown")
 
