@@ -890,9 +890,13 @@ def calculate_matrix(
     cum = 0.0
     payback_year = None
 
+    # 1 July mid-year convention: cashflows occur at mid-year (0.5 years into each year).
+    # Base date is 1 July of discount_base_year, so exponent = eval_year - discount_base_year + 0.5.
+    base_offset = construction_start_year - discount_base_year + 0.5
+
     for y in range(total_years):
         eval_year = construction_start_year + y
-        discount_exp = eval_year - discount_base_year
+        discount_exp = base_offset + y
         df_factor = discount_factor(dr, discount_exp)
         # Clamp traffic eval year to last modelling year when zero-growth is selected
         ey = min(eval_year, modelling_years[-1]) if zero_growth_after_last_year else eval_year
@@ -991,14 +995,14 @@ def calculate_matrix(
     fyrr = (annual_benefits[first_op] / total_capital * 100) if total_capital > 0 else 0.0
 
     pv_by_type = {
-        t: sum(benefits_by_type[t][y] * discount_factor(dr, y) for y in range(total_years))
+        t: sum(benefits_by_type[t][y] * discount_factor(dr, base_offset + y) for y in range(total_years))
         for t in benefits_by_type
     }
 
     sensitivity_dr = {}
     for r in [3, 4, 5, 7, 10, 12]:
-        s_pvb = sum(annual_benefits[y] * discount_factor(r, y) for y in range(total_years))
-        s_pvc = sum(annual_costs[y] * discount_factor(r, y) for y in range(total_years))
+        s_pvb = sum(annual_benefits[y] * discount_factor(r, base_offset + y) for y in range(total_years))
+        s_pvc = sum(annual_costs[y] * discount_factor(r, base_offset + y) for y in range(total_years))
         sensitivity_dr[r] = {
             "pvb": s_pvb, "pvc": s_pvc,
             "npv": s_pvb - s_pvc,
@@ -1015,8 +1019,8 @@ def calculate_matrix(
 
     scenarios = {}
     for label, factor in [("Low (-20%)", 0.8), ("Central", 1.0), ("High (+20%)", 1.2)]:
-        s_pvb = sum(annual_benefits[y] * factor * discount_factor(dr, y) for y in range(total_years))
-        s_pvc = sum(annual_costs[y] * discount_factor(dr, y) for y in range(total_years))
+        s_pvb = sum(annual_benefits[y] * factor * discount_factor(dr, base_offset + y) for y in range(total_years))
+        s_pvc = sum(annual_costs[y] * discount_factor(dr, base_offset + y) for y in range(total_years))
         scenarios[label] = {
             "pvb": s_pvb, "pvc": s_pvc,
             "npv": s_pvb - s_pvc,
