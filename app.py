@@ -1330,6 +1330,20 @@ def generate_csv(results: dict, project_name: str) -> str:
 # PARAMETER EDITOR HELPERS — Phase 0e
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _param_sync_num(param_key: str) -> None:
+    """on_change callback: push number_input value → canonical key + slider."""
+    val = float(st.session_state[f"{param_key}_num"])
+    st.session_state[param_key] = val
+    st.session_state[f"{param_key}_sl"] = val
+
+
+def _param_sync_sl(param_key: str) -> None:
+    """on_change callback: push slider value → canonical key + number_input."""
+    val = float(st.session_state[f"{param_key}_sl"])
+    st.session_state[param_key] = val
+    st.session_state[f"{param_key}_num"] = val
+
+
 def param_editor(label: str, key: str, default: float,
                  min_val: float, max_val: float, step: float,
                  unit: str, source: str = "") -> float:
@@ -1340,7 +1354,15 @@ def param_editor(label: str, key: str, default: float,
 
     Returns the current (possibly overridden) value.
     """
-    current = float(st.session_state.get(key, default))
+    # Initialise canonical key and both widget keys from it
+    if key not in st.session_state:
+        st.session_state[key] = float(default)
+    current = float(st.session_state[key])
+    if f"{key}_num" not in st.session_state:
+        st.session_state[f"{key}_num"] = current
+    if f"{key}_sl" not in st.session_state:
+        st.session_state[f"{key}_sl"] = current
+
     col_lbl, col_num, col_sl = st.columns([2, 1, 2])
     with col_lbl:
         st.write(f"**{label}** `{unit}`")
@@ -1351,24 +1373,20 @@ def param_editor(label: str, key: str, default: float,
             arrow = "↑" if current > default else "↓"
             st.caption(f"{arrow} {abs(pct):.0f}% from default")
     with col_num:
-        num_val = st.number_input(
-            "", key=f"{key}_num", value=current,
+        st.number_input(
+            "", key=f"{key}_num",
             min_value=float(min_val), max_value=float(max_val), step=float(step),
             label_visibility="collapsed",
+            on_change=_param_sync_num, args=(key,),
         )
     with col_sl:
-        sl_val = st.slider(
-            "", key=f"{key}_sl", value=current,
+        st.slider(
+            "", key=f"{key}_sl",
             min_value=float(min_val), max_value=float(max_val), step=float(step),
             label_visibility="collapsed",
+            on_change=_param_sync_sl, args=(key,),
         )
-    # Slider takes precedence when it differs from the number input
-    new_val = sl_val if sl_val != current else num_val
-    if new_val != st.session_state.get(key, default):
-        st.session_state[key] = new_val
-        st.rerun()
-    st.session_state[key] = new_val
-    return new_val
+    return float(st.session_state[key])
 
 
 def build_effective_params() -> dict:
