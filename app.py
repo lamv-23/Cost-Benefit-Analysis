@@ -912,10 +912,10 @@ def calculate_matrix(
             # ── TTS: per vehicle type ───────────────────────────────────────
             for vt in VTYPES:
                 vht_base = interpolate_modelling_years(
-                    modelling_years, base_traffic[vt]["vht"], eval_year
+                    modelling_years, base_traffic[vt]["vht"], ey
                 )
                 vht_proj = interpolate_modelling_years(
-                    modelling_years, proj_traffic[vt]["vht"], eval_year
+                    modelling_years, proj_traffic[vt]["vht"], ey
                 )
                 annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factors[vt]
                 vt_tts = annual_vht_saving * vtts_by_vtype[vt] / 1e6
