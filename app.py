@@ -671,6 +671,8 @@ def calculate_matrix(
     proj_traffic: dict,
     cost: dict,
     annualisation: dict,
+    safety_vkt_base: dict = None,
+    safety_vkt_proj: dict = None,
     params: dict = None,
 ) -> dict:
     """Compute CBA for one project case using the matrix traffic data model.
@@ -783,11 +785,13 @@ def calculate_matrix(
                 voc_saving = annual_vkt_b * voc_b - annual_vkt_p * voc_p
                 b_voc += max(0.0, voc_saving) / 1e6
 
-            # ── Safety: $/VKT per vehicle type ──────────────────────────────
+            # ── Safety: $/VKT per vehicle type (per-case rates) ─────────────
+            _sv_base = safety_vkt_base if safety_vkt_base is not None else _p["safety_vkt"]
+            _sv_proj = safety_vkt_proj if safety_vkt_proj is not None else _p["safety_vkt"]
             for vt in VTYPES:
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
-                b_safety += max(0.0, vkt_b - vkt_p) * _p["safety_vkt"][vt] * ann_factors[vt] / 1e6
+                b_safety += (vkt_b * _sv_base[vt] - vkt_p * _sv_proj[vt]) * ann_factors[vt] / 1e6
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
             for vt in VTYPES:
@@ -890,6 +894,7 @@ def calculate_all_cases(
     traffic_data: dict,
     cost_data: dict,
     annualisation: dict,
+    safety_vkt_data: dict = None,
     params: dict = None,
 ) -> dict:
     """Run calculate_matrix for every active project case vs the base case."""
@@ -903,6 +908,8 @@ def calculate_all_cases(
             proj_traffic=traffic_data[case_key],
             cost=cost_data[case_key],
             annualisation=annualisation,
+            safety_vkt_base=safety_vkt_data.get("base_case") if safety_vkt_data else None,
+            safety_vkt_proj=safety_vkt_data.get(case_key) if safety_vkt_data else None,
             params=params,
         )
     return results
@@ -1224,6 +1231,17 @@ def _init_session_state() -> None:
                 _ann[_vt] = {"factor": _f, "days": int(_old_days)}
     _years = st.session_state["modelling_years"]
     _n = st.session_state["n_project_cases"]
+    _case_keys = ["base_case"] + [f"project_{i}" for i in range(1, _n + 1)]
+    # Safety $/VKT per case — initialise missing cases with PARAMS defaults
+    if "safety_vkt_data" not in st.session_state:
+        st.session_state["safety_vkt_data"] = {
+            ck: dict(PARAMS["safety_vkt"]) for ck in _case_keys
+        }
+    else:
+        _svd = st.session_state["safety_vkt_data"]
+        for ck in _case_keys:
+            if ck not in _svd:
+                _svd[ck] = dict(PARAMS["safety_vkt"])
     # (Re-)initialise traffic / cost data when structure changes
     td = st.session_state.get("traffic_data")
     needs_reset = (
@@ -1360,6 +1378,7 @@ try:
         traffic_data=st.session_state.traffic_data,
         cost_data=st.session_state.cost_data,
         annualisation=st.session_state.annualisation,
+        safety_vkt_data=st.session_state.safety_vkt_data,
         params=build_effective_params(),
     )
 except Exception as _calc_err:
@@ -1528,8 +1547,8 @@ with tab_datainput:
     st.divider()
 
     # ── Sub-tabs: one per traffic metric + Crashes + Costs ────────────────
-    sub_vht, sub_vkt, sub_stops, sub_demand, sub_costs = st.tabs(
-        ["VHT", "VKT", "Stops", "Demand", "Costs"]
+    sub_vht, sub_vkt, sub_stops, sub_demand, sub_safety, sub_costs = st.tabs(
+        ["VHT", "VKT", "Stops", "Demand", "Safety $/VKT", "Costs"]
     )
 
     # ── VHT sub-tab ───────────────────────────────────────────────────────
@@ -1562,6 +1581,27 @@ with tab_datainput:
             "Captured for reference; TTS is driven by VHT, not demand."
         )
         render_traffic_matrix("demand", "person-trips / peak period")
+
+    # ── Safety $/VKT sub-tab ──────────────────────────────────────────────
+    with sub_safety:
+        st.caption(
+            "Safety cost rate ($/VKT) per vehicle type for each case. "
+            "Benefit = Base VKT × Base rate − Project VKT × Project rate."
+        )
+        _svd = st.session_state["safety_vkt_data"]
+        _sv_case_keys = ["base_case"] + [f"project_{i}" for i in range(1, st.session_state.n_project_cases + 1)]
+        _sv_case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, st.session_state.n_project_cases + 1)]
+        for _ck, _cl in zip(_sv_case_keys, _sv_case_labels):
+            with st.expander(_cl, expanded=True):
+                _cols = st.columns(4)
+                for _vt, _col in zip(VTYPES, _cols):
+                    _svd[_ck][_vt] = _col.number_input(
+                        _vt, min_value=0.0, max_value=10.0,
+                        value=float(_svd[_ck].get(_vt, PARAMS["safety_vkt"][_vt])),
+                        step=0.001, format="%.3f",
+                        key=f"sv_{_ck}_{_vt}",
+                    )
+        st.session_state["safety_vkt_data"] = _svd
 
     # ── Costs sub-tab ─────────────────────────────────────────────────────
     with sub_costs:
