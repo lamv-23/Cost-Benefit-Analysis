@@ -86,9 +86,6 @@ PARAMS = {
         "urban": {"car": 0.023, "lgv": 0.027, "rigid": 0.071, "bus": 0.101},
         "rural": {"car": 0.007, "lgv": 0.009, "rigid": 0.022, "bus": 0.032},
     },
-    # Phase 0c: Occupancy per vehicle type (persons/vehicle)
-    # Car=1.4 (average auto), LCV/HCV=1.0 (driver only), Bus=45 (seated capacity)
-    "occupancy": {"Car": 1.4, "LCV": 1.0, "HCV": 1.0, "Bus": 45.0},
 }
 
 # Phase 0b: Vehicle type mapping — UI labels to PARAMS internal keys
@@ -826,216 +823,6 @@ def _render_user_mapping_upload(uploaded_file) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CALCULATION ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
-
-def calculate(inputs: dict) -> dict:
-    ctx = inputs["context"]
-    eval_period = inputs["evaluation_period"]
-    const_years = inputs["construction_years"]
-    dr = inputs["discount_rate"]
-    aadt = inputs["aadt"]
-    growth = inputs["traffic_growth"] / 100
-    trip_len = inputs["trip_length"]
-    occupancy = inputs["occupancy"]
-    pct_commute = inputs["pct_commute"] / 100
-    pct_business = inputs["pct_business"] / 100
-    pct_other = max(0, 1 - pct_commute - pct_business)
-    pct_heavy = inputs["pct_heavy"] / 100
-    speed_base = inputs["speed_base"]
-    speed_project = inputs["speed_project"]
-
-    # --- COSTS ---
-    cap_planning = inputs["cap_planning"]
-    cap_land = inputs["cap_land"]
-    cap_construction = inputs["cap_construction"]
-    contingency_pct = inputs["contingency"] / 100
-    total_capital = (cap_planning + cap_land + cap_construction) * (1 + contingency_pct)
-    opex_maint = inputs["opex_maint"]
-    opex_op = inputs["opex_op"]
-    residual = inputs["residual"]
-    annual_capital = total_capital / const_years if const_years > 0 else 0
-
-    # --- ANNUAL BENEFITS (first year of operation) ---
-    vtts_set = PARAMS["vtts"][ctx]
-
-    time_base_hr = trip_len / speed_base if speed_base > 0 else 0
-    time_project_hr = trip_len / speed_project if speed_project > 0 else 0
-    time_saving_hr = max(0, time_base_hr - time_project_hr)
-
-    daily_person_trips = aadt * occupancy
-    vtts_weighted = (
-        vtts_set["commute"] * pct_commute
-        + vtts_set["business"] * pct_business
-        + vtts_set["other"] * pct_other
-    )
-
-    annual_tts = daily_person_trips * time_saving_hr * vtts_weighted * PARAMS["days_per_year"] / 1e6
-    annual_reliability = annual_tts * PARAMS["reliability_ratio"] * 0.3
-
-    # VOC savings
-    voc_base_car = interpolate_voc(PARAMS["voc"][ctx]["car"], speed_base)
-    voc_proj_car = interpolate_voc(PARAMS["voc"][ctx]["car"], speed_project)
-    voc_saving_car = max(0, voc_base_car - voc_proj_car)
-
-    voc_base_heavy = interpolate_voc(PARAMS["voc"][ctx]["rigid"], speed_base)
-    voc_proj_heavy = interpolate_voc(PARAMS["voc"][ctx]["rigid"], speed_project)
-    voc_saving_heavy = max(0, voc_base_heavy - voc_proj_heavy)
-
-    annual_voc = (
-        aadt * (1 - pct_heavy) * trip_len * voc_saving_car
-        + aadt * pct_heavy * trip_len * voc_saving_heavy
-    ) * PARAMS["days_per_year"] / 1e6
-
-    # Safety
-    annual_safety = (
-        inputs["crash_fatal"] * PARAMS["crash_costs"]["fatal"]
-        + inputs["crash_serious"] * PARAMS["crash_costs"]["serious"]
-        + inputs["crash_moderate"] * PARAMS["crash_costs"]["moderate"]
-        + inputs["crash_minor"] * PARAMS["crash_costs"]["minor"]
-        + inputs["crash_pdo"] * PARAMS["crash_costs"]["pdo"]
-    ) / 1e6
-
-    # Environmental
-    annual_co2 = inputs["co2_reduction"] * PARAMS["carbon_per_tonne"] / 1e6
-    annual_air = inputs["air_pollution_reduction"] / 1e3
-    annual_noise = inputs["noise_reduction"] / 1e3
-    annual_env = annual_co2 + annual_air + annual_noise
-
-    # Active transport
-    annual_walk = inputs["walk_km"] * PARAMS["health_benefits"]["walking"] * PARAMS["days_per_year"] / 1e6
-    annual_cycle = inputs["cycle_km"] * PARAMS["health_benefits"]["cycling"] * PARAMS["days_per_year"] / 1e6
-    annual_active = annual_walk + annual_cycle
-
-    total_first_year = annual_tts + annual_reliability + annual_voc + annual_safety + annual_env + annual_active
-
-    # --- YEAR-BY-YEAR CASHFLOW ---
-    total_years = const_years + eval_period
-    annual_costs = []
-    annual_benefits = []
-    benefits_by_type = {"tts": [], "reliability": [], "voc": [], "safety": [], "env": [], "active": []}
-    annual_net = []
-    disc_costs = []
-    disc_benefits = []
-    disc_net = []
-    cum_disc_net = []
-
-    pv_benefits = 0
-    pv_costs = 0
-    cum = 0
-    payback_year = None
-
-    for y in range(total_years):
-        df = discount_factor(dr, y)
-        cost = 0
-        benefit = 0
-        b_tts = b_rel = b_voc = b_safety = b_env = b_active = 0
-
-        if y < const_years:
-            cost = annual_capital
-        else:
-            op_year = y - const_years
-            gf = math.pow(1 + growth, op_year)
-            cost = opex_maint + opex_op
-            b_tts = annual_tts * gf
-            b_rel = annual_reliability * gf
-            b_voc = annual_voc * gf
-            b_safety = annual_safety
-            b_env = annual_env
-            b_active = annual_active
-            benefit = b_tts + b_rel + b_voc + b_safety + b_env + b_active
-            if y == total_years - 1:
-                benefit += residual
-
-        annual_costs.append(cost)
-        annual_benefits.append(benefit)
-        benefits_by_type["tts"].append(b_tts)
-        benefits_by_type["reliability"].append(b_rel)
-        benefits_by_type["voc"].append(b_voc)
-        benefits_by_type["safety"].append(b_safety)
-        benefits_by_type["env"].append(b_env)
-        benefits_by_type["active"].append(b_active)
-
-        net = benefit - cost
-        annual_net.append(net)
-        disc_costs.append(cost * df)
-        disc_benefits.append(benefit * df)
-        disc_net.append(net * df)
-
-        pv_costs += cost * df
-        pv_benefits += benefit * df
-        cum += net * df
-        cum_disc_net.append(cum)
-
-        if payback_year is None and cum >= 0 and y >= const_years:
-            payback_year = y + 1
-
-    npv = pv_benefits - pv_costs
-    bcr = pv_benefits / pv_costs if pv_costs > 0 else 0
-    fyrr = (total_first_year / total_capital) * 100 if total_capital > 0 else 0
-
-    # PV by benefit type
-    pv_by_type = {}
-    for t in benefits_by_type:
-        pv_by_type[t] = sum(benefits_by_type[t][y] * discount_factor(dr, y) for y in range(total_years))
-
-    # Sensitivity: discount rates
-    sensitivity_dr = {}
-    for r in [3, 4, 5, 7, 10, 12]:
-        s_pvb = sum(annual_benefits[y] * discount_factor(r, y) for y in range(total_years))
-        s_pvc = sum(annual_costs[y] * discount_factor(r, y) for y in range(total_years))
-        sensitivity_dr[r] = {
-            "pvb": s_pvb, "pvc": s_pvc, "npv": s_pvb - s_pvc,
-            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0,
-        }
-
-    # Switching values
-    switching = {}
-    if pv_benefits > 0 and pv_costs > 0:
-        switching["Total Benefits"] = -((pv_benefits - pv_costs) / pv_benefits) * 100
-        switching["Total Costs"] = ((pv_benefits - pv_costs) / pv_costs) * 100
-        type_labels = {
-            "tts": "Travel Time Savings", "reliability": "Reliability",
-            "voc": "Vehicle Operating Costs", "safety": "Safety",
-            "env": "Environmental", "active": "Active Transport",
-        }
-        for t, label in type_labels.items():
-            if pv_by_type[t] > 0:
-                switching[label] = -((pv_benefits - pv_costs) / pv_by_type[t]) * 100
-
-    # Demand scenarios
-    scenarios = {}
-    for label, factor in [("Low (-20%)", 0.8), ("Central", 1.0), ("High (+20%)", 1.2)]:
-        s_pvb = sum(annual_benefits[y] * factor * discount_factor(dr, y) for y in range(total_years))
-        s_pvc = sum(annual_costs[y] * discount_factor(dr, y) for y in range(total_years))
-        scenarios[label] = {
-            "pvb": s_pvb, "pvc": s_pvc, "npv": s_pvb - s_pvc,
-            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0,
-        }
-
-    return {
-        "npv": npv, "bcr": bcr, "pv_benefits": pv_benefits, "pv_costs": pv_costs,
-        "fyrr": fyrr, "payback_year": payback_year,
-        "total_capital": total_capital,
-        "annual_costs": annual_costs, "annual_benefits": annual_benefits,
-        "annual_net": annual_net,
-        "disc_costs": disc_costs, "disc_benefits": disc_benefits, "disc_net": disc_net,
-        "cum_disc_net": cum_disc_net,
-        "pv_by_type": pv_by_type, "sensitivity_dr": sensitivity_dr,
-        "switching": switching, "scenarios": scenarios,
-        "const_years": const_years, "eval_period": eval_period,
-        "total_years": total_years, "dr": dr,
-        "benefits_by_type": benefits_by_type,
-        "first_year": {
-            "tts": annual_tts, "reliability": annual_reliability,
-            "voc": annual_voc, "safety": annual_safety,
-            "env": annual_env, "active": annual_active,
-            "total": total_first_year,
-        },
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # MATRIX CALCULATION ENGINE — Step 7
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1410,10 +1197,6 @@ def build_effective_params() -> dict:
         _k = f"param_health_{_mode}"
         if _k in ss:
             p["health_benefits"][_mode] = float(ss[_k])
-    for _vt in ("Car", "LCV", "HCV", "Bus"):
-        _k = f"param_occupancy_{_vt}"
-        if _k in ss:
-            p["occupancy"][_vt] = float(ss[_k])
     return p
 
 
@@ -2416,18 +2199,6 @@ with tab_params:
             min_val=0.0, max_val=5.0, step=0.01,
             unit="$/person-km", source=_src_health,
         )
-
-    # ── Vehicle Occupancy ────────────────────────────────────────────────────
-    with st.expander("Vehicle Occupancy (persons/vehicle)"):
-        _src_occ = "TfNSW EPV Jan 2025, Table 6"
-        for _vt in ("Car", "LCV", "HCV", "Bus"):
-            param_editor(
-                label=_vt,
-                key=f"param_occupancy_{_vt}",
-                default=PARAMS["occupancy"][_vt],
-                min_val=0.5, max_val=100.0, step=0.1,
-                unit="persons/veh", source=_src_occ,
-            )
 
     # ── VOC Speed Tables (read-only reference) ───────────────────────────────
     with st.expander("Vehicle Operating Costs — Urban ($/veh-km, read-only)"):
