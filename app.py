@@ -101,6 +101,10 @@ VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "artic"}
 # Separate mapping for emission_cost (uses "bus" key, not "artic")
 EMISSION_VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "bus"}
 
+# Separate mapping for air_pollution and noise (Bus approximated as "artic";
+# kept explicit here so a future change to VTYPE_MAP won't silently affect env calcs)
+AIR_NOISE_VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "artic"}
+
 # Canonical vehicle type list for matrix inputs
 VTYPES = ["Car", "LCV", "HCV", "Bus"]
 
@@ -249,10 +253,22 @@ def _cagr_interpolate(v1: float, v2: float, y1: int, y2: int, eval_year: int) ->
     """CAGR-based interpolation/extrapolation between two modelling years.
 
     Mirrors the Excel formula: ((v2/v1)^(1/(y2-y1)))-1 applied as
-    v1 * (v2/v1)^((eval_year-y1)/(y2-y1)).  Returns 0 if either value is 0.
+    v1 * (v2/v1)^((eval_year-y1)/(y2-y1)).
+
+    Edge cases:
+    - y2 == y1: undefined interval, return v1.
+    - v1 == 0: no base to grow from; return 0 for all years.
+    - v2 == 0: traffic declines to zero; interpolate linearly to 0 then hold at 0
+      (CAGR is undefined when the end-value is 0).
     """
-    if v1 == 0 or v2 == 0 or y2 == y1:
+    if y2 == y1:
+        return float(v1)
+    if v1 == 0:
         return 0.0
+    if v2 == 0:
+        # Linear decline to zero over [y1, y2]; clamp at 0 for extrapolation beyond y2.
+        frac = (eval_year - y1) / (y2 - y1)
+        return float(v1) * max(0.0, 1.0 - frac)
     return float(v1) * (float(v2) / float(v1)) ** ((eval_year - y1) / (y2 - y1))
 
 
@@ -382,7 +398,7 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
                 return ""
 
             st.dataframe(
-                incr_df.style.applymap(_style_incr).format("{:+.0f}"),
+                incr_df.style.map(_style_incr).format("{:+.0f}"),
                 use_container_width=True,
             )
 
@@ -809,6 +825,11 @@ def calculate_matrix(
                 b_tts_by_vt[vt] = vt_tts
                 b_tts += vt_tts
 
+            # Reliability benefit: TTS × reliability_ratio × 0.3.
+            # The 0.3 (30%) is the Austroads / TfNSW standard apportionment of
+            # travel-time savings attributable to reliability improvement
+            # (i.e. not all VHT savings are also reliability savings).
+            # reliability_ratio (default 0.9) is the relative VTTS for reliability.
             b_rel = b_tts * _p["reliability_ratio"] * 0.3
 
             # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
@@ -844,11 +865,11 @@ def calculate_matrix(
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
             for vt in VTYPES:
-                param_vt = VTYPE_MAP[vt]
                 emit_vt = EMISSION_VTYPE_MAP[vt]
+                air_noise_vt = AIR_NOISE_VTYPE_MAP[vt]
                 emit_rate = _p["emission_cost"][ctx].get(emit_vt, 0.0)
-                air_rate = _p["air_pollution"][ctx].get(param_vt, 0.0)
-                noise_rate = _p["noise"][ctx].get(param_vt, 0.0)
+                air_rate = _p["air_pollution"][ctx].get(air_noise_vt, 0.0)
+                noise_rate = _p["noise"][ctx].get(air_noise_vt, 0.0)
 
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
@@ -1987,9 +2008,9 @@ with tab_sensitivity:
     fy_cols = st.columns(7)
     for i, (key, label) in enumerate(TYPE_LABELS.items()):
         with fy_cols[i]:
-            st.metric(label, f"${fy[key]:.2f}M")
+            st.metric(label, f"${fy.get(key, 0.0):.2f}M")
     with fy_cols[6]:
-        st.metric("Total", f"${fy['total']:.2f}M")
+        st.metric("Total", f"${fy.get('total', 0.0):.2f}M")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
