@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      padding: 14px 16px 18px;
+      background: transparent;
+      color: #1a1a1a;
+    }
+
+    .section-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      opacity: 0.55;
+      margin-bottom: 6px;
+    }
+
+    /* ── Chip pools ────────────────────────────────────── */
+    .pool-row {
+      display: flex;
+      gap: 16px;
+      margin-bottom: 10px;
+    }
+
+    .pool-block { flex: 1; }
+
+    .pool-block-label {
+      font-size: 11px;
+      opacity: 0.5;
+      margin-bottom: 4px;
+    }
+
+    .pool {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-height: 36px;
+      padding: 6px 8px;
+      border: 1px dashed rgba(128,128,128,0.35);
+      border-radius: 8px;
+      background: rgba(128,128,128,0.04);
+    }
+
+    .empty-msg      { font-size: 12px; color: #198754; align-self: center; }
+    .pool-hint      { font-size: 12px; color: rgba(128,128,128,0.55); align-self: center; }
+
+    /* ── Chips ─────────────────────────────────────────── */
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 11px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: grab;
+      user-select: none;
+      transition: opacity 0.15s, transform 0.1s;
+      white-space: nowrap;
+    }
+
+    .chip:active            { cursor: grabbing; transform: scale(0.96); }
+    .chip.dragging-source   { opacity: 0.35; }
+    .chip-unmatched         { background: #fff3cd; color: #664d03; border: 1px solid #ffc107; }
+    .chip-matched           { background: #d1e7dd; color: #0a3622; border: 1px solid #a3cfbb; }
+
+    /* ── Mapping grid ──────────────────────────────────── */
+    .mapping-grid { display: flex; gap: 16px; margin-top: 4px; }
+    .panel        { flex: 1; min-width: 0; }
+
+    .panel-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      opacity: 0.55;
+      margin-bottom: 8px;
+    }
+
+    /* ── Drop zones ────────────────────────────────────── */
+    .target-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 7px;
+    }
+
+    .target-label {
+      width: 72px;
+      font-weight: 700;
+      font-size: 12px;
+      text-align: right;
+      flex-shrink: 0;
+      color: #444;
+    }
+
+    .target-label.wide { width: 82px; font-size: 11px; }
+
+    .drop-zone {
+      flex: 1;
+      min-height: 32px;
+      border: 2px dashed rgba(128,128,128,0.4);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      padding: 3px 8px;
+      transition: border-color 0.15s, background 0.15s;
+    }
+
+    .drop-zone.filled { border-style: solid; border-color: #a3cfbb; background: rgba(25,135,84,0.06); }
+    .drop-zone.over   { border-color: #0d6efd; background: rgba(13,110,253,0.08); }
+
+    .drop-placeholder { font-size: 11px; color: rgba(128,128,128,0.65); pointer-events: none; }
+
+    /* ── Year inputs ───────────────────────────────────── */
+    .year-row   { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+    .col-name   { flex: 1; font-size: 12px; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .year-input {
+      width: 76px;
+      padding: 4px 7px;
+      border: 1px solid rgba(128,128,128,0.4);
+      border-radius: 6px;
+      font-size: 12px;
+      text-align: center;
+      outline: none;
+      flex-shrink: 0;
+    }
+
+    .year-input:focus  { border-color: #0d6efd; box-shadow: 0 0 0 2px rgba(13,110,253,0.15); }
+    .year-input.filled { border-color: #a3cfbb; background: rgba(25,135,84,0.05); }
+
+    /* ── Misc ──────────────────────────────────────────── */
+    hr { border: none; border-top: 1px solid rgba(128,128,128,0.2); margin: 10px 0; }
+
+    .btn-row { margin-top: 14px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+    .btn-confirm {
+      background: #0d6efd; color: #fff; border: none;
+      padding: 7px 20px; border-radius: 6px;
+      cursor: pointer; font-size: 13px; font-weight: 600;
+      transition: background 0.15s;
+    }
+    .btn-confirm:hover:not(:disabled) { background: #0b5ed7; }
+    .btn-confirm:disabled             { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-reset {
+      background: transparent; border: 1px solid rgba(128,128,128,0.5);
+      padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; color: #555;
+    }
+    .btn-reset:hover { border-color: #999; }
+
+    .status-msg { font-size: 12px; color: rgba(128,128,128,0.75); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script>
+    // ── Streamlit IPC ──────────────────────────────────────────────────────────
+    let initialized = false;
+
+    window.parent.postMessage({ type: "streamlit:componentReady", apiVersion: 1 }, "*");
+
+    window.addEventListener("message", (event) => {
+      if (event.data.type !== "streamlit:render") return;
+      const args = event.data.args || {};
+      const key  = JSON.stringify([args.detected_rows, args.detected_cols, args.detected_cases]);
+      if (!initialized || key !== lastDataKey) { init(args); initialized = true; }
+    });
+
+    function postValue(v) {
+      window.parent.postMessage({ type: "streamlit:setComponentValue", value: v, dataType: "json" }, "*");
+    }
+    function postHeight() {
+      window.parent.postMessage({ type: "streamlit:setFrameHeight", height: document.body.scrollHeight + 28 }, "*");
+    }
+
+    // ── State ──────────────────────────────────────────────────────────────────
+    let detectedRows  = [];
+    let detectedCols  = [];
+    let detectedCases = [];
+    let targetRows    = [];
+    let targetCases   = [];
+
+    let rowMapping    = {};   // detected_vt   -> VTYPE label | null
+    let colYears      = {};   // detected_col  -> year_int    | null
+    let caseMapping   = {};   // detected_case -> std_case    | null
+
+    let lastDataKey   = "";
+
+    // Drag state
+    let dragName = null, dragType = null, dragFromZone = null;
+
+    // ── Init ───────────────────────────────────────────────────────────────────
+    function init(args) {
+      detectedRows  = args.detected_rows   || [];
+      detectedCols  = args.detected_cols   || [];
+      detectedCases = args.detected_cases  || [];
+      targetRows    = args.target_rows     || [];
+      targetCases   = args.target_cases    || [];
+
+      const autoR = args.auto_row_mapping  || {};
+      const autoC = args.auto_col_mapping  || {};
+      const autoS = args.auto_case_mapping || {};
+
+      rowMapping  = {};
+      colYears    = {};
+      caseMapping = {};
+
+      detectedRows.forEach(r  => { rowMapping[r]  = autoR[r]  || null; });
+      detectedCols.forEach(c  => { colYears[c]    = (autoC[c] != null) ? autoC[c] : null; });
+      detectedCases.forEach(c => { caseMapping[c] = autoS[c]  || null; });
+
+      lastDataKey = JSON.stringify([detectedRows, detectedCols, detectedCases]);
+      render();
+    }
+
+    // ── Render ─────────────────────────────────────────────────────────────────
+    function render() {
+      const unmappedRows  = detectedRows.filter(r  => !rowMapping[r]);
+      const unmappedCases = detectedCases.filter(c => !caseMapping[c]);
+      const hasCases      = detectedCases.length > 0;
+
+      const allVtypes = targetRows.every(t => Object.values(rowMapping).includes(t.key));
+      const allCases  = !hasCases || detectedCases.every(c => caseMapping[c]);
+      const canConfirm = allVtypes && allCases;
+
+      const missingV = targetRows.filter(t => !Object.values(rowMapping).includes(t.key)).map(t => t.label);
+      const missingC = detectedCases.filter(c => !caseMapping[c]);
+      const missing  = [...missingV, ...missingC.map(c => `"${c}"`)];
+
+      document.getElementById("root").innerHTML = `
+
+        <div class="section-label">Detected in your file — drag chips onto the target fields</div>
+        <div class="pool-row">
+          <div class="pool-block">
+            <div class="pool-block-label">Vehicle type values</div>
+            <div class="pool" ondragover="event.preventDefault()" ondrop="onDropPool(event,'row')">
+              ${unmappedRows.length === 0 && detectedRows.length > 0
+                  ? '<span class="empty-msg">✓ All vehicle types mapped</span>'
+                  : unmappedRows.map(r => chip(r,"row",false)).join("")}
+              ${detectedRows.length === 0
+                  ? '<span class="pool-hint">Upload a file to see names here</span>' : ""}
+            </div>
+          </div>
+          ${hasCases ? `
+          <div class="pool-block">
+            <div class="pool-block-label">Case / scenario values</div>
+            <div class="pool" ondragover="event.preventDefault()" ondrop="onDropPool(event,'case')">
+              ${unmappedCases.length === 0
+                  ? '<span class="empty-msg">✓ All cases mapped</span>'
+                  : unmappedCases.map(c => chip(c,"case",false)).join("")}
+            </div>
+          </div>` : ""}
+        </div>
+
+        <hr>
+
+        <div class="mapping-grid">
+
+          <!-- Vehicle type drop zones -->
+          <div class="panel">
+            <div class="panel-title">Vehicle types</div>
+            ${targetRows.map(t => {
+              const hit = Object.entries(rowMapping).find(([,v]) => v === t.key);
+              return `<div class="target-row">
+                <div class="target-label">${t.label}</div>
+                <div class="drop-zone ${hit?"filled":""}"
+                     data-zone="${h(t.key)}" data-type="row"
+                     ondragover="dzOver(event,this)" ondragleave="dzLeave(this)" ondrop="dzDrop(event,this)">
+                  ${hit ? chip(hit[0],"row",true,t.key) : '<span class="drop-placeholder">drop here</span>'}
+                </div>
+              </div>`;
+            }).join("")}
+          </div>
+
+          ${hasCases ? `
+          <!-- Case drop zones -->
+          <div class="panel">
+            <div class="panel-title">Cases</div>
+            ${targetCases.map(std => {
+              const hit = Object.entries(caseMapping).find(([,v]) => v === std);
+              return `<div class="target-row">
+                <div class="target-label wide">${std}</div>
+                <div class="drop-zone ${hit?"filled":""}"
+                     data-zone="${h(std)}" data-type="case"
+                     ondragover="dzOver(event,this)" ondragleave="dzLeave(this)" ondrop="dzDrop(event,this)">
+                  ${hit ? chip(hit[0],"case",true,std) : '<span class="drop-placeholder">drop here</span>'}
+                </div>
+              </div>`;
+            }).join("")}
+          </div>` : ""}
+
+          <!-- Year column inputs -->
+          <div class="panel">
+            <div class="panel-title">Year columns</div>
+            ${detectedCols.map(c => {
+              const yr = colYears[c];
+              return `<div class="year-row">
+                <div class="col-name" title="${h(c)}">${h(c)}</div>
+                <input type="number" class="year-input ${yr!==null?"filled":""}"
+                       id="yr-${eid(c)}" value="${yr!==null?yr:""}" placeholder="year"
+                       min="1990" max="2100" oninput="setYr('${js(c)}',this.value)">
+              </div>`;
+            }).join("")}
+            ${detectedCols.length===0 ? '<div style="font-size:12px;opacity:0.5">No columns detected</div>' : ""}
+          </div>
+
+        </div>
+
+        <div class="btn-row">
+          <button class="btn-confirm" onclick="confirm_()" ${canConfirm?"":"disabled"}>
+            ${canConfirm ? "Confirm Mapping" : "Complete all mappings to confirm"}
+          </button>
+          <button class="btn-reset" onclick="reset_()">Reset</button>
+          ${!canConfirm && missing.length
+              ? `<span class="status-msg">Still needed: ${missing.join(" · ")}</span>` : ""}
+        </div>
+      `;
+
+      setTimeout(postHeight, 60);
+    }
+
+    // ── Chip HTML ──────────────────────────────────────────────────────────────
+    function chip(name, type, matched, zone) {
+      const cls = matched ? "chip chip-matched" : "chip chip-unmatched";
+      return `<span class="${cls}" draggable="true"
+        data-name="${h(name)}" data-type="${type}" data-zone="${zone?h(zone):""}"
+        ondragstart="ds(event,'${js(name)}','${type}','${js(zone||'')}')"
+        ondragend="de(event)">${h(name)}</span>`;
+    }
+
+    // ── Drag handlers ──────────────────────────────────────────────────────────
+    function ds(e, name, type, fromZone) {
+      dragName = name; dragType = type; dragFromZone = fromZone || null;
+      e.dataTransfer.effectAllowed = "move";
+      e.target.classList.add("dragging-source");
+    }
+    function de(e) { e.target.classList.remove("dragging-source"); }
+
+    function dzOver(e, zone) {
+      if (zone.dataset.type !== dragType) return;
+      e.preventDefault(); zone.classList.add("over");
+    }
+    function dzLeave(zone) { zone.classList.remove("over"); }
+
+    function dzDrop(e, zone) {
+      e.preventDefault(); zone.classList.remove("over");
+      if (!dragName || zone.dataset.type !== dragType) return;
+      const zk = zone.dataset.zone;
+      if (dragType === "row") {
+        const prev = Object.entries(rowMapping).find(([,v]) => v === zk);
+        if (prev) rowMapping[prev[0]] = null;
+        if (dragFromZone) rowMapping[dragName] = null;
+        rowMapping[dragName] = zk;
+      } else {
+        const prev = Object.entries(caseMapping).find(([,v]) => v === zk);
+        if (prev) caseMapping[prev[0]] = null;
+        if (dragFromZone) caseMapping[dragName] = null;
+        caseMapping[dragName] = zk;
+      }
+      dragName = null; dragType = null; dragFromZone = null;
+      render();
+    }
+
+    function onDropPool(e, type) {
+      e.preventDefault();
+      if (!dragName || dragType !== type) return;
+      if (type === "row"  && dragFromZone) rowMapping[dragName]  = null;
+      if (type === "case" && dragFromZone) caseMapping[dragName] = null;
+      dragName = null; dragType = null; dragFromZone = null;
+      render();
+    }
+
+    // ── Year inputs ────────────────────────────────────────────────────────────
+    function setYr(col, val) {
+      colYears[col] = val ? parseInt(val, 10) : null;
+      const inp = document.getElementById("yr-" + eid(col));
+      if (inp) inp.classList.toggle("filled", colYears[col] !== null);
+    }
+
+    // ── Confirm / Reset ────────────────────────────────────────────────────────
+    function reset_() {
+      detectedRows.forEach(r  => { rowMapping[r]  = null; });
+      detectedCols.forEach(c  => { colYears[c]    = null; });
+      detectedCases.forEach(c => { caseMapping[c] = null; });
+      render();
+    }
+
+    function confirm_() {
+      const rm = {}, cm = {}, sm = {};
+      Object.entries(rowMapping).forEach(([k,v])  => { if (v) rm[k] = v; });
+      Object.entries(colYears).forEach(([k,v])    => { if (v != null) cm[k] = v; });
+      Object.entries(caseMapping).forEach(([k,v]) => { if (v) sm[k] = v; });
+      postValue({ row_mapping: rm, col_mapping: cm, case_mapping: sm });
+    }
+
+    // ── Escape helpers ─────────────────────────────────────────────────────────
+    function h(s)   { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+    function js(s)  { return String(s).replace(/\\/g,"\\\\").replace(/'/g,"\\'"); }
+    function eid(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g,"_"); }
+  </script>
+</body>
+</html>
