@@ -11,6 +11,14 @@ import plotly.express as px
 import math
 import io
 import csv
+import copy
+
+# Optional: Excel template generation (Step 6) — requires openpyxl
+try:
+    import openpyxl  # noqa: F401
+    _EXCEL_AVAILABLE = True
+except ImportError:
+    _EXCEL_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -26,9 +34,12 @@ st.set_page_config(
 # TfNSW ECONOMIC PARAMETER VALUES (Jan 2025, June 2024 prices)
 # ─────────────────────────────────────────────────────────────────────────────
 PARAMS = {
+    # Value of travel time savings $/person-hr, by vehicle type.
+    # Car/Bus use commute rate (personal travel); LCV/HCV use business rate (freight/commercial).
+    # Source: TfNSW EPV Jan 2025, Table 3
     "vtts": {
-        "urban": {"commute": 19.76, "business": 54.87, "other": 9.35},
-        "rural": {"commute": 17.78, "business": 49.38, "other": 8.42},
+        "urban": {"Car": 19.76, "LCV": 54.87, "HCV": 54.87, "Bus": 19.76},
+        "rural": {"Car": 17.78, "LCV": 49.38, "HCV": 49.38, "Bus": 17.78},
     },
     "voc": {
         "urban": {
@@ -44,12 +55,11 @@ PARAMS = {
             "artic": {60: 0.685, 80: 0.660, 100: 0.697, 110: 0.731},
         },
     },
-    "crash_costs": {
-        "fatal": 9_462_000,
-        "serious": 471_000,
-        "moderate": 28_200,
-        "minor": 13_100,
-        "pdo": 11_500,
+    "safety_vkt": {
+        "Car": 0.153,
+        "LCV": 0.098,
+        "HCV": 0.198,
+        "Bus": 0.167,
     },
     "vsl": 8_100_000,
     "carbon_per_tonne": 123,
@@ -69,7 +79,89 @@ PARAMS = {
         "urban": {"car": 0.84, "lgv": 0.08, "rigid": 0.05, "artic": 0.03},
         "rural": {"car": 0.75, "lgv": 0.10, "rigid": 0.08, "artic": 0.07},
     },
+    # Phase 0a: Emission cost per vehicle-km ($/veh-km), combining emission factor × carbon price
+    # Derived from NTC fleet-average emission factors × $123/tCO₂e (June 2024)
+    "emission_cost": {
+        "urban": {"car": 0.023, "lgv": 0.027, "rigid": 0.071, "bus": 0.101},
+        "rural": {"car": 0.007, "lgv": 0.009, "rigid": 0.022, "bus": 0.032},
+    },
 }
+
+# Phase 0b: Vehicle type mapping — UI labels to PARAMS internal keys
+# Note: Bus approximated as artic for VOC/air/noise externality rates
+VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "artic"}
+
+# Separate mapping for emission_cost (uses "bus" key, not "artic")
+EMISSION_VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "bus"}
+
+# Canonical vehicle type list for matrix inputs
+VTYPES = ["Car", "LCV", "HCV", "Bus"]
+
+# Default modelling years
+DEFAULT_MODELLING_YEARS = [2026, 2031, 2041, 2056]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA SCHEMA — Step 1: factory functions for matrix input structures
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_traffic_case(years: list) -> dict:
+    """Return a zeroed traffic data dict for one case (base or project).
+
+    Structure:
+        {
+          "years": [2026, 2031, ...],
+          "Car":  {"vht": [...], "vkt": [...], "stops": [...], "demand": [...]},
+          "LCV":  {...},
+          "HCV":  {...},
+          "Bus":  {...},
+        }
+    """
+    n = len(years)
+    return {
+        "years": list(years),
+        **{
+            vt: {"vht": [0.0] * n, "vkt": [0.0] * n, "stops": [0.0] * n, "demand": [0.0] * n}
+            for vt in VTYPES
+        },
+    }
+
+
+def make_traffic_data(years: list, n_project_cases: int = 1) -> dict:
+    """Return a full traffic_data dict: base_case + project_1 … project_N.
+
+    Structure:
+        {
+          "base_case":  <traffic_case>,
+          "project_1":  <traffic_case>,
+          ...
+        }
+    """
+    data = {"base_case": make_traffic_case(years)}
+    for i in range(1, n_project_cases + 1):
+        data[f"project_{i}"] = make_traffic_case(years)
+    return data
+
+
+def make_cost_data(n_project_cases: int = 1) -> dict:
+    """Return cost_data dict keyed by project case (base has no costs).
+
+    Structure per project case:
+        {
+          "cap_planning": 0.0,   # $M
+          "cap_land": 0.0,       # $M
+          "cap_construction": 0.0,  # $M
+          "contingency_pct": 0.0,   # %
+          "opex_maint": 0.0,     # $M/year
+          "opex_op": 0.0,        # $M/year
+          "residual": 0.0,       # $M
+        }
+    """
+    template = {
+        "cap_planning": 0.0, "cap_land": 0.0, "cap_construction": 0.0,
+        "contingency_pct": 0.0, "opex_maint": 0.0, "opex_op": 0.0, "residual": 0.0,
+    }
+    return {f"project_{i}": dict(template) for i in range(1, n_project_cases + 1)}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER FUNCTIONS
@@ -98,198 +190,686 @@ def format_m(value: float) -> str:
     return f"${value:.1f}M"
 
 
+def _cagr_interpolate(v1: float, v2: float, y1: int, y2: int, eval_year: int) -> float:
+    """CAGR-based interpolation/extrapolation between two modelling years.
+
+    Mirrors the Excel formula: ((v2/v1)^(1/(y2-y1)))-1 applied as
+    v1 * (v2/v1)^((eval_year-y1)/(y2-y1)).  Returns 0 if either value is 0.
+    """
+    if v1 == 0 or v2 == 0 or y2 == y1:
+        return 0.0
+    return float(v1) * (float(v2) / float(v1)) ** ((eval_year - y1) / (y2 - y1))
+
+
+def interpolate_modelling_years(modelling_years: list, values: list, eval_year: int) -> float:
+    """CAGR interpolate (or extrapolate) a value for eval_year from modelling year data.
+
+    Uses compound-growth interpolation matching the Excel CAGR formula:
+        rate = (v2/v1)^(1/(y2-y1)) - 1
+        value = v1 * (1+rate)^(eval_year - y1)
+    Returns 0 when either bracketing value is 0.
+    """
+    if len(modelling_years) == 0 or len(values) == 0:
+        return 0.0
+    if len(modelling_years) == 1:
+        return float(values[0])
+
+    years = modelling_years
+    if eval_year <= years[0]:
+        return _cagr_interpolate(values[0], values[1], years[0], years[1], eval_year)
+    if eval_year >= years[-1]:
+        return _cagr_interpolate(values[-2], values[-1], years[-2], years[-1], eval_year)
+
+    for i in range(len(years) - 1):
+        if years[i] <= eval_year <= years[i + 1]:
+            return _cagr_interpolate(values[i], values[i + 1], years[i], years[i + 1], eval_year)
+
+    return float(values[-1])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# CALCULATION ENGINE
+# MATRIX UI HELPERS — Step 3
 # ─────────────────────────────────────────────────────────────────────────────
 
-def calculate(inputs: dict) -> dict:
+def render_traffic_matrix(metric: str, unit_label: str) -> None:
+    """Render st.data_editor tables for one traffic metric across all cases.
+
+    Displays one editable table per case (Base Case + N project cases), then a
+    colour-coded read-only incremental table (Project − Base) beneath.
+    Reads and writes ``st.session_state.traffic_data`` in-place.
+
+    Args:
+        metric:     One of "vht", "vkt", "stops", "demand".
+        unit_label: Human-readable unit string shown in the table header.
+    """
+    years: list = st.session_state.modelling_years
+    n: int = st.session_state.n_project_cases
+    case_keys = ["base_case"] + [f"project_{i}" for i in range(1, n + 1)]
+    case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
+
+    col_cfg = {
+        str(y): st.column_config.NumberColumn(str(y), min_value=0.0, format="%.0f")
+        for y in years
+    }
+
+    # ── Editable input tables ──────────────────────────────────────────────
+    for case_key, case_label in zip(case_keys, case_labels):
+        st.markdown(f"**{case_label}** &nbsp;·&nbsp; <small>{unit_label}</small>",
+                    unsafe_allow_html=True)
+
+        # Build DataFrame: rows = vehicle types, columns = modelling years
+        row_data = {
+            str(y): {
+                vt: st.session_state.traffic_data[case_key][vt][metric][y_idx]
+                for vt in VTYPES
+            }
+            for y_idx, y in enumerate(years)
+        }
+        df_edit = pd.DataFrame(row_data, index=VTYPES)
+
+        edited = st.data_editor(
+            df_edit,
+            num_rows="fixed",
+            key=f"de_{metric}_{case_key}",
+            use_container_width=True,
+            column_config=col_cfg,
+        )
+
+        # Persist edits back to session_state
+        for y_idx, y in enumerate(years):
+            for vt in VTYPES:
+                try:
+                    val = float(edited.loc[vt, str(y)])
+                except (KeyError, ValueError, TypeError):
+                    val = 0.0
+                st.session_state.traffic_data[case_key][vt][metric][y_idx] = val
+
+        # Auto-sum totals (read-only caption below each table)
+        totals = edited.sum()
+        st.caption(
+            "  Total: " + "   |   ".join(f"{y}: {totals[str(y)]:.0f}" for y in years)
+        )
+
+    # ── Incremental tables (Project − Base) ───────────────────────────────
+    if n >= 1:
+        st.divider()
+        st.markdown("**Incremental (Project − Base)**")
+
+        base_data = {
+            str(y): {
+                vt: st.session_state.traffic_data["base_case"][vt][metric][y_idx]
+                for vt in VTYPES
+            }
+            for y_idx, y in enumerate(years)
+        }
+        base_df = pd.DataFrame(base_data, index=VTYPES)
+
+        for i in range(1, n + 1):
+            proj_data = {
+                str(y): {
+                    vt: st.session_state.traffic_data[f"project_{i}"][vt][metric][y_idx]
+                    for vt in VTYPES
+                }
+                for y_idx, y in enumerate(years)
+            }
+            proj_df = pd.DataFrame(proj_data, index=VTYPES)
+            incr_df = proj_df - base_df
+
+            if n > 1:
+                st.caption(f"Project {i} − Base")
+
+            def _style_incr(val):
+                if isinstance(val, (int, float)):
+                    if val < 0:
+                        return "background-color:rgba(220,53,69,0.12);color:#dc3545"
+                    if val > 0:
+                        return "background-color:rgba(25,135,84,0.12);color:#198754"
+                return ""
+
+            st.dataframe(
+                incr_df.style.applymap(_style_incr).format("{:+.0f}"),
+                use_container_width=True,
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CRASH MATRIX UI HELPER — Step 4
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COST ENTRY UI HELPER — Step 5
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_cost_entry() -> None:
+    """Render cost input forms per project case (Step 5).
+
+    One expandable section per project case with capital costs (planning, land,
+    construction, contingency %), recurrent costs (maintenance, operating), and
+    residual value.  Updates ``st.session_state.cost_data`` in-place.
+    """
+    n = st.session_state.n_project_cases
+    for i in range(1, n + 1):
+        case_key = f"project_{i}"
+        cd = st.session_state.cost_data[case_key]
+
+        with st.expander(f"Project {i} — Costs", expanded=(i == 1)):
+            st.markdown("**Capital Costs ($M, undiscounted)**")
+            c1, c2 = st.columns(2)
+            with c1:
+                cd["cap_planning"] = st.number_input(
+                    "Planning & Design ($M)", min_value=0.0,
+                    value=float(cd["cap_planning"]), step=0.1, key=f"cost_planning_{i}",
+                )
+                cd["cap_construction"] = st.number_input(
+                    "Construction ($M)", min_value=0.0,
+                    value=float(cd["cap_construction"]), step=1.0, key=f"cost_construction_{i}",
+                )
+            with c2:
+                cd["cap_land"] = st.number_input(
+                    "Land Acquisition ($M)", min_value=0.0,
+                    value=float(cd["cap_land"]), step=0.1, key=f"cost_land_{i}",
+                )
+                cd["contingency_pct"] = st.number_input(
+                    "Contingency (%)", min_value=0.0, max_value=50.0,
+                    value=float(cd["contingency_pct"]), step=1.0, key=f"cost_contingency_{i}",
+                )
+
+            total_cap = (
+                (cd["cap_planning"] + cd["cap_land"] + cd["cap_construction"])
+                * (1 + cd["contingency_pct"] / 100)
+            )
+            st.metric(
+                f"Total Capital incl. {cd['contingency_pct']:.0f}% contingency ($M)",
+                f"${total_cap:.2f}M",
+            )
+
+            st.markdown("**Recurrent Costs ($M/year)**")
+            r1, r2 = st.columns(2)
+            with r1:
+                cd["opex_maint"] = st.number_input(
+                    "Maintenance ($M/yr)", min_value=0.0,
+                    value=float(cd["opex_maint"]), step=0.1, key=f"cost_maint_{i}",
+                )
+            with r2:
+                cd["opex_op"] = st.number_input(
+                    "Operating ($M/yr)", min_value=0.0,
+                    value=float(cd["opex_op"]), step=0.1, key=f"cost_op_{i}",
+                )
+
+            cd["residual"] = st.number_input(
+                "Residual Value ($M, at end of evaluation period)", min_value=0.0,
+                value=float(cd["residual"]), step=0.1, key=f"cost_residual_{i}",
+            )
+            st.session_state.cost_data[case_key] = cd
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE UPLOAD HELPERS — Step 6
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_template_excel():
+    """Generate a pre-structured Excel template for matrix traffic data.
+
+    Returns raw bytes suitable for st.download_button, or None if openpyxl is
+    not installed.
+    """
+    if not _EXCEL_AVAILABLE:
+        return None
+
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+    case_keys = ["base_case"] + [f"project_{i}" for i in range(1, n + 1)]
+    case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # One sheet per traffic metric
+        for metric in ["VHT", "VKT", "Stops", "Demand"]:
+            rows = []
+            for case_key, case_label in zip(case_keys, case_labels):
+                for vt in VTYPES:
+                    row = {"Case": case_label, "Vehicle Type": vt}
+                    for y in years:
+                        row[str(y)] = 0.0
+                    rows.append(row)
+            pd.DataFrame(rows).to_excel(writer, sheet_name=metric, index=False)
+
+    return buf.getvalue()
+
+
+def _apply_template_df(df: pd.DataFrame, metric: str, years: list, n: int) -> None:
+    """Write a parsed template DataFrame into ``st.session_state.traffic_data``."""
+    case_labels_map = {
+        "Base Case": "base_case",
+        **{f"Project {i}": f"project_{i}" for i in range(1, n + 1)},
+    }
+    year_cols = [str(y) for y in years]
+    for _, row in df.iterrows():
+        case_key = case_labels_map.get(str(row.get("Case", "")).strip())
+        vt = str(row.get("Vehicle Type", "")).strip()
+        if case_key and vt in VTYPES and case_key in st.session_state.traffic_data:
+            for y_idx, yc in enumerate(year_cols):
+                try:
+                    val = float(row.get(yc, 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    val = 0.0
+                st.session_state.traffic_data[case_key][vt][metric][y_idx] = val
+
+
+def _handle_template_upload(uploaded_file) -> None:
+    """Parse a file uploaded in Template mode and populate session_state data."""
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+            _apply_template_df(df, "vht", years, n)
+            st.success("Imported VHT data from CSV (for full import use Excel template).")
+        else:
+            xl = pd.ExcelFile(uploaded_file)
+            metrics_map = {"VHT": "vht", "VKT": "vkt", "Stops": "stops", "Demand": "demand"}
+            imported = []
+            for sheet_name, metric in metrics_map.items():
+                if sheet_name in xl.sheet_names:
+                    _apply_template_df(xl.parse(sheet_name), metric, years, n)
+                    imported.append(sheet_name)
+            if imported:
+                st.success(f"Imported: {', '.join(imported)}")
+                st.rerun()
+            else:
+                st.warning(
+                    "No matching sheets found. Expected sheet names: "
+                    "VHT, VKT, Stops, Demand."
+                )
+    except Exception as e:
+        st.error(f"Import failed: {e}")
+
+
+def _smart_parse_upload(uploaded_file) -> None:
+    """Attempt automatic column detection for arbitrary CSV/Excel files."""
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            dfs = {"Sheet1": pd.read_csv(uploaded_file)}
+        else:
+            xl = pd.ExcelFile(uploaded_file)
+            # If it looks like our own template, delegate to the template handler
+            template_sheets = {"VHT", "VKT", "Stops", "Demand", "Crashes"}
+            if template_sheets & set(xl.sheet_names):
+                _handle_template_upload(uploaded_file)
+                return
+            dfs = {sh: xl.parse(sh) for sh in xl.sheet_names}
+
+        case_labels_norm = {
+            "base case": "Base Case", "base": "Base Case",
+            **{f"project {i}": f"Project {i}" for i in range(1, n + 1)},
+            **{f"project_{i}": f"Project {i}" for i in range(1, n + 1)},
+            **{f"project{i}": f"Project {i}" for i in range(1, n + 1)},
+        }
+
+        imported = []
+        for sheet_name, df in dfs.items():
+            df.columns = [str(c).strip() for c in df.columns]
+
+            # Detect year columns: 4-digit integers 2020-2100
+            year_cols = [c for c in df.columns if c.isdigit() and 2020 <= int(c) <= 2100]
+            if not year_cols:
+                continue
+
+            case_col = next((c for c in df.columns if c.lower() in
+                             ("case", "scenario", "project")), None)
+            vt_col = next((c for c in df.columns if c.lower() in
+                           ("vehicle type", "vehicletype", "vtype", "vehicle")), None)
+
+            # Infer metric from sheet name
+            inferred_metric = next(
+                (m for m in ("vht", "vkt", "stops", "demand") if m in sheet_name.lower()),
+                "vht",
+            )
+
+            norm_rows = []
+            for _, row in df.iterrows():
+                raw_case = str(row[case_col]).strip().lower() if case_col else "base case"
+                norm_case = case_labels_norm.get(raw_case, "Base Case")
+
+                raw_vt = str(row[vt_col]).strip() if vt_col else "Car"
+                vt_match = next(
+                    (vt for vt in VTYPES if raw_vt.lower() in (vt.lower(), vt[:3].lower())),
+                    None,
+                )
+                if vt_match is None:
+                    continue
+
+                norm_row = {"Case": norm_case, "Vehicle Type": vt_match}
+                for yc in year_cols:
+                    norm_row[yc] = row.get(yc, 0.0)
+                norm_rows.append(norm_row)
+
+            if norm_rows:
+                _apply_template_df(pd.DataFrame(norm_rows), inferred_metric, years, n)
+                imported.append(f"{sheet_name} → {inferred_metric.upper()}")
+
+        if imported:
+            st.success(f"Smart parse imported: {', '.join(imported)}")
+            st.rerun()
+        else:
+            st.warning(
+                "Could not detect year columns (expecting 4-digit years ≥ 2020) or no "
+                "matching vehicle types found. Try **Template** mode instead."
+            )
+    except Exception as e:
+        st.error(f"Smart parse failed: {e}")
+
+
+def _render_user_mapping_upload(uploaded_file) -> None:
+    """Render a column-mapping UI for arbitrary CSV/Excel files."""
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            xl = pd.ExcelFile(uploaded_file)
+            sheet = st.selectbox("Sheet", xl.sheet_names, key="um_sheet")
+            df = xl.parse(sheet)
+
+        df.columns = [str(c).strip() for c in df.columns]
+        all_cols = list(df.columns)
+        none_opt = "(none)"
+        col_opts = [none_opt] + all_cols
+
+        st.markdown("**Map columns to fields:**")
+        m1, m2 = st.columns(2)
+        with m1:
+            _case_default = next(
+                (i + 1 for i, c in enumerate(all_cols) if c.lower() in ("case", "scenario")), 0
+            )
+            case_col = st.selectbox("Case column", col_opts, index=_case_default, key="um_case_col")
+            _vt_default = next(
+                (i + 1 for i, c in enumerate(all_cols)
+                 if "vehicle" in c.lower() or "vtype" in c.lower()), 0
+            )
+            vt_col = st.selectbox("Vehicle Type column", col_opts, index=_vt_default, key="um_vt_col")
+
+        with m2:
+            metric = st.selectbox(
+                "Metric", ["vht", "vkt", "stops", "demand"], key="um_metric"
+            )
+            year_cols_detected = [
+                c for c in all_cols if c.isdigit() and 2020 <= int(c) <= 2100
+            ]
+            year_cols_sel = st.multiselect(
+                "Year columns", all_cols, default=year_cols_detected, key="um_year_cols"
+            )
+
+        # Case value → standard name mapping
+        if case_col and case_col != none_opt:
+            unique_cases = [str(v) for v in df[case_col].dropna().unique()[:6]]
+            standard_cases = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
+            st.markdown("**Map case values to standard names:**")
+            case_map: dict = {}
+            for uc in unique_cases:
+                case_map[uc] = st.selectbox(
+                    f'"{uc}"', standard_cases, key=f"um_casemap_{uc}"
+                )
+        else:
+            case_map = {}
+
+        if st.button("Apply Mapping", key="um_apply"):
+            if not year_cols_sel:
+                st.error("Select at least one year column.")
+                return
+
+            norm_rows = []
+            for _, row in df.iterrows():
+                raw_case = (
+                    str(row[case_col]).strip() if case_col and case_col != none_opt else "Base Case"
+                )
+                norm_case = case_map.get(raw_case, raw_case)
+
+                raw_vt = (
+                    str(row[vt_col]).strip() if vt_col and vt_col != none_opt else "Car"
+                )
+                vt_match = next(
+                    (vt for vt in VTYPES
+                     if raw_vt.lower() in (vt.lower(), vt[:3].lower())),
+                    None,
+                )
+                if vt_match is None:
+                    continue
+                norm_row = {"Case": norm_case, "Vehicle Type": vt_match}
+                for yc in year_cols_sel:
+                    norm_row[str(yc)] = row.get(yc, 0.0)
+                norm_rows.append(norm_row)
+
+            if not norm_rows:
+                st.warning(
+                    "No rows matched after mapping. Check column selections and "
+                    "case/vehicle type values."
+                )
+                return
+
+            norm_df = pd.DataFrame(norm_rows)
+            _apply_template_df(norm_df, metric, years, n)
+            st.success(f"Applied mapping: {len(norm_rows)} rows → {metric.upper()}")
+            st.rerun()
+
+    except Exception as e:
+        st.error(f"User mapping failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MATRIX CALCULATION ENGINE — Step 7
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_matrix(
+    inputs: dict,
+    base_traffic: dict,
+    proj_traffic: dict,
+    cost: dict,
+    annualisation: dict,
+    safety_vkt_base: dict = None,
+    safety_vkt_proj: dict = None,
+    params: dict = None,
+) -> dict:
+    """Compute CBA for one project case using the matrix traffic data model.
+
+    Args:
+        inputs:        Project config keys: context, evaluation_period,
+                       construction_years, discount_rate, base_year.
+        base_traffic:  traffic_case dict for the base case.
+        proj_traffic:  traffic_case dict for this project case.
+        cost:          cost_data entry for this project case.
+        annualisation: annualisation factor and days_per_year per vehicle type.
+
+    Returns:
+        Result dict with the same keys as the legacy ``calculate()`` output so
+        existing dashboard/export code is compatible.
+    """
+    _p = params if params is not None else PARAMS
     ctx = inputs["context"]
     eval_period = inputs["evaluation_period"]
     const_years = inputs["construction_years"]
     dr = inputs["discount_rate"]
-    aadt = inputs["aadt"]
-    growth = inputs["traffic_growth"] / 100
-    trip_len = inputs["trip_length"]
-    occupancy = inputs["occupancy"]
-    pct_commute = inputs["pct_commute"] / 100
-    pct_business = inputs["pct_business"] / 100
-    pct_other = max(0, 1 - pct_commute - pct_business)
-    pct_heavy = inputs["pct_heavy"] / 100
-    speed_base = inputs["speed_base"]
-    speed_project = inputs["speed_project"]
+    discount_base_year = inputs.get("discount_base_year", 2026)
+    construction_start_year = inputs.get("construction_start_year", discount_base_year)
+    zero_growth_after_last_year = inputs.get("zero_growth_after_last_year", False)
 
-    # --- COSTS ---
-    cap_planning = inputs["cap_planning"]
-    cap_land = inputs["cap_land"]
-    cap_construction = inputs["cap_construction"]
-    contingency_pct = inputs["contingency"] / 100
-    total_capital = (cap_planning + cap_land + cap_construction) * (1 + contingency_pct)
-    opex_maint = inputs["opex_maint"]
-    opex_op = inputs["opex_op"]
-    residual = inputs["residual"]
-    annual_capital = total_capital / const_years if const_years > 0 else 0
+    # Annualisation: modelled-period VHT/VKT → annual (per vehicle type)
+    ann_factors = {vt: annualisation[vt]["factor"] * annualisation[vt]["days"] for vt in VTYPES}
 
-    # --- ANNUAL BENEFITS (first year of operation) ---
-    vtts_set = PARAMS["vtts"][ctx]
+    # VTTS by vehicle type ($/person-hr)
+    vtts_by_vtype = _p["vtts"][ctx]
 
-    time_base_hr = trip_len / speed_base if speed_base > 0 else 0
-    time_project_hr = trip_len / speed_project if speed_project > 0 else 0
-    time_saving_hr = max(0, time_base_hr - time_project_hr)
+    # Capital and recurrent costs
+    raw_cap = cost["cap_planning"] + cost["cap_land"] + cost["cap_construction"]
+    total_capital = raw_cap * (1 + cost["contingency_pct"] / 100)
+    annual_capital = total_capital / const_years if const_years > 0 else 0.0
+    opex = cost["opex_maint"] + cost["opex_op"]
+    residual = cost["residual"]
 
-    daily_person_trips = aadt * occupancy
-    vtts_weighted = (
-        vtts_set["commute"] * pct_commute
-        + vtts_set["business"] * pct_business
-        + vtts_set["other"] * pct_other
-    )
-
-    annual_tts = daily_person_trips * time_saving_hr * vtts_weighted * PARAMS["days_per_year"] / 1e6
-    annual_reliability = annual_tts * PARAMS["reliability_ratio"] * 0.3
-
-    # VOC savings
-    voc_base_car = interpolate_voc(PARAMS["voc"][ctx]["car"], speed_base)
-    voc_proj_car = interpolate_voc(PARAMS["voc"][ctx]["car"], speed_project)
-    voc_saving_car = max(0, voc_base_car - voc_proj_car)
-
-    voc_base_heavy = interpolate_voc(PARAMS["voc"][ctx]["rigid"], speed_base)
-    voc_proj_heavy = interpolate_voc(PARAMS["voc"][ctx]["rigid"], speed_project)
-    voc_saving_heavy = max(0, voc_base_heavy - voc_proj_heavy)
-
-    annual_voc = (
-        aadt * (1 - pct_heavy) * trip_len * voc_saving_car
-        + aadt * pct_heavy * trip_len * voc_saving_heavy
-    ) * PARAMS["days_per_year"] / 1e6
-
-    # Safety
-    annual_safety = (
-        inputs["crash_fatal"] * PARAMS["crash_costs"]["fatal"]
-        + inputs["crash_serious"] * PARAMS["crash_costs"]["serious"]
-        + inputs["crash_moderate"] * PARAMS["crash_costs"]["moderate"]
-        + inputs["crash_minor"] * PARAMS["crash_costs"]["minor"]
-        + inputs["crash_pdo"] * PARAMS["crash_costs"]["pdo"]
-    ) / 1e6
-
-    # Environmental
-    annual_co2 = inputs["co2_reduction"] * PARAMS["carbon_per_tonne"] / 1e6
-    annual_air = inputs["air_pollution_reduction"] / 1e3
-    annual_noise = inputs["noise_reduction"] / 1e3
-    annual_env = annual_co2 + annual_air + annual_noise
-
-    # Active transport
-    annual_walk = inputs["walk_km"] * PARAMS["health_benefits"]["walking"] * PARAMS["days_per_year"] / 1e6
-    annual_cycle = inputs["cycle_km"] * PARAMS["health_benefits"]["cycling"] * PARAMS["days_per_year"] / 1e6
-    annual_active = annual_walk + annual_cycle
-
-    total_first_year = annual_tts + annual_reliability + annual_voc + annual_safety + annual_env + annual_active
-
-    # --- YEAR-BY-YEAR CASHFLOW ---
+    modelling_years = base_traffic["years"]
     total_years = const_years + eval_period
-    annual_costs = []
-    annual_benefits = []
-    benefits_by_type = {"tts": [], "reliability": [], "voc": [], "safety": [], "env": [], "active": []}
-    annual_net = []
-    disc_costs = []
-    disc_benefits = []
-    disc_net = []
-    cum_disc_net = []
 
-    pv_benefits = 0
-    pv_costs = 0
-    cum = 0
+    annual_costs: list = []
+    annual_benefits: list = []
+    benefits_by_type: dict = {k: [] for k in ("tts", "tts_Car", "tts_LCV", "tts_HCV", "tts_Bus", "reliability", "voc", "safety", "env", "active")}
+    annual_net: list = []
+    disc_costs: list = []
+    disc_benefits: list = []
+    disc_net: list = []
+    cum_disc_net: list = []
+
+    pv_costs = 0.0
+    pv_benefits = 0.0
+    cum = 0.0
     payback_year = None
 
+    # Start-of-year convention: discount exponent = eval_year - discount_base_year.
+    # First operational year has DF = 1.0 when discount_base_year = construction_start_year + const_years.
+    base_offset = construction_start_year - discount_base_year
+
     for y in range(total_years):
-        df = discount_factor(dr, y)
-        cost = 0
-        benefit = 0
-        b_tts = b_rel = b_voc = b_safety = b_env = b_active = 0
+        eval_year = construction_start_year + y
+        discount_exp = base_offset + y
+        df_factor = discount_factor(dr, discount_exp)
+        # Clamp traffic eval year to last modelling year when zero-growth is selected
+        ey = min(eval_year, modelling_years[-1]) if zero_growth_after_last_year else eval_year
+        cost_y = 0.0
+        b_tts = b_rel = b_voc = b_safety = b_env = b_active = 0.0
+        b_tts_by_vt: dict = {vt: 0.0 for vt in VTYPES}
 
         if y < const_years:
-            cost = annual_capital
+            cost_y = annual_capital
         else:
-            op_year = y - const_years
-            gf = math.pow(1 + growth, op_year)
-            cost = opex_maint + opex_op
-            b_tts = annual_tts * gf
-            b_rel = annual_reliability * gf
-            b_voc = annual_voc * gf
-            b_safety = annual_safety
-            b_env = annual_env
-            b_active = annual_active
-            benefit = b_tts + b_rel + b_voc + b_safety + b_env + b_active
-            if y == total_years - 1:
-                benefit += residual
+            cost_y = opex
 
-        annual_costs.append(cost)
-        annual_benefits.append(benefit)
-        benefits_by_type["tts"].append(b_tts)
-        benefits_by_type["reliability"].append(b_rel)
-        benefits_by_type["voc"].append(b_voc)
-        benefits_by_type["safety"].append(b_safety)
-        benefits_by_type["env"].append(b_env)
-        benefits_by_type["active"].append(b_active)
+            # ── TTS: per vehicle type ───────────────────────────────────────
+            for vt in VTYPES:
+                vht_base = interpolate_modelling_years(
+                    modelling_years, base_traffic[vt]["vht"], ey
+                )
+                vht_proj = interpolate_modelling_years(
+                    modelling_years, proj_traffic[vt]["vht"], ey
+                )
+                annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factors[vt]
+                vt_tts = annual_vht_saving * vtts_by_vtype[vt] / 1e6
+                b_tts_by_vt[vt] = vt_tts
+                b_tts += vt_tts
 
-        net = benefit - cost
+            b_rel = b_tts * _p["reliability_ratio"] * 0.3
+
+            # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
+            for vt in VTYPES:
+                param_vt = VTYPE_MAP[vt]
+                voc_table = _p["voc"][ctx].get(param_vt, {})
+                if not voc_table:
+                    continue
+
+                vht_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vht"], ey)
+                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
+                vht_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vht"], ey)
+                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
+
+                spd_b = vkt_b / vht_b if vht_b > 0 else 0.0
+                spd_p = vkt_p / vht_p if vht_p > 0 else 0.0
+
+                voc_b = interpolate_voc(voc_table, spd_b) if spd_b > 0 else 0.0
+                voc_p = interpolate_voc(voc_table, spd_p) if spd_p > 0 else 0.0
+
+                annual_vkt_b = vkt_b * ann_factors[vt]
+                annual_vkt_p = vkt_p * ann_factors[vt]
+                voc_saving = annual_vkt_b * voc_b - annual_vkt_p * voc_p
+                b_voc += max(0.0, voc_saving) / 1e6
+
+            # ── Safety: $/VKT per vehicle type (per-case rates) ─────────────
+            _sv_base = safety_vkt_base if safety_vkt_base is not None else _p["safety_vkt"]
+            _sv_proj = safety_vkt_proj if safety_vkt_proj is not None else _p["safety_vkt"]
+            for vt in VTYPES:
+                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
+                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
+                b_safety += (vkt_b * _sv_base[vt] - vkt_p * _sv_proj[vt]) * ann_factors[vt] / 1e6
+
+            # ── Environmental: emission + air + noise per vtype × VKT Δ ────
+            for vt in VTYPES:
+                param_vt = VTYPE_MAP[vt]
+                emit_vt = EMISSION_VTYPE_MAP[vt]
+                emit_rate = _p["emission_cost"][ctx].get(emit_vt, 0.0)
+                air_rate = _p["air_pollution"][ctx].get(param_vt, 0.0)
+                noise_rate = _p["noise"][ctx].get(param_vt, 0.0)
+
+                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
+                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
+                vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
+                b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
+
+        benefit_y = b_tts + b_rel + b_voc + b_safety + b_env + b_active
+        if y == total_years - 1:
+            benefit_y += residual
+
+        net = benefit_y - cost_y
+        annual_costs.append(cost_y)
+        annual_benefits.append(benefit_y)
+        for k, v in zip(("tts", "reliability", "voc", "safety", "env", "active"),
+                        (b_tts, b_rel, b_voc, b_safety, b_env, b_active)):
+            benefits_by_type[k].append(v)
+        for vt in VTYPES:
+            benefits_by_type[f"tts_{vt}"].append(b_tts_by_vt[vt])
         annual_net.append(net)
-        disc_costs.append(cost * df)
-        disc_benefits.append(benefit * df)
-        disc_net.append(net * df)
-
-        pv_costs += cost * df
-        pv_benefits += benefit * df
-        cum += net * df
+        disc_costs.append(cost_y * df_factor)
+        disc_benefits.append(benefit_y * df_factor)
+        disc_net.append(net * df_factor)
+        pv_costs += cost_y * df_factor
+        pv_benefits += benefit_y * df_factor
+        cum += net * df_factor
         cum_disc_net.append(cum)
-
         if payback_year is None and cum >= 0 and y >= const_years:
             payback_year = y + 1
 
     npv = pv_benefits - pv_costs
-    bcr = pv_benefits / pv_costs if pv_costs > 0 else 0
-    fyrr = (total_first_year / total_capital) * 100 if total_capital > 0 else 0
+    bcr = pv_benefits / pv_costs if pv_costs > 0 else 0.0
+    first_op = const_years if const_years < total_years else 0
+    fyrr = (annual_benefits[first_op] / total_capital * 100) if total_capital > 0 else 0.0
 
-    # PV by benefit type
-    pv_by_type = {}
-    for t in benefits_by_type:
-        pv_by_type[t] = sum(benefits_by_type[t][y] * discount_factor(dr, y) for y in range(total_years))
+    pv_by_type = {
+        t: sum(benefits_by_type[t][y] * discount_factor(dr, base_offset + y) for y in range(total_years))
+        for t in benefits_by_type
+    }
 
-    # Sensitivity: discount rates
     sensitivity_dr = {}
     for r in [3, 4, 5, 7, 10, 12]:
-        s_pvb = sum(annual_benefits[y] * discount_factor(r, y) for y in range(total_years))
-        s_pvc = sum(annual_costs[y] * discount_factor(r, y) for y in range(total_years))
+        s_pvb = sum(annual_benefits[y] * discount_factor(r, base_offset + y) for y in range(total_years))
+        s_pvc = sum(annual_costs[y] * discount_factor(r, base_offset + y) for y in range(total_years))
         sensitivity_dr[r] = {
-            "pvb": s_pvb, "pvc": s_pvc, "npv": s_pvb - s_pvc,
-            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0,
+            "pvb": s_pvb, "pvc": s_pvc,
+            "npv": s_pvb - s_pvc,
+            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0.0,
         }
 
-    # Switching values
     switching = {}
     if pv_benefits > 0 and pv_costs > 0:
         switching["Total Benefits"] = -((pv_benefits - pv_costs) / pv_benefits) * 100
         switching["Total Costs"] = ((pv_benefits - pv_costs) / pv_costs) * 100
-        type_labels = {
-            "tts": "Travel Time Savings", "reliability": "Reliability",
-            "voc": "Vehicle Operating Costs", "safety": "Safety",
-            "env": "Environmental", "active": "Active Transport",
-        }
-        for t, label in type_labels.items():
-            if pv_by_type[t] > 0:
+        for t, label in TYPE_LABELS.items():
+            if pv_by_type.get(t, 0) > 0:
                 switching[label] = -((pv_benefits - pv_costs) / pv_by_type[t]) * 100
 
-    # Demand scenarios
     scenarios = {}
     for label, factor in [("Low (-20%)", 0.8), ("Central", 1.0), ("High (+20%)", 1.2)]:
-        s_pvb = sum(annual_benefits[y] * factor * discount_factor(dr, y) for y in range(total_years))
-        s_pvc = sum(annual_costs[y] * discount_factor(dr, y) for y in range(total_years))
+        s_pvb = sum(annual_benefits[y] * factor * discount_factor(dr, base_offset + y) for y in range(total_years))
+        s_pvc = sum(annual_costs[y] * discount_factor(dr, base_offset + y) for y in range(total_years))
         scenarios[label] = {
-            "pvb": s_pvb, "pvc": s_pvc, "npv": s_pvb - s_pvc,
-            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0,
+            "pvb": s_pvb, "pvc": s_pvc,
+            "npv": s_pvb - s_pvc,
+            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0.0,
         }
 
     return {
         "npv": npv, "bcr": bcr, "pv_benefits": pv_benefits, "pv_costs": pv_costs,
-        "fyrr": fyrr, "payback_year": payback_year,
-        "total_capital": total_capital,
+        "fyrr": fyrr, "payback_year": payback_year, "total_capital": total_capital,
         "annual_costs": annual_costs, "annual_benefits": annual_benefits,
         "annual_net": annual_net,
         "disc_costs": disc_costs, "disc_benefits": disc_benefits, "disc_net": disc_net,
@@ -300,12 +880,39 @@ def calculate(inputs: dict) -> dict:
         "total_years": total_years, "dr": dr,
         "benefits_by_type": benefits_by_type,
         "first_year": {
-            "tts": annual_tts, "reliability": annual_reliability,
-            "voc": annual_voc, "safety": annual_safety,
-            "env": annual_env, "active": annual_active,
-            "total": total_first_year,
-        },
+            t: benefits_by_type[t][first_op] for t in benefits_by_type
+        } | {"total": annual_benefits[first_op]},
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MULTI-CASE LOOP — Step 8
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_all_cases(
+    inputs: dict,
+    traffic_data: dict,
+    cost_data: dict,
+    annualisation: dict,
+    safety_vkt_data: dict = None,
+    params: dict = None,
+) -> dict:
+    """Run calculate_matrix for every active project case vs the base case."""
+    n = inputs.get("n_project_cases", 1)
+    results = {}
+    for i in range(1, n + 1):
+        case_key = f"project_{i}"
+        results[case_key] = calculate_matrix(
+            inputs=inputs,
+            base_traffic=traffic_data["base_case"],
+            proj_traffic=traffic_data[case_key],
+            cost=cost_data[case_key],
+            annualisation=annualisation,
+            safety_vkt_base=safety_vkt_data.get("base_case") if safety_vkt_data else None,
+            safety_vkt_proj=safety_vkt_data.get(case_key) if safety_vkt_data else None,
+            params=params,
+        )
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,6 +949,183 @@ def generate_csv(results: dict, project_name: str) -> str:
             f"{r['cum_disc_net'][y]:.3f}",
         ])
     return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARAMETER EDITOR HELPERS — Phase 0e
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _param_sync_num(param_key: str) -> None:
+    """on_change callback: push number_input value → canonical key + slider."""
+    val = float(st.session_state[f"{param_key}_num"])
+    st.session_state[param_key] = val
+    st.session_state[f"{param_key}_sl"] = val
+
+
+def _param_sync_sl(param_key: str) -> None:
+    """on_change callback: push slider value → canonical key + number_input."""
+    val = float(st.session_state[f"{param_key}_sl"])
+    st.session_state[param_key] = val
+    st.session_state[f"{param_key}_num"] = val
+
+
+def param_editor(label: str, key: str, default: float,
+                 min_val: float, max_val: float, step: float,
+                 unit: str, source: str = "") -> float:
+    """Render a synchronized number_input + slider for one economic parameter.
+
+    Writes the current value to ``st.session_state[key]``.  A delta badge is
+    shown when the value has been changed from its TfNSW default.
+
+    Returns the current (possibly overridden) value.
+    """
+    # Initialise canonical key and both widget keys from it
+    if key not in st.session_state:
+        st.session_state[key] = float(default)
+    current = float(st.session_state[key])
+    if f"{key}_num" not in st.session_state:
+        st.session_state[f"{key}_num"] = current
+    if f"{key}_sl" not in st.session_state:
+        st.session_state[f"{key}_sl"] = current
+
+    col_lbl, col_num, col_sl = st.columns([2, 1, 2])
+    with col_lbl:
+        st.write(f"**{label}** `{unit}`")
+        if source:
+            st.caption(source)
+        if current != default and default != 0:
+            pct = (current - default) / abs(default) * 100
+            arrow = "↑" if current > default else "↓"
+            st.caption(f"{arrow} {abs(pct):.0f}% from default")
+    with col_num:
+        st.number_input(
+            "", key=f"{key}_num",
+            min_value=float(min_val), max_value=float(max_val), step=float(step),
+            label_visibility="collapsed",
+            on_change=_param_sync_num, args=(key,),
+        )
+    with col_sl:
+        st.slider(
+            "", key=f"{key}_sl",
+            min_value=float(min_val), max_value=float(max_val), step=float(step),
+            label_visibility="collapsed",
+            on_change=_param_sync_sl, args=(key,),
+        )
+    return float(st.session_state[key])
+
+
+def build_effective_params() -> dict:
+    """Return a deep copy of PARAMS with any session_state overrides applied.
+
+    The Parameters tab writes overrides to session_state under ``param_*`` keys.
+    This function merges those back into the canonical PARAMS structure so that
+    ``calculate_matrix()`` uses user-edited values without mutating the global.
+    """
+    p = copy.deepcopy(PARAMS)
+    ss = st.session_state
+    for _ctx in ("urban", "rural"):
+        for _vt in ("Car", "LCV", "HCV", "Bus"):
+            _k = f"param_vtts_{_ctx}_{_vt}"
+            if _k in ss:
+                p["vtts"][_ctx][_vt] = float(ss[_k])
+    if "param_reliability_ratio" in ss:
+        p["reliability_ratio"] = float(ss["param_reliability_ratio"])
+    for _vt in VTYPES:
+        _k = f"param_safety_vkt_{_vt}"
+        if _k in ss:
+            p["safety_vkt"][_vt] = float(ss[_k])
+    for _ctx in ("urban", "rural"):
+        for _vt in ("car", "lgv", "rigid", "bus"):
+            _k = f"param_emission_{_ctx}_{_vt}"
+            if _k in ss:
+                p["emission_cost"][_ctx][_vt] = float(ss[_k])
+        for _vt in ("car", "lgv", "rigid", "artic"):
+            _k = f"param_air_{_ctx}_{_vt}"
+            if _k in ss:
+                p["air_pollution"][_ctx][_vt] = float(ss[_k])
+            _k = f"param_noise_{_ctx}_{_vt}"
+            if _k in ss:
+                p["noise"][_ctx][_vt] = float(ss[_k])
+    for _mode in ("walking", "cycling"):
+        _k = f"param_health_{_mode}"
+        if _k in ss:
+            p["health_benefits"][_mode] = float(ss[_k])
+    return p
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INCREMENTAL BENEFITS SUMMARY HELPER — Step 11
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_incremental_summary() -> None:
+    """Step 11: Render the Incremental Benefits Summary table.
+
+    Shows base-case and project-case absolute traffic values at a chosen
+    modelling year, plus colour-coded Δ columns (Project − Base).
+    Negative Δ = green (reduction = improvement for VHT/VKT).
+    Positive Δ = red (increase = disbenefit for the same metrics).
+    """
+    years = st.session_state.modelling_years
+    n = st.session_state.n_project_cases
+    td = st.session_state.traffic_data
+
+    if not years or not td:
+        return
+
+    st.markdown(
+        '<div class="section-header">Incremental Benefits Summary</div>',
+        unsafe_allow_html=True,
+    )
+
+    sel_year = st.selectbox(
+        "Display modelling year",
+        options=years,
+        key="incr_summary_year_sel",
+    )
+    y_idx = years.index(sel_year)
+
+    _TRAFFIC_ROWS = [
+        ("VHT (veh-hrs/peak period)", "vht"),
+        ("VKT (veh-km/peak period)", "vkt"),
+        ("Stops (stops/peak period)", "stops"),
+        ("Demand (person-trips/peak period)", "demand"),
+    ]
+    rows_data = {}
+
+    # Traffic rows: sum across vehicle types at selected modelling year
+    for label, metric in _TRAFFIC_ROWS:
+        base_val = sum(td["base_case"][vt][metric][y_idx] for vt in VTYPES)
+        row: dict = {"Base Case": base_val}
+        for i in range(1, n + 1):
+            proj_val = sum(td[f"project_{i}"][vt][metric][y_idx] for vt in VTYPES)
+            row[f"Project {i}"] = proj_val
+            row[f"Δ{i}"] = proj_val - base_val
+        rows_data[label] = row
+
+    df_inc = pd.DataFrame.from_dict(rows_data, orient="index")
+    delta_cols = [c for c in df_inc.columns if str(c).startswith("Δ")]
+
+    def _colour_delta(val):
+        if isinstance(val, (int, float)):
+            if val < 0:
+                return "background-color:rgba(25,135,84,0.12);color:#198754"
+            if val > 0:
+                return "background-color:rgba(220,53,69,0.12);color:#dc3545"
+        return ""
+
+    fmt: dict = {}
+    fmt.update({col: "{:+.0f}" for col in delta_cols})
+    fmt.update({col: "{:.0f}" for col in df_inc.columns if col not in delta_cols})
+
+    styled = df_inc.style.format(fmt)
+    for col in delta_cols:
+        styled = styled.applymap(_colour_delta, subset=[col])
+
+    st.dataframe(styled, use_container_width=True)
+    st.caption(
+        f"Values are totals across Car, LCV, HCV, Bus at modelling year {sel_year}. "
+        "Δ = Project − Base. Green (negative) = reduction = improvement."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,14 +1208,113 @@ st.markdown("""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SESSION STATE INITIALISATION — Step 2
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _init_session_state() -> None:
+    """Initialise session_state keys for the matrix input UI (run once per session)."""
+    if "modelling_years" not in st.session_state:
+        st.session_state["modelling_years"] = list(DEFAULT_MODELLING_YEARS)
+    if "n_project_cases" not in st.session_state:
+        st.session_state["n_project_cases"] = 1
+    _ANN_DEFAULT = {"factor": 6.29, "days": 336}
+    if "annualisation" not in st.session_state:
+        st.session_state["annualisation"] = {vt: dict(_ANN_DEFAULT) for vt in ("Car", "LCV", "HCV", "Bus")}
+    else:
+        # Migrate older flat structures
+        _ann = st.session_state["annualisation"]
+        _old_factor = _ann.pop("annualisation_factor", None)
+        _old_days = _ann.pop("days_per_year", 336)
+        for _vt in ("Car", "LCV", "HCV", "Bus"):
+            if not isinstance(_ann.get(_vt), dict):
+                _f = float(_ann[_vt]) if _vt in _ann else (_old_factor or 6.29)
+                _ann[_vt] = {"factor": _f, "days": int(_old_days)}
+    _years = st.session_state["modelling_years"]
+    _n = st.session_state["n_project_cases"]
+    _case_keys = ["base_case"] + [f"project_{i}" for i in range(1, _n + 1)]
+    # Safety $/VKT per case — initialise missing cases with PARAMS defaults
+    if "safety_vkt_data" not in st.session_state:
+        st.session_state["safety_vkt_data"] = {
+            ck: dict(PARAMS["safety_vkt"]) for ck in _case_keys
+        }
+    else:
+        _svd = st.session_state["safety_vkt_data"]
+        for ck in _case_keys:
+            if ck not in _svd:
+                _svd[ck] = dict(PARAMS["safety_vkt"])
+    # (Re-)initialise traffic / cost data when structure changes
+    td = st.session_state.get("traffic_data")
+    needs_reset = (
+        td is None
+        or td.get("base_case", {}).get("years") != _years
+        or f"project_{_n}" not in td
+    )
+    if needs_reset:
+        st.session_state["traffic_data"] = make_traffic_data(_years, _n)
+        st.session_state["cost_data"] = make_cost_data(_n)
+
+
+_init_session_state()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR — ALL INPUTS
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Transport CBA")
     st.caption("TfNSW Economic Parameter Values (Jan 2025) · June 2024 prices")
 
-    # --- Comparison mode toggle ---
-    comparison_mode = st.toggle("Compare Scenarios", value=False, key="comparison_mode")
+    # ── Matrix Input Configuration (Step 2) ──────────────────────────────────
+    st.markdown("### Modelling Configuration")
+
+    # Number of project cases
+    _n_input = st.number_input(
+        "Number of Project Cases", min_value=1, max_value=5,
+        value=st.session_state["n_project_cases"], step=1,
+        key="n_project_cases_widget",
+    )
+    if _n_input != st.session_state["n_project_cases"]:
+        st.session_state["n_project_cases"] = _n_input
+        _init_session_state()
+        st.rerun()
+
+    # Modelling years (comma-separated text input)
+    _years_raw = st.text_input(
+        "Modelling Years (comma-separated)",
+        value=", ".join(str(y) for y in st.session_state["modelling_years"]),
+        key="modelling_years_widget",
+        help="e.g. 2026, 2031, 2041, 2056",
+    )
+    try:
+        _parsed_years = [int(y.strip()) for y in _years_raw.split(",") if y.strip()]
+        if len(_parsed_years) >= 1 and _parsed_years != st.session_state["modelling_years"]:
+            st.session_state["modelling_years"] = _parsed_years
+            _init_session_state()
+            st.rerun()
+    except ValueError:
+        st.error("Invalid year format — enter integers separated by commas.")
+
+    # Annualisation parameters panel
+    with st.expander("Annualisation Parameters", expanded=False):
+        _ann = st.session_state["annualisation"]
+        st.caption("Annualisation factor × days converts modelled-period VHT/VKT to an annual total.")
+        _cols = st.columns(4)
+        for _vt, _col in zip(("Car", "LCV", "HCV", "Bus"), _cols):
+            _col.markdown(f"**{_vt}**")
+            _ann[_vt]["factor"] = _col.number_input(
+                "Factor", min_value=0.1, max_value=100.0,
+                value=float(_ann[_vt]["factor"]), step=0.01,
+                key=f"ann_factor_{_vt}",
+            )
+            _ann[_vt]["days"] = _col.number_input(
+                "Days/yr", min_value=1, max_value=365,
+                value=int(_ann[_vt]["days"]), step=1,
+                key=f"ann_days_{_vt}",
+            )
+            _col.caption(f"= **{_ann[_vt]['factor'] * _ann[_vt]['days']:.0f}**")
+        st.session_state["annualisation"] = _ann
+
+    st.divider()
 
     # --- Project Details ---
     st.markdown("### Project Details")
@@ -439,11 +1322,20 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30)
-        base_year = st.number_input("Base Year", 2020, 2040, 2026)
+        discount_base_year = st.number_input("Discount Base Year", 2020, 2060, 2026,
+            help="Calendar year used as Year 0 for discounting (PV anchor).")
+        construction_start_year = st.number_input("Construction Start Year", 2020, 2060, 2026,
+            help="Calendar year construction begins. Benefits start after the construction period.")
     with col2:
         const_years = st.number_input("Construction Period (years)", 1, 10, 3)
         discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 7.0, step=0.5)
     context = st.selectbox("Context", ["urban", "rural"], format_func=str.title)
+    zero_growth_after_last_year = st.checkbox(
+        "Zero growth after last modelling year",
+        value=False,
+        help="When checked, traffic volumes (and all benefits) are held flat at the last "
+             "modelling year's values rather than extrapolating the trend.",
+    )
 
     st.divider()
 
@@ -451,125 +1343,48 @@ with st.sidebar:
     st.markdown("### Capital Costs ($M, undiscounted)")
     col1, col2 = st.columns(2)
     with col1:
-        cap_planning = st.number_input("Planning & Design", 0.0, value=5.0, step=0.1)
-        cap_construction = st.number_input("Construction", 0.0, value=120.0, step=1.0)
+        cap_planning = st.number_input("Planning & Design ($M)", 0.0, value=5.0, step=0.1)
+        cap_construction = st.number_input("Construction ($M)", 0.0, value=120.0, step=1.0)
     with col2:
-        cap_land = st.number_input("Land Acquisition", 0.0, value=10.0, step=0.1)
+        cap_land = st.number_input("Land Acquisition ($M)", 0.0, value=10.0, step=0.1)
         contingency = st.number_input("Contingency (%)", 0.0, 100.0, 20.0, step=1.0)
 
     # --- Recurrent Costs ---
     st.markdown("### Recurrent Costs ($M/year)")
     col1, col2 = st.columns(2)
     with col1:
-        opex_maint = st.number_input("Maintenance", 0.0, value=1.5, step=0.1)
+        opex_maint = st.number_input("Maintenance ($M/yr)", 0.0, value=1.5, step=0.1)
     with col2:
-        opex_op = st.number_input("Operating", 0.0, value=0.8, step=0.1)
+        opex_op = st.number_input("Operating ($M/yr)", 0.0, value=0.8, step=0.1)
     residual = st.number_input("Residual Value ($M)", 0.0, value=15.0, step=0.1)
-
-    st.divider()
-
-    # --- Traffic & Demand ---
-    st.markdown("### Traffic & Demand")
-    aadt = st.number_input("Base AADT (vehicles/day)", 0, value=25000, step=100)
-    col1, col2 = st.columns(2)
-    with col1:
-        traffic_growth = st.number_input("Traffic Growth (%/yr)", 0.0, 10.0, 1.5, step=0.1)
-        avg_occupancy = st.number_input("Avg Occupancy", 1.0, 5.0, 1.4, step=0.1)
-        pct_commute = st.number_input("% Commute Trips", 0.0, 100.0, 35.0, step=1.0)
-        pct_heavy = st.number_input("% Heavy Vehicles", 0.0, 100.0, 8.0, step=0.5)
-    with col2:
-        trip_length = st.number_input("Avg Trip Length (km)", 0.1, value=12.0, step=0.1)
-        speed_base = st.number_input("Base Speed (km/h)", 5.0, 130.0, 45.0, step=1.0)
-        pct_business = st.number_input("% Business Trips", 0.0, 100.0, 15.0, step=1.0)
-        speed_project = st.number_input("Project Speed (km/h)", 5.0, 130.0, 65.0, step=1.0)
-
-    if pct_commute + pct_business > 100:
-        st.error("Commute + Business trips cannot exceed 100%")
-
-    st.divider()
-
-    # --- Safety ---
-    st.markdown("### Safety — Annual Crash Reductions")
-    col1, col2 = st.columns(2)
-    with col1:
-        crash_fatal = st.number_input("Fatal", 0.0, value=0.3, step=0.01)
-        crash_moderate = st.number_input("Moderate Injury", 0.0, value=3.0, step=0.1)
-        crash_pdo = st.number_input("Property Damage Only", 0.0, value=10.0, step=0.5)
-    with col2:
-        crash_serious = st.number_input("Serious Injury", 0.0, value=1.5, step=0.1)
-        crash_minor = st.number_input("Minor Injury", 0.0, value=5.0, step=0.1)
-
-    st.divider()
-
-    # --- Environmental ---
-    st.markdown("### Environmental Externalities")
-    co2_reduction = st.number_input("Annual CO₂ Reduction (tonnes)", 0.0, value=500.0, step=10.0)
-    col1, col2 = st.columns(2)
-    with col1:
-        air_pollution_reduction = st.number_input("Air Pollution ($000s/yr)", 0.0, value=85.0, step=1.0)
-    with col2:
-        noise_reduction = st.number_input("Noise Cost ($000s/yr)", 0.0, value=30.0, step=1.0)
-
-    # --- Active Transport ---
-    st.markdown("### Active Transport")
-    col1, col2 = st.columns(2)
-    with col1:
-        walk_km = st.number_input("Daily Walking (person-km)", 0.0, value=0.0, step=10.0)
-    with col2:
-        cycle_km = st.number_input("Daily Cycling (person-km)", 0.0, value=0.0, step=10.0)
-
-    # --- Scenario B overrides (only shown when comparison mode is on) ---
-    if comparison_mode:
-        st.divider()
-        st.markdown("### Scenario B — Overrides")
-        st.caption("Parameters not overridden use Scenario A values")
-        b_name = st.text_input("Project Name (B)", value=project_name + " — Alt", key="b_name")
-        b_col1, b_col2 = st.columns(2)
-        with b_col1:
-            b_cap_construction = st.number_input("Construction ($M)", 0.0, value=cap_construction, step=1.0, key="b_construction")
-            b_speed_project = st.number_input("Project Speed (km/h)", 5.0, 130.0, speed_project, step=1.0, key="b_speed_project")
-            b_traffic_growth = st.number_input("Traffic Growth (%/yr)", 0.0, 10.0, traffic_growth, step=0.1, key="b_growth")
-        with b_col2:
-            b_contingency = st.number_input("Contingency (%)", 0.0, 100.0, contingency, step=1.0, key="b_contingency")
-            b_aadt = st.number_input("Base AADT", 0, value=aadt, step=100, key="b_aadt")
-            b_discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, discount_rate, step=0.5, key="b_dr")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RUN CALCULATION
 # ─────────────────────────────────────────────────────────────────────────────
-inputs = {
-    "context": context, "evaluation_period": eval_period,
-    "construction_years": const_years, "discount_rate": discount_rate,
-    "aadt": aadt, "traffic_growth": traffic_growth, "trip_length": trip_length,
-    "occupancy": avg_occupancy, "pct_commute": pct_commute,
-    "pct_business": pct_business, "pct_heavy": pct_heavy,
-    "speed_base": speed_base, "speed_project": speed_project,
-    "cap_planning": cap_planning, "cap_land": cap_land,
-    "cap_construction": cap_construction, "contingency": contingency,
-    "opex_maint": opex_maint, "opex_op": opex_op, "residual": residual,
-    "crash_fatal": crash_fatal, "crash_serious": crash_serious,
-    "crash_moderate": crash_moderate, "crash_minor": crash_minor,
-    "crash_pdo": crash_pdo, "co2_reduction": co2_reduction,
-    "air_pollution_reduction": air_pollution_reduction,
-    "noise_reduction": noise_reduction, "walk_km": walk_km, "cycle_km": cycle_km,
+_matrix_inputs = {
+    "context": context,
+    "evaluation_period": eval_period,
+    "construction_years": const_years,
+    "discount_rate": discount_rate,
+    "discount_base_year": discount_base_year,
+    "construction_start_year": construction_start_year,
+    "zero_growth_after_last_year": zero_growth_after_last_year,
+    "n_project_cases": st.session_state.n_project_cases,
 }
-
-results = calculate(inputs)
-
-# Scenario B calculation (if comparison mode)
-results_b = None
-if comparison_mode:
-    inputs_b = inputs.copy()
-    inputs_b.update({
-        "cap_construction": b_cap_construction,
-        "contingency": b_contingency,
-        "speed_project": b_speed_project,
-        "aadt": b_aadt,
-        "traffic_growth": b_traffic_growth,
-        "discount_rate": b_discount_rate,
-    })
-    results_b = calculate(inputs_b)
+try:
+    matrix_results = calculate_all_cases(
+        inputs=_matrix_inputs,
+        traffic_data=st.session_state.traffic_data,
+        cost_data=st.session_state.cost_data,
+        annualisation=st.session_state.annualisation,
+        safety_vkt_data=st.session_state.safety_vkt_data,
+        params=build_effective_params(),
+    )
+except Exception as _calc_err:
+    matrix_results = {}
+    if st.session_state.get("debug_mode"):
+        st.error(f"Matrix calculation error: {_calc_err}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -589,92 +1404,214 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KPI METRICS
+# KPI METRICS — Step 10: multi-case aware
 # ─────────────────────────────────────────────────────────────────────────────
-if comparison_mode and results_b:
-    # Side-by-side KPIs for comparison mode
-    col_a, col_b, col_delta = st.columns(3)
-    with col_a:
-        st.markdown(f"**Scenario A: {project_name}**")
-        st.metric("NPV", format_m(results["npv"]),
-                  delta="Positive" if results["npv"] >= 0 else "Negative",
-                  delta_color="normal" if results["npv"] >= 0 else "inverse")
-        st.metric("BCR", f"{results['bcr']:.2f}",
-                  delta="Above 1.0" if results["bcr"] >= 1 else "Below 1.0",
-                  delta_color="normal" if results["bcr"] >= 1 else "inverse")
-        st.metric("PV Benefits", format_m(results["pv_benefits"]))
-        st.metric("PV Costs", format_m(results["pv_costs"]))
-        st.metric("FYRR", f"{results['fyrr']:.1f}%")
-        pb_a = f"{results['payback_year']} yrs" if results["payback_year"] else "N/A"
-        st.metric("Payback", pb_a)
-    with col_b:
-        st.markdown(f"**Scenario B: {b_name}**")
-        st.metric("NPV", format_m(results_b["npv"]),
-                  delta="Positive" if results_b["npv"] >= 0 else "Negative",
-                  delta_color="normal" if results_b["npv"] >= 0 else "inverse")
-        st.metric("BCR", f"{results_b['bcr']:.2f}",
-                  delta="Above 1.0" if results_b["bcr"] >= 1 else "Below 1.0",
-                  delta_color="normal" if results_b["bcr"] >= 1 else "inverse")
-        st.metric("PV Benefits", format_m(results_b["pv_benefits"]))
-        st.metric("PV Costs", format_m(results_b["pv_costs"]))
-        st.metric("FYRR", f"{results_b['fyrr']:.1f}%")
-        pb_b = f"{results_b['payback_year']} yrs" if results_b["payback_year"] else "N/A"
-        st.metric("Payback", pb_b)
-    with col_delta:
-        st.markdown("**Delta (B - A)**")
-        delta_npv = results_b["npv"] - results["npv"]
-        st.metric("NPV Delta", format_m(delta_npv),
-                  delta="Better" if delta_npv > 0 else "Worse",
-                  delta_color="normal" if delta_npv > 0 else "inverse")
-        delta_bcr = results_b["bcr"] - results["bcr"]
-        st.metric("BCR Delta", f"{delta_bcr:+.2f}",
-                  delta="Better" if delta_bcr > 0 else "Worse",
-                  delta_color="normal" if delta_bcr > 0 else "inverse")
-        delta_pvb = results_b["pv_benefits"] - results["pv_benefits"]
-        st.metric("PV Benefits Delta", format_m(delta_pvb))
-        delta_pvc = results_b["pv_costs"] - results["pv_costs"]
-        st.metric("PV Costs Delta", format_m(delta_pvc))
-        delta_fyrr = results_b["fyrr"] - results["fyrr"]
-        st.metric("FYRR Delta", f"{delta_fyrr:+.1f}%")
-else:
-    # Standard single-scenario KPIs
+_n_cases = st.session_state.n_project_cases
+
+if matrix_results and _n_cases > 1:
+    # Multi-case: one KPI column per project case
+    _case_cols = st.columns(min(_n_cases, 4))
+    for _i, _col in enumerate(_case_cols, 1):
+        _mr = matrix_results.get(f"project_{_i}", {})
+        _pb = f"{_mr['payback_year']} yrs" if _mr.get("payback_year") else "N/A"
+        with _col:
+            st.markdown(f"**Project {_i}**")
+            st.metric("NPV", format_m(_mr.get("npv", 0)),
+                      delta="Positive" if _mr.get("npv", 0) >= 0 else "Negative",
+                      delta_color="normal" if _mr.get("npv", 0) >= 0 else "inverse")
+            st.metric("BCR", f"{_mr.get('bcr', 0):.2f}",
+                      delta="≥ 1.0" if _mr.get("bcr", 0) >= 1 else "< 1.0",
+                      delta_color="normal" if _mr.get("bcr", 0) >= 1 else "inverse")
+            st.metric("PV Benefits", format_m(_mr.get("pv_benefits", 0)))
+            st.metric("PV Costs", format_m(_mr.get("pv_costs", 0)))
+            st.metric("FYRR", f"{_mr.get('fyrr', 0):.1f}%")
+            st.metric("Payback", _pb)
+elif matrix_results:
+    # Single project case
+    _r_kpi = matrix_results["project_1"]
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     with k1:
-        st.metric("Net Present Value", format_m(results["npv"]),
-                  delta="Positive" if results["npv"] >= 0 else "Negative",
-                  delta_color="normal" if results["npv"] >= 0 else "inverse")
+        st.metric("Net Present Value", format_m(_r_kpi["npv"]),
+                  delta="Positive" if _r_kpi["npv"] >= 0 else "Negative",
+                  delta_color="normal" if _r_kpi["npv"] >= 0 else "inverse")
     with k2:
-        st.metric("Benefit-Cost Ratio", f"{results['bcr']:.2f}",
-                  delta="Above 1.0" if results["bcr"] >= 1 else "Below 1.0",
-                  delta_color="normal" if results["bcr"] >= 1 else "inverse")
+        st.metric("Benefit-Cost Ratio", f"{_r_kpi['bcr']:.2f}",
+                  delta="Above 1.0" if _r_kpi["bcr"] >= 1 else "Below 1.0",
+                  delta_color="normal" if _r_kpi["bcr"] >= 1 else "inverse")
     with k3:
-        st.metric("PV Benefits", format_m(results["pv_benefits"]))
+        st.metric("PV Benefits", format_m(_r_kpi["pv_benefits"]))
     with k4:
-        st.metric("PV Costs", format_m(results["pv_costs"]))
+        st.metric("PV Costs", format_m(_r_kpi["pv_costs"]))
     with k5:
-        st.metric("First Year Rate of Return", f"{results['fyrr']:.1f}%")
+        st.metric("First Year Rate of Return", f"{_r_kpi['fyrr']:.1f}%")
     with k6:
-        pb = f"{results['payback_year']} years" if results["payback_year"] else "N/A"
+        pb = f"{_r_kpi['payback_year']} years" if _r_kpi["payback_year"] else "N/A"
         st.metric("Payback Period", pb)
+else:
+    st.info("Enter traffic data in the **Data Input** tab to see results.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXPORT BUTTON
 # ─────────────────────────────────────────────────────────────────────────────
-csv_data = generate_csv(results, project_name)
-st.download_button(
-    "Download CSV Export",
-    csv_data,
-    file_name="cba-results.csv",
-    mime="text/csv",
-    use_container_width=False,
-)
+_export_r = matrix_results.get("project_1", {})
+if _export_r:
+    csv_data = generate_csv(_export_r, project_name)
+    st.download_button(
+        "Download CSV Export",
+        csv_data,
+        file_name="cba-results.csv",
+        mime="text/csv",
+        use_container_width=False,
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TABBED LAYOUT
 # ─────────────────────────────────────────────────────────────────────────────
-tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
-    ["Dashboard", "Detailed Cashflow", "Sensitivity", "Parameters"]
+tab_datainput, tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
+    ["Data Input", "Dashboard", "Detailed Cashflow", "Sensitivity", "Parameters"]
 )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 0: DATA INPUT — Step 3 (traffic matrices) + Step 4 (costs)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_datainput:
+    st.markdown('<div class="section-header">Traffic & Project Data Entry</div>',
+                unsafe_allow_html=True)
+
+    _ann = st.session_state["annualisation"]
+    st.caption(
+        f"Modelling years: **{', '.join(str(y) for y in st.session_state['modelling_years'])}** · "
+        "  ·  ".join(
+            f"{vt}: {_ann[vt]['factor']:.2f} × {_ann[vt]['days']} = **{_ann[vt]['factor']*_ann[vt]['days']:.0f}**"
+            for vt in ("Car", "LCV", "HCV", "Bus")
+        )
+    )
+
+    # ── File Upload / Template Download (Step 6) ──────────────────────────
+    with st.expander("Import Data from File", expanded=False):
+        up_col, tmpl_col = st.columns([2, 1])
+        with up_col:
+            st.markdown("**Upload CSV or Excel**")
+            parse_mode = st.radio(
+                "Parse mode",
+                ["Template", "Smart parse", "User mapping"],
+                horizontal=True,
+                help=(
+                    "**Template**: upload a file generated by the Download button. "
+                    "**Smart parse**: auto-detect year columns and vehicle types. "
+                    "**User mapping**: manually map columns to fields."
+                ),
+            )
+            uploaded_file = st.file_uploader(
+                "Drop file here",
+                type=["csv", "xlsx"],
+                label_visibility="collapsed",
+            )
+            if uploaded_file is not None:
+                if parse_mode == "Template":
+                    _handle_template_upload(uploaded_file)
+                elif parse_mode == "Smart parse":
+                    _smart_parse_upload(uploaded_file)
+                else:
+                    _render_user_mapping_upload(uploaded_file)
+
+        with tmpl_col:
+            st.markdown("**Download blank template**")
+            tmpl_bytes = generate_template_excel()
+            if tmpl_bytes:
+                st.download_button(
+                    "Download Excel Template",
+                    tmpl_bytes,
+                    file_name="cba_data_template.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                # CSV fallback (VHT only) when openpyxl is absent
+                _yrs = st.session_state.modelling_years
+                _nc = st.session_state.n_project_cases
+                _case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, _nc + 1)]
+                csv_lines = ["Case,Vehicle Type," + ",".join(str(y) for y in _yrs)]
+                for cl in _case_labels:
+                    for vt in VTYPES:
+                        csv_lines.append(f"{cl},{vt}," + ",".join("0" for _ in _yrs))
+                st.download_button(
+                    "Download CSV Template (VHT)",
+                    "\n".join(csv_lines),
+                    file_name="cba_vht_template.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+                st.caption("Install openpyxl for the full Excel template.")
+
+    st.divider()
+
+    # ── Sub-tabs: one per traffic metric + Crashes + Costs ────────────────
+    sub_vht, sub_vkt, sub_stops, sub_demand, sub_safety, sub_costs = st.tabs(
+        ["VHT", "VKT", "Stops", "Demand", "Safety $/VKT", "Costs"]
+    )
+
+    # ── VHT sub-tab ───────────────────────────────────────────────────────
+    with sub_vht:
+        st.caption(
+            "Vehicle Hours Travelled per peak period (veh-hrs/peak period). "
+            "Used directly for Travel Time Savings calculation. "
+            "Speed = VKT / VHT (derived, not entered)."
+        )
+        render_traffic_matrix("vht", "veh-hrs / peak period")
+
+    # ── VKT sub-tab ───────────────────────────────────────────────────────
+    with sub_vkt:
+        st.caption(
+            "Vehicle Kilometres Travelled per peak period (veh-km/peak period). "
+            "Used for VOC, emissions, air pollution, and noise calculations. "
+            "Speed (km/h) = VKT ÷ VHT — shown as read-only in the VHT tab."
+        )
+        render_traffic_matrix("vkt", "veh-km / peak period")
+
+    # ── Stops sub-tab ─────────────────────────────────────────────────────
+    with sub_stops:
+        st.caption("Vehicle stops per peak period (stops/peak period). Captured for reference.")
+        render_traffic_matrix("stops", "stops / peak period")
+
+    # ── Demand sub-tab ────────────────────────────────────────────────────
+    with sub_demand:
+        st.caption(
+            "Person-trips per peak period (person-trips/peak period). "
+            "Captured for reference; TTS is driven by VHT, not demand."
+        )
+        render_traffic_matrix("demand", "person-trips / peak period")
+
+    # ── Safety $/VKT sub-tab ──────────────────────────────────────────────
+    with sub_safety:
+        st.caption(
+            "Safety cost rate ($/VKT) per vehicle type for each case. "
+            "Benefit = Base VKT × Base rate − Project VKT × Project rate."
+        )
+        _svd = st.session_state["safety_vkt_data"]
+        _sv_case_keys = ["base_case"] + [f"project_{i}" for i in range(1, st.session_state.n_project_cases + 1)]
+        _sv_case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, st.session_state.n_project_cases + 1)]
+        for _ck, _cl in zip(_sv_case_keys, _sv_case_labels):
+            with st.expander(_cl, expanded=True):
+                _cols = st.columns(4)
+                for _vt, _col in zip(VTYPES, _cols):
+                    _svd[_ck][_vt] = _col.number_input(
+                        _vt, min_value=0.0, max_value=10.0,
+                        value=float(_svd[_ck].get(_vt, PARAMS["safety_vkt"][_vt])),
+                        step=0.001, format="%.3f",
+                        key=f"sv_{_ck}_{_vt}",
+                    )
+        st.session_state["safety_vkt_data"] = _svd
+
+    # ── Costs sub-tab ─────────────────────────────────────────────────────
+    with sub_costs:
+        st.caption(
+            "Capital and recurrent costs per project case ($M, undiscounted). "
+            "Base Case has no project costs. Construction cost is spread evenly over "
+            "the construction period defined in Project Details (sidebar)."
+        )
+        render_cost_entry()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1: DASHBOARD — Charts
@@ -682,16 +1619,33 @@ tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
 with tab_dash:
     st.markdown('<div class="section-header">Analysis Charts</div>', unsafe_allow_html=True)
 
+    # ── Case selector (Step 10): pick which project case drives pie & waterfall ─
+    _n_dash = st.session_state.n_project_cases
+    _CASE_PALETTE = ["#0d6efd", "#fd7e14", "#198754", "#dc3545", "#6610f2"]
+
+    if not matrix_results:
+        st.info("Enter traffic data in the **Data Input** tab to see charts.")
+        st.stop()
+
+    if _n_dash > 1:
+        _dash_case = st.selectbox(
+            "Project case to display in charts",
+            options=[f"project_{i}" for i in range(1, _n_dash + 1)],
+            format_func=lambda k: f"Project {k.split('_')[1]}",
+            key="dash_case_sel",
+        )
+        _r = matrix_results[_dash_case]
+    else:
+        _r = matrix_results["project_1"]
+
     chart1, chart2 = st.columns(2)
 
     with chart1:
         st.subheader("Benefit Composition (PV $M)")
-        pv = results["pv_by_type"]
-        labels_list = []
-        values_list = []
-        colors_list = []
+        pv = _r["pv_by_type"]
+        labels_list, values_list, colors_list = [], [], []
         for t in ["tts", "reliability", "voc", "safety", "env", "active"]:
-            if pv[t] > 0:
+            if pv.get(t, 0) > 0:
                 labels_list.append(TYPE_LABELS[t])
                 values_list.append(round(pv[t], 2))
                 colors_list.append(COLORS[t])
@@ -712,8 +1666,8 @@ with tab_dash:
     with chart2:
         st.subheader("NPV Waterfall ($M)")
         wf_labels = list(TYPE_LABELS.values()) + ["Total Benefits", "Costs", "NPV"]
-        wf_values = [pv[t] for t in TYPE_LABELS] + [
-            results["pv_benefits"], -results["pv_costs"], results["npv"]
+        wf_values = [pv.get(t, 0) for t in TYPE_LABELS] + [
+            _r["pv_benefits"], -_r["pv_costs"], _r["npv"]
         ]
         wf_measures = ["relative"] * 6 + ["total", "relative", "total"]
         fig_wf = go.Figure(go.Waterfall(
@@ -732,27 +1686,40 @@ with tab_dash:
         )
         st.plotly_chart(fig_wf, use_container_width=True)
 
-    # --- Row 2: Cashflow & Cumulative ---
+    # ── Row 2: Cashflow & Cumulative ─────────────────────────────────────────
     chart3, chart4 = st.columns(2)
-    years = list(range(1, results["total_years"] + 1))
+    _years_dash = list(range(construction_start_year, construction_start_year + _r["total_years"]))
 
     with chart3:
-        st.subheader("Annual Cashflow ($M, undiscounted)")
+        st.subheader("Annual Net Cashflow ($M, undiscounted)")
         fig_cf = go.Figure()
-        fig_cf.add_trace(go.Bar(
-            x=years, y=[-c for c in results["annual_costs"]],
-            name="Costs", marker_color=COLORS["negative"], opacity=0.7,
-        ))
-        fig_cf.add_trace(go.Bar(
-            x=years, y=results["annual_benefits"],
-            name="Benefits", marker_color=COLORS["positive"], opacity=0.7,
-        ))
-        fig_cf.add_trace(go.Scatter(
-            x=years, y=results["annual_net"],
-            name="Net", mode="lines+markers",
-            line=dict(color=COLORS["neutral"], width=2),
-            marker=dict(size=4),
-        ))
+        if matrix_results and _n_dash > 1:
+            # Overlay net cashflow for every project case
+            for _i in range(1, _n_dash + 1):
+                _mr_i = matrix_results.get(f"project_{_i}", {})
+                if _mr_i:
+                    fig_cf.add_trace(go.Scatter(
+                        x=list(range(construction_start_year, construction_start_year + _mr_i["total_years"])),
+                        y=_mr_i["annual_net"],
+                        name=f"Project {_i} Net", mode="lines+markers",
+                        line=dict(color=_CASE_PALETTE[(_i - 1) % len(_CASE_PALETTE)], width=2),
+                        marker=dict(size=4),
+                    ))
+        else:
+            fig_cf.add_trace(go.Bar(
+                x=_years_dash, y=[-c for c in _r["annual_costs"]],
+                name="Costs", marker_color=COLORS["negative"], opacity=0.7,
+            ))
+            fig_cf.add_trace(go.Bar(
+                x=_years_dash, y=_r["annual_benefits"],
+                name="Benefits", marker_color=COLORS["positive"], opacity=0.7,
+            ))
+            fig_cf.add_trace(go.Scatter(
+                x=_years_dash, y=_r["annual_net"],
+                name="Net", mode="lines+markers",
+                line=dict(color=COLORS["neutral"], width=2),
+                marker=dict(size=4),
+            ))
         fig_cf.update_layout(
             barmode="relative", height=400,
             margin=dict(t=20, b=20, l=20, r=20),
@@ -765,29 +1732,40 @@ with tab_dash:
     with chart4:
         st.subheader("Cumulative Discounted Net Benefits ($M)")
         fig_cum = go.Figure()
-        fig_cum.add_trace(go.Scatter(
-            x=years, y=results["cum_disc_net"],
-            fill="tozeroy", mode="lines",
-            line=dict(color=COLORS["neutral"], width=2.5),
-            fillcolor="rgba(13, 110, 253, 0.15)",
-            name="Scenario A" if comparison_mode else "Cumulative NPV",
-        ))
-        # Overlay Scenario B if comparison mode
-        if comparison_mode and results_b:
-            years_b = list(range(1, results_b["total_years"] + 1))
+        if matrix_results and _n_dash > 1:
+            # Overlay cumulative NPV for every project case
+            for _i in range(1, _n_dash + 1):
+                _mr_i = matrix_results.get(f"project_{_i}", {})
+                if _mr_i:
+                    _col_i = _CASE_PALETTE[(_i - 1) % len(_CASE_PALETTE)]
+                    fig_cum.add_trace(go.Scatter(
+                        x=list(range(construction_start_year, construction_start_year + _mr_i["total_years"])),
+                        y=_mr_i["cum_disc_net"],
+                        mode="lines", name=f"Project {_i}",
+                        line=dict(color=_col_i, width=2),
+                    ))
+                    if _mr_i.get("payback_year"):
+                        fig_cum.add_vline(
+                            x=construction_start_year + _mr_i["payback_year"] - 1,
+                            line_dash="dot", line_color=_col_i, opacity=0.5,
+                        )
+        else:
             fig_cum.add_trace(go.Scatter(
-                x=years_b, y=results_b["cum_disc_net"],
-                mode="lines", name="Scenario B",
-                line=dict(color="#fd7e14", width=2.5, dash="dash"),
+                x=_years_dash, y=_r["cum_disc_net"],
+                fill="tozeroy", mode="lines",
+                line=dict(color=COLORS["neutral"], width=2.5),
+                fillcolor="rgba(13, 110, 253, 0.15)",
+                name="Cumulative NPV",
             ))
+            if _r.get("payback_year"):
+                _pb_cal = construction_start_year + _r["payback_year"] - 1
+                fig_cum.add_vline(
+                    x=_pb_cal, line_dash="dot",
+                    line_color=COLORS["positive"], opacity=0.7,
+                    annotation_text=f"Payback: {_pb_cal}",
+                    annotation_position="top right",
+                )
         fig_cum.add_hline(y=0, line_dash="dash", line_color="#6c757d", opacity=0.5)
-        if results["payback_year"]:
-            fig_cum.add_vline(
-                x=results["payback_year"], line_dash="dot",
-                line_color=COLORS["positive"], opacity=0.7,
-                annotation_text=f"Payback: Year {results['payback_year']}",
-                annotation_position="top right",
-            )
         fig_cum.update_layout(
             height=400, margin=dict(t=20, b=20, l=20, r=20),
             xaxis_title="Year", yaxis_title="$M",
@@ -796,35 +1774,70 @@ with tab_dash:
         )
         st.plotly_chart(fig_cum, use_container_width=True)
 
+    # ── Incremental Benefits Summary (Step 11) ───────────────────────────────
+    st.divider()
+    render_incremental_summary()
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 2: DETAILED CASHFLOW
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_cashflow:
     st.markdown('<div class="section-header">Year-by-Year Cashflow</div>', unsafe_allow_html=True)
 
+    if not matrix_results:
+        st.info("Enter traffic data in the **Data Input** tab to see cashflow.")
+        st.stop()
+
+    _cf_case_keys = list(matrix_results.keys())
+    if len(_cf_case_keys) > 1:
+        _cf_case_labels = {k: f"Project Case {k.split('_')[1]}" for k in _cf_case_keys}
+        _cf_sel = st.selectbox(
+            "Project Case",
+            options=_cf_case_keys,
+            format_func=lambda k: _cf_case_labels[k],
+            key="cf_case_sel",
+        )
+        _cf_filename_suffix = f"-{_cf_sel}"
+    else:
+        _cf_sel = _cf_case_keys[0]
+        _cf_filename_suffix = ""
+    _r_cf = matrix_results[_cf_sel]
+
     view_mode = st.radio("Values", ["Undiscounted", "Discounted"], horizontal=True, key="cf_view")
-    years_list = list(range(1, results["total_years"] + 1))
+    years_list = list(range(construction_start_year, construction_start_year + _r_cf["total_years"]))
+
+    tts_breakdown = st.toggle("Show TTS by vehicle type", value=False, key="cf_tts_breakdown")
 
     if view_mode == "Undiscounted":
+        _bbt = _r_cf["benefits_by_type"]
+        _tts_cols: dict = {}
+        if tts_breakdown:
+            _tts_cols = {
+                "TTS — Car ($M)": [round(v, 3) for v in _bbt.get("tts_Car", [0.0] * _r_cf["total_years"])],
+                "TTS — LCV ($M)": [round(v, 3) for v in _bbt.get("tts_LCV", [0.0] * _r_cf["total_years"])],
+                "TTS — HCV ($M)": [round(v, 3) for v in _bbt.get("tts_HCV", [0.0] * _r_cf["total_years"])],
+                "TTS — Bus ($M)": [round(v, 3) for v in _bbt.get("tts_Bus", [0.0] * _r_cf["total_years"])],
+            }
         df_cf = pd.DataFrame({
             "Year": years_list,
-            "Costs ($M)": [round(c, 3) for c in results["annual_costs"]],
-            "Benefits ($M)": [round(b, 3) for b in results["annual_benefits"]],
-            "TTS ($M)": [round(v, 3) for v in results["benefits_by_type"]["tts"]],
-            "Reliability ($M)": [round(v, 3) for v in results["benefits_by_type"]["reliability"]],
-            "VOC ($M)": [round(v, 3) for v in results["benefits_by_type"]["voc"]],
-            "Safety ($M)": [round(v, 3) for v in results["benefits_by_type"]["safety"]],
-            "Environmental ($M)": [round(v, 3) for v in results["benefits_by_type"]["env"]],
-            "Active Transport ($M)": [round(v, 3) for v in results["benefits_by_type"]["active"]],
-            "Net ($M)": [round(n, 3) for n in results["annual_net"]],
+            "Costs ($M)": [round(c, 3) for c in _r_cf["annual_costs"]],
+            "Benefits ($M)": [round(b, 3) for b in _r_cf["annual_benefits"]],
+            "TTS ($M)": [round(v, 3) for v in _bbt["tts"]],
+            **_tts_cols,
+            "Reliability ($M)": [round(v, 3) for v in _bbt["reliability"]],
+            "VOC ($M)": [round(v, 3) for v in _bbt["voc"]],
+            "Safety ($M)": [round(v, 3) for v in _bbt["safety"]],
+            "Environmental ($M)": [round(v, 3) for v in _bbt["env"]],
+            "Active Transport ($M)": [round(v, 3) for v in _bbt["active"]],
+            "Net ($M)": [round(n, 3) for n in _r_cf["annual_net"]],
         })
     else:
         df_cf = pd.DataFrame({
             "Year": years_list,
-            "Costs ($M)": [round(c, 3) for c in results["disc_costs"]],
-            "Benefits ($M)": [round(b, 3) for b in results["disc_benefits"]],
-            "Net ($M)": [round(n, 3) for n in results["disc_net"]],
-            "Cumulative Net ($M)": [round(c, 3) for c in results["cum_disc_net"]],
+            "Costs ($M)": [round(c, 3) for c in _r_cf["disc_costs"]],
+            "Benefits ($M)": [round(b, 3) for b in _r_cf["disc_benefits"]],
+            "Net ($M)": [round(n, 3) for n in _r_cf["disc_net"]],
+            "Cumulative Net ($M)": [round(c, 3) for c in _r_cf["cum_disc_net"]],
         })
 
     st.dataframe(df_cf, use_container_width=True, hide_index=True)
@@ -834,7 +1847,7 @@ with tab_cashflow:
     st.download_button(
         f"Download {view_mode} Cashflow CSV",
         cf_csv,
-        file_name=f"cashflow-{view_mode.lower()}.csv",
+        file_name=f"cashflow-{view_mode.lower()}{_cf_filename_suffix}.csv",
         mime="text/csv",
         key="dl_cashflow",
     )
@@ -846,12 +1859,29 @@ with tab_sensitivity:
     # --- Existing sensitivity charts ---
     st.markdown('<div class="section-header">Sensitivity Analysis</div>', unsafe_allow_html=True)
 
+    if not matrix_results:
+        st.info("Enter traffic data in the **Data Input** tab to see sensitivity analysis.")
+        st.stop()
+
+    _sens_case_keys = list(matrix_results.keys())
+    if len(_sens_case_keys) > 1:
+        _sens_case_labels = {k: f"Project Case {k.split('_')[1]}" for k in _sens_case_keys}
+        _sens_sel = st.selectbox(
+            "Project Case",
+            options=_sens_case_keys,
+            format_func=lambda k: _sens_case_labels[k],
+            key="sens_case_sel",
+        )
+    else:
+        _sens_sel = _sens_case_keys[0]
+    _r_sens = matrix_results[_sens_sel]
+
     sen1, sen2 = st.columns(2)
 
     with sen1:
         st.subheader("Discount Rate Sensitivity (BCR)")
-        dr_rates = sorted(results["sensitivity_dr"].keys())
-        dr_bcrs = [results["sensitivity_dr"][r]["bcr"] for r in dr_rates]
+        dr_rates = sorted(_r_sens["sensitivity_dr"].keys())
+        dr_bcrs = [_r_sens["sensitivity_dr"][r]["bcr"] for r in dr_rates]
         bar_colors = [COLORS["positive"] if b >= 1 else COLORS["negative"] for b in dr_bcrs]
         fig_dr = go.Figure(go.Bar(
             x=[f"{r}%" for r in dr_rates], y=dr_bcrs,
@@ -869,7 +1899,7 @@ with tab_sensitivity:
 
     with sen2:
         st.subheader("Switching Values (% change for BCR = 1.0)")
-        sw = results["switching"]
+        sw = _r_sens["switching"]
         if sw:
             sw_labels = list(sw.keys())
             sw_values = list(sw.values())
@@ -892,8 +1922,8 @@ with tab_sensitivity:
     # --- Scenario Analysis Table ---
     st.subheader("Scenario Analysis")
     rows = []
-    for r_val in sorted(results["sensitivity_dr"].keys()):
-        v = results["sensitivity_dr"][r_val]
+    for r_val in sorted(_r_sens["sensitivity_dr"].keys()):
+        v = _r_sens["sensitivity_dr"][r_val]
         rows.append({
             "Scenario": f"Discount Rate {r_val}%",
             "PV Benefits ($M)": round(v["pvb"], 1),
@@ -901,7 +1931,7 @@ with tab_sensitivity:
             "NPV ($M)": round(v["npv"], 1),
             "BCR": round(v["bcr"], 2),
         })
-    for label, v in results["scenarios"].items():
+    for label, v in _r_sens["scenarios"].items():
         rows.append({
             "Scenario": f"Demand {label}",
             "PV Benefits ($M)": round(v["pvb"], 1),
@@ -932,7 +1962,7 @@ with tab_sensitivity:
 
     # --- First-Year Benefit Breakdown ---
     st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
-    fy = results["first_year"]
+    fy = _r_sens["first_year"]
     fy_cols = st.columns(7)
     for i, (key, label) in enumerate(TYPE_LABELS.items()):
         with fy_cols[i]:
@@ -940,120 +1970,123 @@ with tab_sensitivity:
     with fy_cols[6]:
         st.metric("Total", f"${fy['total']:.2f}M")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # INTERACTIVE SENSITIVITY SLIDERS + TORNADO CHART
-    # ─────────────────────────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">Interactive Parameter Sensitivity</div>', unsafe_allow_html=True)
-    st.caption("Drag sliders to explore how each parameter affects the BCR. "
-               "The tornado chart shows the BCR range from varying each parameter independently.")
-
-    sens_params = {
-        "AADT": {"key": "aadt", "min_val": max(1000, int(aadt * 0.5)), "max_val": int(aadt * 1.5),
-                 "default": aadt, "step": 500},
-        "Traffic Growth (%/yr)": {"key": "traffic_growth", "min_val": 0.0, "max_val": 5.0,
-                                   "default": traffic_growth, "step": 0.1},
-        "Construction Cost ($M)": {"key": "cap_construction", "min_val": max(1.0, cap_construction * 0.5),
-                                    "max_val": cap_construction * 1.5, "default": cap_construction, "step": 1.0},
-        "Discount Rate (%)": {"key": "discount_rate", "min_val": 3.0, "max_val": 12.0,
-                               "default": discount_rate, "step": 0.5},
-        "Evaluation Period (yrs)": {"key": "evaluation_period", "min_val": 10, "max_val": 50,
-                                     "default": eval_period, "step": 1},
-    }
-
-    sl1, sl2 = st.columns(2)
-    slider_values = {}
-    for i, (label, cfg) in enumerate(sens_params.items()):
-        col = sl1 if i % 2 == 0 else sl2
-        with col:
-            slider_values[cfg["key"]] = st.slider(
-                label, min_value=cfg["min_val"], max_value=cfg["max_val"],
-                value=cfg["default"], step=cfg["step"],
-                key=f"sens_{cfg['key']}"
-            )
-
-    # Compute tornado data
-    baseline_bcr = results["bcr"]
-    tornado_data = []
-
-    for label, cfg in sens_params.items():
-        inputs_low = inputs.copy()
-        inputs_low[cfg["key"]] = cfg["min_val"]
-        bcr_low = calculate(inputs_low)["bcr"]
-
-        inputs_high = inputs.copy()
-        inputs_high[cfg["key"]] = cfg["max_val"]
-        bcr_high = calculate(inputs_high)["bcr"]
-
-        tornado_data.append({
-            "param": label,
-            "bcr_low": min(bcr_low, bcr_high),
-            "bcr_high": max(bcr_low, bcr_high),
-            "range": abs(bcr_high - bcr_low),
-        })
-
-    tornado_data.sort(key=lambda x: x["range"], reverse=True)
-
-    fig_tornado = go.Figure()
-    for item in tornado_data:
-        fig_tornado.add_trace(go.Bar(
-            y=[item["param"]],
-            x=[item["bcr_high"] - baseline_bcr],
-            base=[baseline_bcr],
-            orientation="h",
-            marker_color=COLORS["positive"],
-            showlegend=False,
-        ))
-        fig_tornado.add_trace(go.Bar(
-            y=[item["param"]],
-            x=[item["bcr_low"] - baseline_bcr],
-            base=[baseline_bcr],
-            orientation="h",
-            marker_color=COLORS["negative"],
-            showlegend=False,
-        ))
-
-    fig_tornado.add_vline(x=baseline_bcr, line_dash="dash", line_color="#6c757d",
-                          annotation_text=f"Baseline BCR: {baseline_bcr:.2f}")
-    fig_tornado.update_layout(
-        height=350, barmode="overlay",
-        xaxis_title="BCR", yaxis_title="",
-        margin=dict(t=30, b=30, l=150, r=30),
-        **PLOTLY_TRANSPARENT,
-    )
-    st.plotly_chart(fig_tornado, use_container_width=True)
-
-    # What-if calculation using all slider values simultaneously
-    inputs_whatif = inputs.copy()
-    for cfg in sens_params.values():
-        inputs_whatif[cfg["key"]] = slider_values[cfg["key"]]
-    results_whatif = calculate(inputs_whatif)
-
-    wi1, wi2, wi3 = st.columns(3)
-    with wi1:
-        st.metric("What-If BCR", f"{results_whatif['bcr']:.2f}",
-                  delta=f"{results_whatif['bcr'] - baseline_bcr:+.2f} vs baseline")
-    with wi2:
-        st.metric("What-If NPV", format_m(results_whatif["npv"]))
-    with wi3:
-        st.metric("What-If PV Benefits", format_m(results_whatif["pv_benefits"]))
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4: PARAMETERS REFERENCE
+# TAB 4: PARAMETERS (EDITABLE)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_params:
-    st.markdown('<div class="section-header">TfNSW Economic Parameter Values Reference</div>', unsafe_allow_html=True)
-    st.caption("Source: TfNSW Economic Parameter Values (January 2025), indexed to June 2024 prices.")
+    st.markdown('<div class="section-header">Economic Parameters</div>', unsafe_allow_html=True)
+    st.caption("Edit values below. Changes take effect immediately in all calculations. "
+               "Source: TfNSW Economic Parameter Values (January 2025), June 2024 prices.")
 
-    with st.expander("Value of Travel Time Savings ($/person-hour)"):
-        vtts_df = pd.DataFrame({
-            "Trip Purpose": ["Commute", "Business", "Other / Private"],
-            "Urban": [f"${PARAMS['vtts']['urban'][k]:.2f}" for k in ["commute", "business", "other"]],
-            "Rural": [f"${PARAMS['vtts']['rural'][k]:.2f}" for k in ["commute", "business", "other"]],
-        })
-        st.dataframe(vtts_df, hide_index=True, use_container_width=True)
+    if st.button("Reset All to Defaults", key="reset_params"):
+        for _k in list(st.session_state.keys()):
+            if _k.startswith("param_"):
+                del st.session_state[_k]
+        st.rerun()
 
-    with st.expander("Vehicle Operating Costs — Urban ($/vehicle-km)"):
-        speeds_urban = [40, 50, 60, 70, 80, 90, 100]
+    # ── Value of Travel Time Savings ─────────────────────────────────────────
+    with st.expander("Value of Travel Time Savings ($/person-hour)", expanded=True):
+        _src_vtts = "TfNSW EPV Jan 2025, Table 3"
+        st.caption("Applied per vehicle type: Car/Bus use commute rate; LCV/HCV use business rate.")
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _vt, _label in [("Car", "Car"), ("LCV", "Light Commercial (LCV)"),
+                                 ("HCV", "Heavy Commercial (HCV)"), ("Bus", "Bus")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_vtts_{_ctx}_{_vt}",
+                    default=PARAMS["vtts"][_ctx][_vt],
+                    min_val=0.0, max_val=10000.0, step=0.5,
+                    unit="$/person-hr", source=_src_vtts,
+                )
+
+    # ── Reliability Ratio ────────────────────────────────────────────────────
+    with st.expander("Reliability Ratio"):
+        param_editor(
+            label="Reliability Ratio (of VTTS)",
+            key="param_reliability_ratio",
+            default=PARAMS["reliability_ratio"],
+            min_val=0.0, max_val=2.0, step=0.05,
+            unit="ratio", source="TfNSW EPV Jan 2025, §4.3",
+        )
+
+    # ── Safety Cost ($/VKT) ───────────────────────────────────────────────────
+    with st.expander("Safety Cost ($/VKT by vehicle type)"):
+        st.caption("Safety benefit = (Base VKT − Project VKT) × rate × annualisation factor")
+        for _vt in VTYPES:
+            _default = PARAMS["safety_vkt"][_vt]
+            param_editor(
+                label=_vt,
+                key=f"param_safety_vkt_{_vt}",
+                default=_default,
+                min_val=0.0, max_val=5.0, step=0.001,
+                unit="$/VKT", source="Agency default",
+            )
+
+    # ── Emission Costs (CO₂) ─────────────────────────────────────────────────
+    with st.expander("Emission Costs — CO₂ ($/veh-km)"):
+        _src_emit = "TfNSW EPV Jan 2025, Table 14"
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _vt, _label in [("car", "Car"), ("lgv", "LGV"), ("rigid", "Rigid Truck"), ("bus", "Bus")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_emission_{_ctx}_{_vt}",
+                    default=PARAMS["emission_cost"][_ctx][_vt],
+                    min_val=0.0, max_val=1.0, step=0.001,
+                    unit="$/veh-km", source=_src_emit,
+                )
+
+    # ── Air Pollution ────────────────────────────────────────────────────────
+    with st.expander("Air Pollution Costs ($/veh-km)"):
+        _src_air = "TfNSW EPV Jan 2025, Table 15"
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _vt, _label in [("car", "Car"), ("lgv", "LGV"), ("rigid", "Rigid Truck"), ("artic", "Articulated Truck")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_air_{_ctx}_{_vt}",
+                    default=PARAMS["air_pollution"][_ctx][_vt],
+                    min_val=0.0, max_val=1.0, step=0.001,
+                    unit="$/veh-km", source=_src_air,
+                )
+
+    # ── Noise ────────────────────────────────────────────────────────────────
+    with st.expander("Noise Costs ($/veh-km)"):
+        _src_noise = "TfNSW EPV Jan 2025, Table 16"
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _vt, _label in [("car", "Car"), ("lgv", "LGV"), ("rigid", "Rigid Truck"), ("artic", "Articulated Truck")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_noise_{_ctx}_{_vt}",
+                    default=PARAMS["noise"][_ctx][_vt],
+                    min_val=0.0, max_val=1.0, step=0.001,
+                    unit="$/veh-km", source=_src_noise,
+                )
+
+    # ── Active Transport Health Benefits ─────────────────────────────────────
+    with st.expander("Active Transport Health Benefits ($/person-km)"):
+        _src_health = "TfNSW EPV Jan 2025, Table 18"
+        param_editor(
+            label="Walking",
+            key="param_health_walking",
+            default=PARAMS["health_benefits"]["walking"],
+            min_val=0.0, max_val=5.0, step=0.01,
+            unit="$/person-km", source=_src_health,
+        )
+        param_editor(
+            label="Cycling",
+            key="param_health_cycling",
+            default=PARAMS["health_benefits"]["cycling"],
+            min_val=0.0, max_val=5.0, step=0.01,
+            unit="$/person-km", source=_src_health,
+        )
+
+    # ── VOC Speed Tables (read-only reference) ───────────────────────────────
+    with st.expander("Vehicle Operating Costs — Urban ($/veh-km, read-only)"):
+        speeds_urban = sorted(set().union(*[PARAMS["voc"]["urban"][v].keys() for v in ("car", "lgv", "rigid", "artic")]))
         voc_rows = []
         for s in speeds_urban:
             voc_rows.append({
@@ -1065,8 +2098,8 @@ with tab_params:
             })
         st.dataframe(pd.DataFrame(voc_rows), hide_index=True, use_container_width=True)
 
-    with st.expander("Vehicle Operating Costs — Rural ($/vehicle-km)"):
-        speeds_rural = [60, 80, 100, 110]
+    with st.expander("Vehicle Operating Costs — Rural ($/veh-km, read-only)"):
+        speeds_rural = sorted(set().union(*[PARAMS["voc"]["rural"][v].keys() for v in ("car", "lgv", "rigid", "artic")]))
         voc_rows_r = []
         for s in speeds_rural:
             voc_rows_r.append({
@@ -1077,53 +2110,6 @@ with tab_params:
                 "Articulated Truck": PARAMS["voc"]["rural"]["artic"].get(s, "–"),
             })
         st.dataframe(pd.DataFrame(voc_rows_r), hide_index=True, use_container_width=True)
-
-    with st.expander("Crash Costs ($/crash)"):
-        crash_df = pd.DataFrame({
-            "Severity": ["Fatal", "Serious Injury", "Moderate Injury", "Minor Injury", "Property Damage Only"],
-            "Cost per Crash": [
-                f"${PARAMS['crash_costs']['fatal']:,.0f}",
-                f"${PARAMS['crash_costs']['serious']:,.0f}",
-                f"${PARAMS['crash_costs']['moderate']:,.0f}",
-                f"${PARAMS['crash_costs']['minor']:,.0f}",
-                f"${PARAMS['crash_costs']['pdo']:,.0f}",
-            ],
-        })
-        st.dataframe(crash_df, hide_index=True, use_container_width=True)
-
-    with st.expander("Environmental Externalities"):
-        env_df = pd.DataFrame([
-            {"Parameter": "CO₂ Social Cost ($/tonne)", "Urban": f"${PARAMS['carbon_per_tonne']}", "Rural": f"${PARAMS['carbon_per_tonne']}"},
-            {"Parameter": "Air Pollution — Car ($/veh-km)", "Urban": f"${PARAMS['air_pollution']['urban']['car']:.3f}", "Rural": f"${PARAMS['air_pollution']['rural']['car']:.3f}"},
-            {"Parameter": "Air Pollution — Rigid Truck ($/veh-km)", "Urban": f"${PARAMS['air_pollution']['urban']['rigid']:.3f}", "Rural": f"${PARAMS['air_pollution']['rural']['rigid']:.3f}"},
-            {"Parameter": "Noise — Car ($/veh-km)", "Urban": f"${PARAMS['noise']['urban']['car']:.3f}", "Rural": f"${PARAMS['noise']['rural']['car']:.3f}"},
-            {"Parameter": "Noise — Heavy Vehicle ($/veh-km)", "Urban": f"${PARAMS['noise']['urban']['rigid']:.3f}", "Rural": f"${PARAMS['noise']['rural']['rigid']:.3f}"},
-        ])
-        st.dataframe(env_df, hide_index=True, use_container_width=True)
-
-    with st.expander("Active Transport Health Benefits ($/person-km)"):
-        health_df = pd.DataFrame({
-            "Mode": ["Walking", "Cycling"],
-            "Health Benefit": [f"${PARAMS['health_benefits']['walking']:.2f}", f"${PARAMS['health_benefits']['cycling']:.2f}"],
-        })
-        st.dataframe(health_df, hide_index=True, use_container_width=True)
-
-    with st.expander("Other Key Parameters"):
-        other_df = pd.DataFrame({
-            "Parameter": ["Value of Statistical Life (VSL)", "Reliability Ratio", "Central Discount Rate",
-                           "Low Discount Rate (sensitivity)", "High Discount Rate (sensitivity)", "Working Days per Year"],
-            "Value": [f"${PARAMS['vsl']/1e6:.1f}M", f"{PARAMS['reliability_ratio']}", "7%", "4%", "10%",
-                      f"{PARAMS['working_days_per_year']}"],
-        })
-        st.dataframe(other_df, hide_index=True, use_container_width=True)
-
-    with st.expander("Default Traffic Composition (%)"):
-        comp_df = pd.DataFrame({
-            "Vehicle Type": ["Car", "Light Commercial", "Rigid Truck", "Articulated Truck"],
-            "Urban": [f"{PARAMS['traffic_composition']['urban'][k]*100:.0f}%" for k in ["car", "lgv", "rigid", "artic"]],
-            "Rural": [f"{PARAMS['traffic_composition']['rural'][k]*100:.0f}%" for k in ["car", "lgv", "rigid", "artic"]],
-        })
-        st.dataframe(comp_df, hide_index=True, use_container_width=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOOTER
