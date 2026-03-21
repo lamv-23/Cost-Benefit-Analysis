@@ -1386,26 +1386,6 @@ with st.sidebar:
              "modelling year's values rather than extrapolating the trend.",
     )
 
-    st.divider()
-
-    # --- Capital Costs ---
-    st.markdown("### Capital Costs ($M, undiscounted)")
-    col1, col2 = st.columns(2)
-    with col1:
-        cap_planning = st.number_input("Planning & Design ($M)", 0.0, value=5.0, step=0.1)
-        cap_construction = st.number_input("Construction ($M)", 0.0, value=120.0, step=1.0)
-    with col2:
-        cap_land = st.number_input("Land Acquisition ($M)", 0.0, value=10.0, step=0.1)
-        contingency = st.number_input("Contingency (%)", 0.0, 100.0, 20.0, step=1.0)
-
-    # --- Recurrent Costs ---
-    st.markdown("### Recurrent Costs ($M/year)")
-    col1, col2 = st.columns(2)
-    with col1:
-        opex_maint = st.number_input("Maintenance ($M/yr)", 0.0, value=1.5, step=0.1)
-    with col2:
-        opex_op = st.number_input("Operating ($M/yr)", 0.0, value=0.8, step=0.1)
-    residual = st.number_input("Residual Value ($M)", 0.0, value=15.0, step=0.1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1500,20 +1480,6 @@ else:
     st.info("Enter traffic data in the **Data Input** tab to see results.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXPORT BUTTON
-# ─────────────────────────────────────────────────────────────────────────────
-_export_r = matrix_results.get("project_1", {})
-if _export_r:
-    csv_data = generate_csv(_export_r, project_name)
-    st.download_button(
-        "Download CSV Export",
-        csv_data,
-        file_name="cba-results.csv",
-        mime="text/csv",
-        use_container_width=False,
-    )
-
-# ─────────────────────────────────────────────────────────────────────────────
 # TABBED LAYOUT
 # ─────────────────────────────────────────────────────────────────────────────
 tab_datainput, tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
@@ -1595,44 +1561,37 @@ with tab_datainput:
 
     st.divider()
 
-    # ── Sub-tabs: one per traffic metric + Crashes + Costs ────────────────
-    sub_vht, sub_vkt, sub_stops, sub_demand, sub_safety, sub_costs = st.tabs(
-        ["VHT", "VKT", "Stops", "Demand", "Safety $/VKT", "Costs"]
-    )
-
-    # ── VHT sub-tab ───────────────────────────────────────────────────────
-    with sub_vht:
+    # ── VHT ───────────────────────────────────────────────────────────────
+    with st.expander("VHT — Vehicle Hours Travelled (veh-hrs / peak period)", expanded=True):
         st.caption(
-            "Vehicle Hours Travelled per peak period (veh-hrs/peak period). "
             "Used directly for Travel Time Savings calculation. "
             "Speed = VKT / VHT (derived, not entered)."
         )
         render_traffic_matrix("vht", "veh-hrs / peak period")
 
-    # ── VKT sub-tab ───────────────────────────────────────────────────────
-    with sub_vkt:
+    # ── VKT ───────────────────────────────────────────────────────────────
+    with st.expander("VKT — Vehicle Kilometres Travelled (veh-km / peak period)", expanded=True):
         st.caption(
-            "Vehicle Kilometres Travelled per peak period (veh-km/peak period). "
             "Used for VOC, emissions, air pollution, and noise calculations. "
-            "Speed (km/h) = VKT ÷ VHT — shown as read-only in the VHT tab."
+            "Speed (km/h) = VKT ÷ VHT."
         )
         render_traffic_matrix("vkt", "veh-km / peak period")
 
-    # ── Stops sub-tab ─────────────────────────────────────────────────────
-    with sub_stops:
-        st.caption("Vehicle stops per peak period (stops/peak period). Captured for reference.")
+    # ── Stops ─────────────────────────────────────────────────────────────
+    with st.expander("Stops (stops / peak period)", expanded=False):
+        st.caption("Vehicle stops per peak period. Captured for reference.")
         render_traffic_matrix("stops", "stops / peak period")
 
-    # ── Demand sub-tab ────────────────────────────────────────────────────
-    with sub_demand:
+    # ── Demand ────────────────────────────────────────────────────────────
+    with st.expander("Demand (person-trips / peak period)", expanded=False):
         st.caption(
-            "Person-trips per peak period (person-trips/peak period). "
+            "Person-trips per peak period. "
             "Captured for reference; TTS is driven by VHT, not demand."
         )
         render_traffic_matrix("demand", "person-trips / peak period")
 
-    # ── Safety $/VKT sub-tab ──────────────────────────────────────────────
-    with sub_safety:
+    # ── Safety $/VKT ──────────────────────────────────────────────────────
+    with st.expander("Safety $/VKT — Cost rates per vehicle type", expanded=True):
         st.caption(
             "Safety cost rate ($/VKT) per vehicle type for each case. "
             "Benefit = Base VKT × Base rate − Project VKT × Project rate."
@@ -1652,12 +1611,11 @@ with tab_datainput:
                     )
         st.session_state["safety_vkt_data"] = _svd
 
-    # ── Costs sub-tab ─────────────────────────────────────────────────────
-    with sub_costs:
+    # ── Costs ─────────────────────────────────────────────────────────────
+    with st.expander("Costs — Capital & Recurrent ($M, undiscounted)", expanded=True):
         st.caption(
-            "Capital and recurrent costs per project case ($M, undiscounted). "
-            "Base Case has no project costs. Construction cost is spread evenly over "
-            "the construction period defined in Project Details (sidebar)."
+            "Per project case. Base Case has no project costs. Construction cost is spread "
+            "evenly over the construction period defined in Project Details (sidebar)."
         )
         render_cost_entry()
 
@@ -1893,13 +1851,27 @@ with tab_cashflow:
 
     # Download for this table
     cf_csv = df_cf.to_csv(index=False)
-    st.download_button(
-        f"Download {view_mode} Cashflow CSV",
-        cf_csv,
-        file_name=f"cashflow-{view_mode.lower()}{_cf_filename_suffix}.csv",
-        mime="text/csv",
-        key="dl_cashflow",
-    )
+    _dl_col1, _dl_col2 = st.columns([1, 1])
+    with _dl_col1:
+        st.download_button(
+            f"Download {view_mode} Cashflow CSV",
+            cf_csv,
+            file_name=f"cashflow-{view_mode.lower()}{_cf_filename_suffix}.csv",
+            mime="text/csv",
+            key="dl_cashflow",
+        )
+    with _dl_col2:
+        _full_export_r = matrix_results.get(_cf_sel, {})
+        if _full_export_r:
+            _full_csv = generate_csv(_full_export_r, project_name)
+            _case_label = f"project-{_cf_sel.split('_')[1]}" if "_" in _cf_sel else _cf_sel
+            st.download_button(
+                "Download Full Results CSV",
+                _full_csv,
+                file_name=f"cba-results-{_case_label}.csv",
+                mime="text/csv",
+                key="dl_full_results",
+            )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 3: SENSITIVITY
@@ -1960,7 +1932,7 @@ with tab_sensitivity:
             ))
             fig_sw.add_vline(x=0, line_color="#6c757d")
             fig_sw.update_layout(
-                height=380, margin=dict(t=20, b=20, l=60, r=60),
+                height=420, margin=dict(t=20, b=20, l=180, r=80),
                 xaxis_title="% Change Required", showlegend=False,
                 **PLOTLY_TRANSPARENT,
             )
