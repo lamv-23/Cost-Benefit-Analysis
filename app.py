@@ -5,6 +5,7 @@ All monetary values in June 2024 prices (AUD)
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
@@ -12,6 +13,8 @@ import math
 import io
 import csv
 import copy
+import re
+import os
 
 # Optional: Excel template generation (Step 6) — requires openpyxl
 try:
@@ -19,6 +22,10 @@ try:
     _EXCEL_AVAILABLE = True
 except ImportError:
     _EXCEL_AVAILABLE = False
+
+# Custom drag-and-drop column mapper component
+_COMPONENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "column_mapper_component")
+column_mapper = components.declare_component("column_mapper", path=_COMPONENT_DIR)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -99,6 +106,54 @@ VTYPES = ["Car", "LCV", "HCV", "Bus"]
 
 # Default modelling years
 DEFAULT_MODELLING_YEARS = [2026, 2031, 2041, 2056]
+
+# ── Auto-match helpers for drag-drop mapper ────────────────────────────────────
+_VTYPE_ALIASES = {
+    "Car": ["car", "cars", "private", "passenger", "light vehicle"],
+    "LCV": ["lcv", "lgv", "light commercial", "light goods", "lav", "van", "vans"],
+    "HCV": ["hcv", "hgv", "heavy", "truck", "trucks", "rigid", "articulated", "artic"],
+    "Bus": ["bus", "buses", "coach", "coaches", "transit"],
+}
+
+
+def _auto_match_vtypes(detected: list) -> dict:
+    """Return {detected_name: VTYPE} for values matching known aliases."""
+    result = {}
+    for name in detected:
+        norm = name.lower().strip()
+        for target, aliases in _VTYPE_ALIASES.items():
+            if any(a in norm for a in aliases):
+                result[name] = target
+                break
+    return result
+
+
+def _auto_match_years(detected: list) -> dict:
+    """Return {detected_col: year_int} for headers that contain a 4-digit year."""
+    result = {}
+    for name in detected:
+        m = re.search(r'\b(19|20)\d{2}\b', str(name))
+        if m:
+            result[name] = int(m.group())
+    return result
+
+
+def _auto_match_cases(detected: list, n: int) -> dict:
+    """Best-effort mapping of detected case strings to standard names."""
+    standard = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
+    result = {}
+    assigned = set()
+    for name in detected:
+        norm = name.lower().strip()
+        if any(k in norm for k in ("base", "do nothing", "reference", "without", "existing")):
+            result[name] = "Base Case"
+            assigned.add("Base Case")
+    # Assign remaining detected cases to remaining standard names in order
+    remaining_std = [s for s in standard if s not in assigned]
+    remaining_det = [d for d in detected if d not in result]
+    for det, std in zip(remaining_det, remaining_std):
+        result[det] = std
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA SCHEMA — Step 1: factory functions for matrix input structures
@@ -564,9 +619,10 @@ def _smart_parse_upload(uploaded_file) -> None:
 
 
 def _render_user_mapping_upload(uploaded_file) -> None:
-    """Render a column-mapping UI for arbitrary CSV/Excel files."""
+    """Drag-and-drop column/row/case mapping UI for arbitrary CSV/Excel files."""
     years = st.session_state.modelling_years
-    n = st.session_state.n_project_cases
+    n     = st.session_state.n_project_cases
+    std_cases = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
 
     try:
         if uploaded_file.name.endswith(".csv"):
@@ -575,90 +631,85 @@ def _render_user_mapping_upload(uploaded_file) -> None:
             xl = pd.ExcelFile(uploaded_file)
             sheet = st.selectbox("Sheet", xl.sheet_names, key="um_sheet")
             df = xl.parse(sheet)
-
-        df.columns = [str(c).strip() for c in df.columns]
-        all_cols = list(df.columns)
-        none_opt = "(none)"
-        col_opts = [none_opt] + all_cols
-
-        st.markdown("**Map columns to fields:**")
-        m1, m2 = st.columns(2)
-        with m1:
-            _case_default = next(
-                (i + 1 for i, c in enumerate(all_cols) if c.lower() in ("case", "scenario")), 0
-            )
-            case_col = st.selectbox("Case column", col_opts, index=_case_default, key="um_case_col")
-            _vt_default = next(
-                (i + 1 for i, c in enumerate(all_cols)
-                 if "vehicle" in c.lower() or "vtype" in c.lower()), 0
-            )
-            vt_col = st.selectbox("Vehicle Type column", col_opts, index=_vt_default, key="um_vt_col")
-
-        with m2:
-            metric = st.selectbox(
-                "Metric", ["vht", "vkt", "stops", "demand"], key="um_metric"
-            )
-            year_cols_detected = [
-                c for c in all_cols if c.isdigit() and 2020 <= int(c) <= 2100
-            ]
-            year_cols_sel = st.multiselect(
-                "Year columns", all_cols, default=year_cols_detected, key="um_year_cols"
-            )
-
-        # Case value → standard name mapping
-        if case_col and case_col != none_opt:
-            unique_cases = [str(v) for v in df[case_col].dropna().unique()[:6]]
-            standard_cases = ["Base Case"] + [f"Project {i}" for i in range(1, n + 1)]
-            st.markdown("**Map case values to standard names:**")
-            case_map: dict = {}
-            for uc in unique_cases:
-                case_map[uc] = st.selectbox(
-                    f'"{uc}"', standard_cases, key=f"um_casemap_{uc}"
-                )
-        else:
-            case_map = {}
-
-        if st.button("Apply Mapping", key="um_apply"):
-            if not year_cols_sel:
-                st.error("Select at least one year column.")
-                return
-
-            norm_rows = []
-            for _, row in df.iterrows():
-                raw_case = (
-                    str(row[case_col]).strip() if case_col and case_col != none_opt else "Base Case"
-                )
-                norm_case = case_map.get(raw_case, raw_case)
-
-                raw_vt = (
-                    str(row[vt_col]).strip() if vt_col and vt_col != none_opt else "Car"
-                )
-                vt_match = next(
-                    (vt for vt in VTYPES
-                     if raw_vt.lower() in (vt.lower(), vt[:3].lower())),
-                    None,
-                )
-                if vt_match is None:
-                    continue
-                norm_row = {"Case": norm_case, "Vehicle Type": vt_match}
-                for yc in year_cols_sel:
-                    norm_row[str(yc)] = row.get(yc, 0.0)
-                norm_rows.append(norm_row)
-
-            if not norm_rows:
-                st.warning(
-                    "No rows matched after mapping. Check column selections and "
-                    "case/vehicle type values."
-                )
-                return
-
-            norm_df = pd.DataFrame(norm_rows)
-            _apply_template_df(norm_df, metric, years, n)
-            st.success(f"Applied mapping: {len(norm_rows)} rows → {metric.upper()}")
-            st.rerun()
-
     except Exception as e:
-        st.error(f"User mapping failed: {e}")
+        st.error(f"Could not read file: {e}")
+        return
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # Detect structural columns (Case, Vehicle Type) and the remaining year columns
+    case_col = next((c for c in df.columns if c.lower() in ("case", "scenario", "project")), None)
+    vt_col   = next((c for c in df.columns
+                     if "vehicle" in c.lower() or "vtype" in c.lower()), None)
+    year_cols = [c for c in df.columns if c not in filter(None, [case_col, vt_col])]
+
+    detected_cases  = ([str(v).strip() for v in df[case_col].dropna().unique()[:8]]
+                       if case_col else [])
+    detected_vtypes = ([str(v).strip() for v in df[vt_col].dropna().unique()]
+                       if vt_col else [])
+
+    metric = st.selectbox("Metric in this file / sheet",
+                          ["vht", "vkt", "stops", "demand"], key="um_metric")
+
+    st.caption(
+        "Drag vehicle type chips onto the matching drop zones. "
+        "Year columns are auto-filled — correct them if needed. "
+        "Then click **Confirm Mapping**."
+    )
+
+    mapping = column_mapper(
+        detected_rows=detected_vtypes,
+        detected_cols=year_cols,
+        detected_cases=detected_cases,
+        auto_row_mapping=_auto_match_vtypes(detected_vtypes),
+        auto_col_mapping=_auto_match_years(year_cols),
+        auto_case_mapping=_auto_match_cases(detected_cases, n),
+        target_rows=[{"key": vt, "label": vt} for vt in VTYPES],
+        target_cases=std_cases,
+        key=f"um_mapper_{uploaded_file.name}_{metric}",
+        height=480,
+        default=None,
+    )
+
+    if mapping:
+        row_map  = mapping.get("row_mapping", {})   # {detected_vt: "Car"/"LCV"/...}
+        col_map  = mapping.get("col_mapping", {})   # {detected_col: year_int}
+        case_map = mapping.get("case_mapping", {})  # {detected_case: "Base Case"/...}
+
+        ordered_cols = sorted(col_map, key=lambda c: col_map[c])
+
+        norm_rows = []
+        for _, row in df.iterrows():
+            raw_case = (str(row[case_col]).strip()
+                        if case_col else (next(iter(case_map), "Base Case")))
+            norm_case = case_map.get(raw_case, "Base Case") if case_map else "Base Case"
+
+            raw_vt   = str(row[vt_col]).strip() if vt_col else ""
+            norm_vt  = row_map.get(raw_vt)
+            if norm_vt is None:
+                continue
+
+            norm_row = {"Case": norm_case, "Vehicle Type": norm_vt}
+            for col in ordered_cols:
+                try:
+                    norm_row[str(col_map[col])] = float(row.get(col, 0.0) or 0.0)
+                except (ValueError, TypeError):
+                    norm_row[str(col_map[col])] = 0.0
+            norm_rows.append(norm_row)
+
+        if not norm_rows:
+            st.warning("No rows matched after mapping. Check column selections and values.")
+            return
+
+        # Merge any new mapped years into the modelling_years list
+        mapped_year_ints = sorted({col_map[c] for c in ordered_cols})
+        merged_years = sorted(set(years) | set(mapped_year_ints))
+
+        _apply_template_df(pd.DataFrame(norm_rows), metric, merged_years, n)
+        if merged_years != list(years):
+            st.session_state.modelling_years = merged_years
+        st.success(f"Mapped {len(norm_rows)} rows → {metric.upper()}")
+        st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
