@@ -937,7 +937,9 @@ def calculate_matrix(
     }
 
     sensitivity_dr = {}
-    for r in [3, 4, 5, 7, 10, 12]:
+    # ATAP T2 (2022) mandated sensitivity rates: 4% (low), 7% (base), 10% (high).
+    # 3.5% added per NSW Treasury long-run real risk-free rate reference.
+    for r in [3.5, 4, 7, 10]:
         s_pvb = sum(annual_benefits[y] * discount_factor(r, base_offset + y) for y in range(total_years))
         s_pvc = sum(annual_costs[y] * discount_factor(r, base_offset + y) for y in range(total_years))
         sensitivity_dr[r] = {
@@ -954,6 +956,33 @@ def calculate_matrix(
             if pv_by_type.get(t, 0) > 0:
                 switching[label] = -((pv_benefits - pv_costs) / pv_by_type[t]) * 100
 
+    # IRR — Internal Rate of Return (ATAP T2 §5.3).
+    # Find the real discount rate (%) at which NPV = 0 via bisection.
+    # Uses the same start-of-year, base_offset convention as the main calculation.
+    def _npv_at_rate(r_pct: float) -> float:
+        return sum(
+            (annual_benefits[y] - annual_costs[y]) * discount_factor(r_pct, base_offset + y)
+            for y in range(total_years)
+        )
+
+    irr: float | None = None
+    if _npv_at_rate(0.0) > 0:
+        _lo, _hi = 0.0, 200.0
+        if _npv_at_rate(_hi) < 0:
+            for _ in range(60):
+                _mid = (_lo + _hi) / 2.0
+                if _npv_at_rate(_mid) > 0:
+                    _lo = _mid
+                else:
+                    _hi = _mid
+                if _hi - _lo < 1e-6:
+                    break
+            irr = round((_lo + _hi) / 2.0, 2)
+
+    # FYRR deferral test (ATAP T2): proceed if FYRR >= discount rate; otherwise
+    # consider deferral to improve timing efficiency of capital deployment.
+    fyrr_deferral_pass = (fyrr >= dr) if total_capital > 0 else None
+
     scenarios = {}
     for label, factor in [("Low (-20%)", 0.8), ("Central", 1.0), ("High (+20%)", 1.2)]:
         s_pvb = sum(annual_benefits[y] * factor * discount_factor(dr, base_offset + y) for y in range(total_years))
@@ -966,7 +995,9 @@ def calculate_matrix(
 
     return {
         "npv": npv, "bcr": bcr, "pv_benefits": pv_benefits, "pv_costs": pv_costs,
-        "fyrr": fyrr, "payback_year": payback_year, "total_capital": total_capital,
+        "fyrr": fyrr, "fyrr_deferral_pass": fyrr_deferral_pass,
+        "irr": irr,
+        "payback_year": payback_year, "total_capital": total_capital,
         "annual_costs": annual_costs, "annual_benefits": annual_benefits,
         "annual_net": annual_net,
         "disc_costs": disc_costs, "disc_benefits": disc_benefits, "disc_net": disc_net,
@@ -1510,6 +1541,9 @@ if matrix_results and _n_cases > 1:
     for _i, _col in enumerate(_case_cols, 1):
         _mr = matrix_results.get(f"project_{_i}", {})
         _pb = f"{_mr['payback_year']} yrs" if _mr.get("payback_year") else "N/A"
+        _irr_str = f"{_mr['irr']:.1f}%" if _mr.get("irr") is not None else "N/A"
+        _deferral = _mr.get("fyrr_deferral_pass")
+        _deferral_delta = ("Proceed" if _deferral else "Consider deferral") if _deferral is not None else ""
         with _col:
             st.markdown(f"**Project {_i}**")
             st.metric("NPV", format_m(_mr.get("npv", 0)),
@@ -1518,14 +1552,19 @@ if matrix_results and _n_cases > 1:
             st.metric("BCR", f"{_mr.get('bcr', 0):.2f}",
                       delta="≥ 1.0" if _mr.get("bcr", 0) >= 1 else "< 1.0",
                       delta_color="normal" if _mr.get("bcr", 0) >= 1 else "inverse")
-            st.metric("PV Benefits", format_m(_mr.get("pv_benefits", 0)))
-            st.metric("PV Costs", format_m(_mr.get("pv_costs", 0)))
-            st.metric("FYRR", f"{_mr.get('fyrr', 0):.1f}%")
+            st.metric("IRR", _irr_str)
+            st.metric("FYRR", f"{_mr.get('fyrr', 0):.1f}%",
+                      delta=_deferral_delta,
+                      delta_color="normal" if _deferral else "inverse")
             st.metric("Payback", _pb)
 elif matrix_results:
     # Single project case
     _r_kpi = matrix_results["project_1"]
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    _irr_val = _r_kpi.get("irr")
+    _irr_str = f"{_irr_val:.1f}%" if _irr_val is not None else "N/A"
+    _deferral = _r_kpi.get("fyrr_deferral_pass")
+    _deferral_delta = ("Proceed" if _deferral else "Consider deferral") if _deferral is not None else ""
+    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
     with k1:
         st.metric("Net Present Value", format_m(_r_kpi["npv"]),
                   delta="Positive" if _r_kpi["npv"] >= 0 else "Negative",
@@ -1539,8 +1578,14 @@ elif matrix_results:
     with k4:
         st.metric("PV Costs", format_m(_r_kpi["pv_costs"]))
     with k5:
-        st.metric("First Year Rate of Return", f"{_r_kpi['fyrr']:.1f}%")
+        # IRR: ATAP T2 §5.3
+        st.metric("Internal Rate of Return", _irr_str)
     with k6:
+        # FYRR deferral test: ATAP T2 — proceed if FYRR ≥ discount rate
+        st.metric("First Year Rate of Return", f"{_r_kpi['fyrr']:.1f}%",
+                  delta=_deferral_delta,
+                  delta_color="normal" if _deferral else "inverse")
+    with k7:
         pb = f"{_r_kpi['payback_year']} years" if _r_kpi["payback_year"] else "N/A"
         st.metric("Payback Period", pb)
 else:
@@ -2009,11 +2054,14 @@ with tab_sensitivity:
 
     # --- Scenario Analysis Table ---
     st.subheader("Scenario Analysis")
+    # ATAP T2 (2022) mandated sensitivity rates
+    _atap_rates = {4, 7, 10}
     rows = []
     for r_val in sorted(_r_sens["sensitivity_dr"].keys()):
         v = _r_sens["sensitivity_dr"][r_val]
+        _atap_tag = " ✦" if r_val in _atap_rates else ""
         rows.append({
-            "Scenario": f"Discount Rate {r_val}%",
+            "Scenario": f"Discount Rate {r_val}%{_atap_tag}",
             "PV Benefits ($M)": round(v["pvb"], 1),
             "PV Costs ($M)": round(v["pvc"], 1),
             "NPV ($M)": round(v["npv"], 1),
@@ -2031,7 +2079,10 @@ with tab_sensitivity:
 
     def highlight_rows(row):
         styles = [""] * len(row)
-        if f"Discount Rate {int(discount_rate)}%" in row["Scenario"] or row["Scenario"] == "Demand Central":
+        _is_base = (f"Discount Rate {discount_rate}%" in row["Scenario"]
+                    or f"Discount Rate {int(discount_rate)}%" in row["Scenario"]
+                    or row["Scenario"] == "Demand Central")
+        if _is_base:
             styles = ["background-color: rgba(13, 110, 253, 0.1); font-weight: 700"] * len(row)
         bcr_idx = df_sens.columns.get_loc("BCR")
         if row["BCR"] >= 1:
@@ -2047,6 +2098,9 @@ with tab_sensitivity:
         "BCR": "{:.2f}",
     })
     st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.caption("✦ ATAP T2 (2022) mandated sensitivity rates: 4% (low), 7% (base), 10% (high). "
+               "3.5% = NSW Treasury long-run real risk-free reference rate. "
+               "Highlighted row = project base case discount rate.")
 
     # --- First-Year Benefit Breakdown ---
     st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
