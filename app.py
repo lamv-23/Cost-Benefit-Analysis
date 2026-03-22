@@ -601,8 +601,11 @@ def _smart_parse_upload(uploaded_file) -> None:
         for sheet_name, df in dfs.items():
             df.columns = [str(c).strip() for c in df.columns]
 
-            # Detect year columns: 4-digit integers 2020-2100
-            year_cols = [c for c in df.columns if c.isdigit() and 2020 <= int(c) <= 2100]
+            # Detect year columns: 4-digit integers in range 1990-2200, sorted ascending
+            year_cols = sorted(
+                [c for c in df.columns if c.isdigit() and 1990 <= int(c) <= 2200],
+                key=int,
+            )
             if not year_cols:
                 continue
 
@@ -921,7 +924,12 @@ def calculate_matrix(
     npv = pv_benefits - pv_costs
     bcr = pv_benefits / pv_costs if pv_costs > 0 else 0.0
     first_op = const_years if const_years < total_years else 0
-    fyrr = (annual_benefits[first_op] / total_capital * 100) if total_capital > 0 else 0.0
+    # FYRR (First Year Rate of Return): net benefit in first operational year
+    # expressed as a percentage of total undiscounted capital cost.
+    # Net benefit = gross benefits minus opex; excludes construction-period costs.
+    # Source: Austroads AGPE Part 4, §5.3; TfNSW CBA framework.
+    _first_op_net = annual_benefits[first_op] - annual_costs[first_op]
+    fyrr = (_first_op_net / total_capital * 100) if total_capital > 0 else 0.0
 
     pv_by_type = {
         t: sum(benefits_by_type[t][y] * discount_factor(dr, base_offset + y) for y in range(total_years))
@@ -1379,7 +1387,23 @@ with st.sidebar:
     )
     try:
         _parsed_years = [int(y.strip()) for y in _years_raw.split(",") if y.strip()]
-        if len(_parsed_years) >= 1 and _parsed_years != st.session_state["modelling_years"]:
+        _year_errors = []
+        if len(_parsed_years) < 2:
+            _year_errors.append("At least 2 modelling years are required for CAGR interpolation.")
+        else:
+            _out_of_range = [y for y in _parsed_years if not (1990 <= y <= 2200)]
+            if _out_of_range:
+                _year_errors.append(f"Year(s) out of valid range (1990–2200): {_out_of_range}")
+            _deduped = sorted(set(_parsed_years))
+            if len(_deduped) < len(_parsed_years):
+                _year_errors.append("Duplicate years will be removed.")
+                _parsed_years = _deduped
+            else:
+                _parsed_years = sorted(_parsed_years)
+        if _year_errors:
+            for _msg in _year_errors:
+                st.warning(_msg)
+        if not _year_errors and _parsed_years != st.session_state["modelling_years"]:
             st.session_state["modelling_years"] = _parsed_years
             _init_session_state()
             st.rerun()
