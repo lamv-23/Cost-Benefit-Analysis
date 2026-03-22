@@ -48,6 +48,16 @@ PARAMS = {
         "urban": {"Car": 19.76, "LCV": 54.87, "HCV": 54.87, "Bus": 19.76},
         "rural": {"Car": 17.78, "LCV": 49.38, "HCV": 49.38, "Bus": 17.78},
     },
+    # Vehicle occupancy (persons/vehicle). Multiplied by VHT saving to convert
+    # vehicle-hours to person-hours before applying the per-person VTTS.
+    # Car/Bus urban: 2014/15 HTS (Sydney), rural: ATAP 2016 PV2 pp. 16-19.
+    # LCV: commercial driver (occasionally one passenger); HCV: driver only.
+    # Bus: typical all-day average load (urban route / rural coach).
+    # Source: TfNSW EPV Jan 2025, Tables 2.4 & 2.5; ATAP 2016 PV2
+    "occupancy": {
+        "urban": {"Car": 1.14, "LCV": 1.1, "HCV": 1.0, "Bus": 13.0},
+        "rural": {"Car": 1.58, "LCV": 1.1, "HCV": 1.0, "Bus": 10.0},
+    },
     "voc": {
         "urban": {
             "car":   {40: 0.268, 50: 0.241, 60: 0.224, 70: 0.215, 80: 0.212, 90: 0.215, 100: 0.224},
@@ -69,6 +79,13 @@ PARAMS = {
         "Bus": 0.167,
     },
     "vsl": 8_100_000,
+    # Carbon shadow price used as the basis for emission_cost values below.
+    # Source: TfNSW EPV Jan 2025 (June 2024 prices): $123/tCO₂e.
+    # NOTE: NSW Treasury TPG24-34 mandates the NSW government carbon value;
+    # as of June 2025 this was $135.74/tCO₂e. Verify against the EPV Excel
+    # tool and update emission_cost proportionally if a newer EPV is adopted.
+    # ATAP PV5 (2024) uses a separate target-consistent schedule (starts at
+    # $56/tCO₂e in 2024 rising to $377 by 2050) — not applicable here.
     "carbon_per_tonne": 123,
     "air_pollution": {
         "urban": {"car": 0.032, "lgv": 0.045, "rigid": 0.179, "artic": 0.228},
@@ -768,6 +785,8 @@ def calculate_matrix(
 
     # VTTS by vehicle type ($/person-hr)
     vtts_by_vtype = _p["vtts"][ctx]
+    # Occupancy (persons/vehicle): converts VHT savings (veh-hrs) → person-hours
+    occupancy_by_vtype = _p["occupancy"][ctx]
 
     # Capital and recurrent costs
     raw_cap = cost["cap_planning"] + cost["cap_land"] + cost["cap_construction"]
@@ -821,7 +840,7 @@ def calculate_matrix(
                     modelling_years, proj_traffic[vt]["vht"], ey
                 )
                 annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factors[vt]
-                vt_tts = annual_vht_saving * vtts_by_vtype[vt] / 1e6
+                vt_tts = annual_vht_saving * occupancy_by_vtype[vt] * vtts_by_vtype[vt] / 1e6
                 b_tts_by_vt[vt] = vt_tts
                 b_tts += vt_tts
 
@@ -1098,6 +1117,9 @@ def build_effective_params() -> dict:
             _k = f"param_vtts_{_ctx}_{_vt}"
             if _k in ss:
                 p["vtts"][_ctx][_vt] = float(ss[_k])
+            _k = f"param_occupancy_{_ctx}_{_vt}"
+            if _k in ss:
+                p["occupancy"][_ctx][_vt] = float(ss[_k])
     if "param_reliability_ratio" in ss:
         p["reliability_ratio"] = float(ss["param_reliability_ratio"])
     for _vt in VTYPES:
@@ -2041,6 +2063,26 @@ with tab_params:
                     default=PARAMS["vtts"][_ctx][_vt],
                     min_val=0.0, max_val=10000.0, step=0.5,
                     unit="$/person-hr", source=_src_vtts,
+                )
+
+    # ── Vehicle Occupancy ────────────────────────────────────────────────────
+    with st.expander("Vehicle Occupancy (persons/vehicle)"):
+        _src_occ = "TfNSW EPV Jan 2025, Tables 2.4/2.5; ATAP 2016 PV2 (rural)"
+        st.caption(
+            "Converts VHT savings (vehicle-hours) to person-hours before applying VTTS. "
+            "Car/Bus urban from 2014/15 HTS; rural from ATAP 2016 PV2. "
+            "LCV = commercial driver (±1 passenger); HCV = driver only."
+        )
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _vt, _label in [("Car", "Car"), ("LCV", "Light Commercial (LCV)"),
+                                 ("HCV", "Heavy Commercial (HCV)"), ("Bus", "Bus")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_occupancy_{_ctx}_{_vt}",
+                    default=PARAMS["occupancy"][_ctx][_vt],
+                    min_val=0.1, max_val=100.0, step=0.01,
+                    unit="persons/veh", source=_src_occ,
                 )
 
     # ── Reliability Ratio ────────────────────────────────────────────────────
