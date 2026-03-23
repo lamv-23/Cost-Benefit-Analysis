@@ -927,7 +927,7 @@ def calculate_matrix(
     # FYRR (First Year Rate of Return): net benefit in first operational year
     # expressed as a percentage of total undiscounted capital cost.
     # Net benefit = gross benefits minus opex; excludes construction-period costs.
-    # Source: Austroads AGPE Part 4, §5.3; TfNSW CBA framework.
+    # Source: TfNSW CBA Practitioner's Guide; ATAP T2 §5.3 (supplementary).
     _first_op_net = annual_benefits[first_op] - annual_costs[first_op]
     fyrr = (_first_op_net / total_capital * 100) if total_capital > 0 else 0.0
 
@@ -937,8 +937,9 @@ def calculate_matrix(
     }
 
     sensitivity_dr = {}
-    # ATAP T2 (2022) mandated sensitivity rates: 4% (low), 7% (base), 10% (high).
-    # 3.5% added per NSW Treasury long-run real risk-free rate reference.
+    # TfNSW CBA Guidelines / NSW Treasury TPG23-08 sensitivity rates:
+    # 4% (low), 7% (base), 10% (high). ATAP T2 (2022) specifies the same core rates.
+    # 3.5% = NSW Treasury long-run real risk-free reference rate (TPP20-07).
     for r in [3.5, 4, 7, 10]:
         s_pvb = sum(annual_benefits[y] * discount_factor(r, base_offset + y) for y in range(total_years))
         s_pvc = sum(annual_costs[y] * discount_factor(r, base_offset + y) for y in range(total_years))
@@ -956,7 +957,8 @@ def calculate_matrix(
             if pv_by_type.get(t, 0) > 0:
                 switching[label] = -((pv_benefits - pv_costs) / pv_by_type[t]) * 100
 
-    # IRR — Internal Rate of Return (ATAP T2 §5.3).
+    # IRR — Internal Rate of Return.
+    # Source: TfNSW CBA framework; ATAP T2 §5.3 (supplementary).
     # Find the real discount rate (%) at which NPV = 0 via bisection.
     # Uses the same start-of-year, base_offset convention as the main calculation.
     def _npv_at_rate(r_pct: float) -> float:
@@ -979,8 +981,8 @@ def calculate_matrix(
                     break
             irr = round((_lo + _hi) / 2.0, 2)
 
-    # FYRR deferral test (ATAP T2): proceed if FYRR >= discount rate; otherwise
-    # consider deferral to improve timing efficiency of capital deployment.
+    # FYRR deferral test per TfNSW CBA Guidelines (ATAP T2 supplementary):
+    # proceed if FYRR >= discount rate; otherwise consider deferral.
     fyrr_deferral_pass = (fyrr >= dr) if total_capital > 0 else None
 
     scenarios = {}
@@ -1578,10 +1580,10 @@ elif matrix_results:
     with k4:
         st.metric("PV Costs", format_m(_r_kpi["pv_costs"]))
     with k5:
-        # IRR: ATAP T2 §5.3
+        # IRR: TfNSW CBA framework; ATAP T2 §5.3 (supplementary)
         st.metric("Internal Rate of Return", _irr_str)
     with k6:
-        # FYRR deferral test: ATAP T2 — proceed if FYRR ≥ discount rate
+        # FYRR deferral test: TfNSW CBA Guidelines — proceed if FYRR ≥ discount rate
         st.metric("First Year Rate of Return", f"{_r_kpi['fyrr']:.1f}%",
                   delta=_deferral_delta,
                   delta_color="normal" if _deferral else "inverse")
@@ -2054,14 +2056,14 @@ with tab_sensitivity:
 
     # --- Scenario Analysis Table ---
     st.subheader("Scenario Analysis")
-    # ATAP T2 (2022) mandated sensitivity rates
-    _atap_rates = {4, 7, 10}
+    # TfNSW CBA / NSW Treasury TPG23-08 required sensitivity rates
+    _tfnsw_required_rates = {4, 7, 10}
     rows = []
     for r_val in sorted(_r_sens["sensitivity_dr"].keys()):
         v = _r_sens["sensitivity_dr"][r_val]
-        _atap_tag = " ✦" if r_val in _atap_rates else ""
+        _req_tag = " ✦" if r_val in _tfnsw_required_rates else ""
         rows.append({
-            "Scenario": f"Discount Rate {r_val}%{_atap_tag}",
+            "Scenario": f"Discount Rate {r_val}%{_req_tag}",
             "PV Benefits ($M)": round(v["pvb"], 1),
             "PV Costs ($M)": round(v["pvc"], 1),
             "NPV ($M)": round(v["npv"], 1),
@@ -2098,8 +2100,9 @@ with tab_sensitivity:
         "BCR": "{:.2f}",
     })
     st.dataframe(styled, use_container_width=True, hide_index=True)
-    st.caption("✦ ATAP T2 (2022) mandated sensitivity rates: 4% (low), 7% (base), 10% (high). "
-               "3.5% = NSW Treasury long-run real risk-free reference rate. "
+    st.caption("✦ TfNSW CBA / NSW Treasury TPG23-08 required sensitivity rates: "
+               "4% (low), 7% (base), 10% (high). ATAP T2 (2022) specifies the same core rates. "
+               "3.5% = NSW Treasury long-run real risk-free rate (TPP20-07). "
                "Highlighted row = project base case discount rate.")
 
     # --- First-Year Benefit Breakdown ---
