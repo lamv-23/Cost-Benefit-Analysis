@@ -48,6 +48,16 @@ PARAMS = {
         "urban": {"Car": 19.76, "LCV": 54.87, "HCV": 54.87, "Bus": 19.76},
         "rural": {"Car": 17.78, "LCV": 49.38, "HCV": 49.38, "Bus": 17.78},
     },
+    # Vehicle occupancy (persons/vehicle). Multiplied by VHT saving to convert
+    # vehicle-hours to person-hours before applying the per-person VTTS.
+    # Car/Bus urban: 2014/15 HTS (Sydney), rural: ATAP 2016 PV2 pp. 16-19.
+    # LCV: commercial driver (occasionally one passenger); HCV: driver only.
+    # Bus: typical all-day average load (urban route / rural coach).
+    # Source: TfNSW EPV Jan 2025, Tables 2.4 & 2.5; ATAP 2016 PV2
+    "occupancy": {
+        "urban": {"Car": 1.14, "LCV": 1.1, "HCV": 1.0, "Bus": 13.0},
+        "rural": {"Car": 1.58, "LCV": 1.1, "HCV": 1.0, "Bus": 10.0},
+    },
     "voc": {
         "urban": {
             "car":   {40: 0.268, 50: 0.241, 60: 0.224, 70: 0.215, 80: 0.212, 90: 0.215, 100: 0.224},
@@ -69,6 +79,13 @@ PARAMS = {
         "Bus": 0.167,
     },
     "vsl": 8_100_000,
+    # Carbon shadow price used as the basis for emission_cost values below.
+    # Source: TfNSW EPV Jan 2025 (June 2024 prices): $123/tCO₂e.
+    # NOTE: NSW Treasury TPG24-34 mandates the NSW government carbon value;
+    # as of June 2025 this was $135.74/tCO₂e. Verify against the EPV Excel
+    # tool and update emission_cost proportionally if a newer EPV is adopted.
+    # ATAP PV5 (2024) uses a separate target-consistent schedule (starts at
+    # $56/tCO₂e in 2024 rising to $377 by 2050) — not applicable here.
     "carbon_per_tonne": 123,
     "air_pollution": {
         "urban": {"car": 0.032, "lgv": 0.045, "rigid": 0.179, "artic": 0.228},
@@ -100,6 +117,10 @@ VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "artic"}
 
 # Separate mapping for emission_cost (uses "bus" key, not "artic")
 EMISSION_VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "bus"}
+
+# Separate mapping for air_pollution and noise (Bus approximated as "artic";
+# kept explicit here so a future change to VTYPE_MAP won't silently affect env calcs)
+AIR_NOISE_VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "artic"}
 
 # Canonical vehicle type list for matrix inputs
 VTYPES = ["Car", "LCV", "HCV", "Bus"]
@@ -249,10 +270,22 @@ def _cagr_interpolate(v1: float, v2: float, y1: int, y2: int, eval_year: int) ->
     """CAGR-based interpolation/extrapolation between two modelling years.
 
     Mirrors the Excel formula: ((v2/v1)^(1/(y2-y1)))-1 applied as
-    v1 * (v2/v1)^((eval_year-y1)/(y2-y1)).  Returns 0 if either value is 0.
+    v1 * (v2/v1)^((eval_year-y1)/(y2-y1)).
+
+    Edge cases:
+    - y2 == y1: undefined interval, return v1.
+    - v1 == 0: no base to grow from; return 0 for all years.
+    - v2 == 0: traffic declines to zero; interpolate linearly to 0 then hold at 0
+      (CAGR is undefined when the end-value is 0).
     """
-    if v1 == 0 or v2 == 0 or y2 == y1:
+    if y2 == y1:
+        return float(v1)
+    if v1 == 0:
         return 0.0
+    if v2 == 0:
+        # Linear decline to zero over [y1, y2]; clamp at 0 for extrapolation beyond y2.
+        frac = (eval_year - y1) / (y2 - y1)
+        return float(v1) * max(0.0, 1.0 - frac)
     return float(v1) * (float(v2) / float(v1)) ** ((eval_year - y1) / (y2 - y1))
 
 
@@ -382,7 +415,7 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
                 return ""
 
             st.dataframe(
-                incr_df.style.applymap(_style_incr).format("{:+.0f}"),
+                incr_df.style.map(_style_incr).format("{:+.0f}"),
                 use_container_width=True,
             )
 
@@ -568,8 +601,11 @@ def _smart_parse_upload(uploaded_file) -> None:
         for sheet_name, df in dfs.items():
             df.columns = [str(c).strip() for c in df.columns]
 
-            # Detect year columns: 4-digit integers 2020-2100
-            year_cols = [c for c in df.columns if c.isdigit() and 2020 <= int(c) <= 2100]
+            # Detect year columns: 4-digit integers in range 1990-2200, sorted ascending
+            year_cols = sorted(
+                [c for c in df.columns if c.isdigit() and 1990 <= int(c) <= 2200],
+                key=int,
+            )
             if not year_cols:
                 continue
 
@@ -752,6 +788,8 @@ def calculate_matrix(
 
     # VTTS by vehicle type ($/person-hr)
     vtts_by_vtype = _p["vtts"][ctx]
+    # Occupancy (persons/vehicle): converts VHT savings (veh-hrs) → person-hours
+    occupancy_by_vtype = _p["occupancy"][ctx]
 
     # Capital and recurrent costs
     raw_cap = cost["cap_planning"] + cost["cap_land"] + cost["cap_construction"]
@@ -805,10 +843,15 @@ def calculate_matrix(
                     modelling_years, proj_traffic[vt]["vht"], ey
                 )
                 annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factors[vt]
-                vt_tts = annual_vht_saving * vtts_by_vtype[vt] / 1e6
+                vt_tts = annual_vht_saving * occupancy_by_vtype[vt] * vtts_by_vtype[vt] / 1e6
                 b_tts_by_vt[vt] = vt_tts
                 b_tts += vt_tts
 
+            # Reliability benefit: TTS × reliability_ratio × 0.3.
+            # The 0.3 (30%) is the Austroads / TfNSW standard apportionment of
+            # travel-time savings attributable to reliability improvement
+            # (i.e. not all VHT savings are also reliability savings).
+            # reliability_ratio (default 0.9) is the relative VTTS for reliability.
             b_rel = b_tts * _p["reliability_ratio"] * 0.3
 
             # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
@@ -844,11 +887,11 @@ def calculate_matrix(
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
             for vt in VTYPES:
-                param_vt = VTYPE_MAP[vt]
                 emit_vt = EMISSION_VTYPE_MAP[vt]
+                air_noise_vt = AIR_NOISE_VTYPE_MAP[vt]
                 emit_rate = _p["emission_cost"][ctx].get(emit_vt, 0.0)
-                air_rate = _p["air_pollution"][ctx].get(param_vt, 0.0)
-                noise_rate = _p["noise"][ctx].get(param_vt, 0.0)
+                air_rate = _p["air_pollution"][ctx].get(air_noise_vt, 0.0)
+                noise_rate = _p["noise"][ctx].get(air_noise_vt, 0.0)
 
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
@@ -881,7 +924,12 @@ def calculate_matrix(
     npv = pv_benefits - pv_costs
     bcr = pv_benefits / pv_costs if pv_costs > 0 else 0.0
     first_op = const_years if const_years < total_years else 0
-    fyrr = (annual_benefits[first_op] / total_capital * 100) if total_capital > 0 else 0.0
+    # FYRR (First Year Rate of Return): net benefit in first operational year
+    # expressed as a percentage of total undiscounted capital cost.
+    # Net benefit = gross benefits minus opex; excludes construction-period costs.
+    # Source: TfNSW CBA Practitioner's Guide; ATAP T2 §5.3 (supplementary).
+    _first_op_net = annual_benefits[first_op] - annual_costs[first_op]
+    fyrr = (_first_op_net / total_capital * 100) if total_capital > 0 else 0.0
 
     pv_by_type = {
         t: sum(benefits_by_type[t][y] * discount_factor(dr, base_offset + y) for y in range(total_years))
@@ -889,7 +937,10 @@ def calculate_matrix(
     }
 
     sensitivity_dr = {}
-    for r in [3, 4, 5, 7, 10, 12]:
+    # TfNSW CBA Guidelines / NSW Treasury TPG23-08 sensitivity rates:
+    # 4% (low), 7% (base), 10% (high). ATAP T2 (2022) specifies the same core rates.
+    # 3.5% = NSW Treasury long-run real risk-free reference rate (TPP20-07).
+    for r in [3.5, 5, 7, 10]:
         s_pvb = sum(annual_benefits[y] * discount_factor(r, base_offset + y) for y in range(total_years))
         s_pvc = sum(annual_costs[y] * discount_factor(r, base_offset + y) for y in range(total_years))
         sensitivity_dr[r] = {
@@ -906,6 +957,34 @@ def calculate_matrix(
             if pv_by_type.get(t, 0) > 0:
                 switching[label] = -((pv_benefits - pv_costs) / pv_by_type[t]) * 100
 
+    # IRR — Internal Rate of Return.
+    # Source: TfNSW CBA framework; ATAP T2 §5.3 (supplementary).
+    # Find the real discount rate (%) at which NPV = 0 via bisection.
+    # Uses the same start-of-year, base_offset convention as the main calculation.
+    def _npv_at_rate(r_pct: float) -> float:
+        return sum(
+            (annual_benefits[y] - annual_costs[y]) * discount_factor(r_pct, base_offset + y)
+            for y in range(total_years)
+        )
+
+    irr: float | None = None
+    if _npv_at_rate(0.0) > 0:
+        _lo, _hi = 0.0, 200.0
+        if _npv_at_rate(_hi) < 0:
+            for _ in range(60):
+                _mid = (_lo + _hi) / 2.0
+                if _npv_at_rate(_mid) > 0:
+                    _lo = _mid
+                else:
+                    _hi = _mid
+                if _hi - _lo < 1e-6:
+                    break
+            irr = round((_lo + _hi) / 2.0, 2)
+
+    # FYRR deferral test per TfNSW CBA Guidelines (ATAP T2 supplementary):
+    # proceed if FYRR >= discount rate; otherwise consider deferral.
+    fyrr_deferral_pass = (fyrr >= dr) if total_capital > 0 else None
+
     scenarios = {}
     for label, factor in [("Low (-20%)", 0.8), ("Central", 1.0), ("High (+20%)", 1.2)]:
         s_pvb = sum(annual_benefits[y] * factor * discount_factor(dr, base_offset + y) for y in range(total_years))
@@ -918,7 +997,9 @@ def calculate_matrix(
 
     return {
         "npv": npv, "bcr": bcr, "pv_benefits": pv_benefits, "pv_costs": pv_costs,
-        "fyrr": fyrr, "payback_year": payback_year, "total_capital": total_capital,
+        "fyrr": fyrr, "fyrr_deferral_pass": fyrr_deferral_pass,
+        "irr": irr,
+        "payback_year": payback_year, "total_capital": total_capital,
         "annual_costs": annual_costs, "annual_benefits": annual_benefits,
         "annual_net": annual_net,
         "disc_costs": disc_costs, "disc_benefits": disc_benefits, "disc_net": disc_net,
@@ -1077,6 +1158,9 @@ def build_effective_params() -> dict:
             _k = f"param_vtts_{_ctx}_{_vt}"
             if _k in ss:
                 p["vtts"][_ctx][_vt] = float(ss[_k])
+            _k = f"param_occupancy_{_ctx}_{_vt}"
+            if _k in ss:
+                p["occupancy"][_ctx][_vt] = float(ss[_k])
     if "param_reliability_ratio" in ss:
         p["reliability_ratio"] = float(ss["param_reliability_ratio"])
     for _vt in VTYPES:
@@ -1336,7 +1420,23 @@ with st.sidebar:
     )
     try:
         _parsed_years = [int(y.strip()) for y in _years_raw.split(",") if y.strip()]
-        if len(_parsed_years) >= 1 and _parsed_years != st.session_state["modelling_years"]:
+        _year_errors = []
+        if len(_parsed_years) < 2:
+            _year_errors.append("At least 2 modelling years are required for CAGR interpolation.")
+        else:
+            _out_of_range = [y for y in _parsed_years if not (1990 <= y <= 2200)]
+            if _out_of_range:
+                _year_errors.append(f"Year(s) out of valid range (1990–2200): {_out_of_range}")
+            _deduped = sorted(set(_parsed_years))
+            if len(_deduped) < len(_parsed_years):
+                _year_errors.append("Duplicate years will be removed.")
+                _parsed_years = _deduped
+            else:
+                _parsed_years = sorted(_parsed_years)
+        if _year_errors:
+            for _msg in _year_errors:
+                st.warning(_msg)
+        if not _year_errors and _parsed_years != st.session_state["modelling_years"]:
             st.session_state["modelling_years"] = _parsed_years
             _init_session_state()
             st.rerun()
@@ -1377,7 +1477,7 @@ with st.sidebar:
             help="Calendar year construction begins. Benefits start after the construction period.")
     with col2:
         const_years = st.number_input("Construction Period (years)", 1, 10, 3)
-        discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 7.0, step=0.5)
+        discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 5.0, step=0.5)
     context = st.selectbox("Context", ["urban", "rural"], format_func=str.title)
     zero_growth_after_last_year = st.checkbox(
         "Zero growth after last modelling year",
@@ -1443,6 +1543,9 @@ if matrix_results and _n_cases > 1:
     for _i, _col in enumerate(_case_cols, 1):
         _mr = matrix_results.get(f"project_{_i}", {})
         _pb = f"{_mr['payback_year']} yrs" if _mr.get("payback_year") else "N/A"
+        _irr_str = f"{_mr['irr']:.1f}%" if _mr.get("irr") is not None else "N/A"
+        _deferral = _mr.get("fyrr_deferral_pass")
+        _deferral_delta = ("Proceed" if _deferral else "Consider deferral") if _deferral is not None else ""
         with _col:
             st.markdown(f"**Project {_i}**")
             st.metric("NPV", format_m(_mr.get("npv", 0)),
@@ -1451,14 +1554,19 @@ if matrix_results and _n_cases > 1:
             st.metric("BCR", f"{_mr.get('bcr', 0):.2f}",
                       delta="≥ 1.0" if _mr.get("bcr", 0) >= 1 else "< 1.0",
                       delta_color="normal" if _mr.get("bcr", 0) >= 1 else "inverse")
-            st.metric("PV Benefits", format_m(_mr.get("pv_benefits", 0)))
-            st.metric("PV Costs", format_m(_mr.get("pv_costs", 0)))
-            st.metric("FYRR", f"{_mr.get('fyrr', 0):.1f}%")
+            st.metric("IRR", _irr_str)
+            st.metric("FYRR", f"{_mr.get('fyrr', 0):.1f}%",
+                      delta=_deferral_delta,
+                      delta_color="normal" if _deferral else "inverse")
             st.metric("Payback", _pb)
 elif matrix_results:
     # Single project case
     _r_kpi = matrix_results["project_1"]
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    _irr_val = _r_kpi.get("irr")
+    _irr_str = f"{_irr_val:.1f}%" if _irr_val is not None else "N/A"
+    _deferral = _r_kpi.get("fyrr_deferral_pass")
+    _deferral_delta = ("Proceed" if _deferral else "Consider deferral") if _deferral is not None else ""
+    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
     with k1:
         st.metric("Net Present Value", format_m(_r_kpi["npv"]),
                   delta="Positive" if _r_kpi["npv"] >= 0 else "Negative",
@@ -1472,8 +1580,14 @@ elif matrix_results:
     with k4:
         st.metric("PV Costs", format_m(_r_kpi["pv_costs"]))
     with k5:
-        st.metric("First Year Rate of Return", f"{_r_kpi['fyrr']:.1f}%")
+        # IRR: TfNSW CBA framework; ATAP T2 §5.3 (supplementary)
+        st.metric("Internal Rate of Return", _irr_str)
     with k6:
+        # FYRR deferral test: TfNSW CBA Guidelines — proceed if FYRR ≥ discount rate
+        st.metric("First Year Rate of Return", f"{_r_kpi['fyrr']:.1f}%",
+                  delta=_deferral_delta,
+                  delta_color="normal" if _deferral else "inverse")
+    with k7:
         pb = f"{_r_kpi['payback_year']} years" if _r_kpi["payback_year"] else "N/A"
         st.metric("Payback Period", pb)
 else:
@@ -1942,11 +2056,14 @@ with tab_sensitivity:
 
     # --- Scenario Analysis Table ---
     st.subheader("Scenario Analysis")
+    # TfNSW CBA / NSW Treasury TPG23-08 required sensitivity rates
+    _tfnsw_required_rates = {5, 7, 10}
     rows = []
     for r_val in sorted(_r_sens["sensitivity_dr"].keys()):
         v = _r_sens["sensitivity_dr"][r_val]
+        _req_tag = " ✦" if r_val in _tfnsw_required_rates else ""
         rows.append({
-            "Scenario": f"Discount Rate {r_val}%",
+            "Scenario": f"Discount Rate {r_val}%{_req_tag}",
             "PV Benefits ($M)": round(v["pvb"], 1),
             "PV Costs ($M)": round(v["pvc"], 1),
             "NPV ($M)": round(v["npv"], 1),
@@ -1964,7 +2081,10 @@ with tab_sensitivity:
 
     def highlight_rows(row):
         styles = [""] * len(row)
-        if f"Discount Rate {int(discount_rate)}%" in row["Scenario"] or row["Scenario"] == "Demand Central":
+        _is_base = (f"Discount Rate {discount_rate}%" in row["Scenario"]
+                    or f"Discount Rate {int(discount_rate)}%" in row["Scenario"]
+                    or row["Scenario"] == "Demand Central")
+        if _is_base:
             styles = ["background-color: rgba(13, 110, 253, 0.1); font-weight: 700"] * len(row)
         bcr_idx = df_sens.columns.get_loc("BCR")
         if row["BCR"] >= 1:
@@ -1980,6 +2100,10 @@ with tab_sensitivity:
         "BCR": "{:.2f}",
     })
     st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.caption("✦ TfNSW CBA / NSW Treasury TPG23-08 required sensitivity rates: "
+               "4% (low), 7% (base), 10% (high). ATAP T2 (2022) specifies the same core rates. "
+               "3.5% = NSW Treasury long-run real risk-free rate (TPP20-07). "
+               "Highlighted row = project base case discount rate.")
 
     # --- First-Year Benefit Breakdown ---
     st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
@@ -1987,9 +2111,9 @@ with tab_sensitivity:
     fy_cols = st.columns(7)
     for i, (key, label) in enumerate(TYPE_LABELS.items()):
         with fy_cols[i]:
-            st.metric(label, f"${fy[key]:.2f}M")
+            st.metric(label, f"${fy.get(key, 0.0):.2f}M")
     with fy_cols[6]:
-        st.metric("Total", f"${fy['total']:.2f}M")
+        st.metric("Total", f"${fy.get('total', 0.0):.2f}M")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2020,6 +2144,26 @@ with tab_params:
                     default=PARAMS["vtts"][_ctx][_vt],
                     min_val=0.0, max_val=10000.0, step=0.5,
                     unit="$/person-hr", source=_src_vtts,
+                )
+
+    # ── Vehicle Occupancy ────────────────────────────────────────────────────
+    with st.expander("Vehicle Occupancy (persons/vehicle)"):
+        _src_occ = "TfNSW EPV Jan 2025, Tables 2.4/2.5; ATAP 2016 PV2 (rural)"
+        st.caption(
+            "Converts VHT savings (vehicle-hours) to person-hours before applying VTTS. "
+            "Car/Bus urban from 2014/15 HTS; rural from ATAP 2016 PV2. "
+            "LCV = commercial driver (±1 passenger); HCV = driver only."
+        )
+        for _ctx in ("urban", "rural"):
+            st.markdown(f"**{_ctx.title()}**")
+            for _vt, _label in [("Car", "Car"), ("LCV", "Light Commercial (LCV)"),
+                                 ("HCV", "Heavy Commercial (HCV)"), ("Bus", "Bus")]:
+                param_editor(
+                    label=f"{_label} — {_ctx.title()}",
+                    key=f"param_occupancy_{_ctx}_{_vt}",
+                    default=PARAMS["occupancy"][_ctx][_vt],
+                    min_val=0.1, max_val=100.0, step=0.01,
+                    unit="persons/veh", source=_src_occ,
                 )
 
     # ── Reliability Ratio ────────────────────────────────────────────────────
