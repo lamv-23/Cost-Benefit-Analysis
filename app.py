@@ -1152,6 +1152,183 @@ def calculate_all_cases(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MONTE CARLO SIMULATION — Step 8b
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_monte_carlo(
+    case_key: str,
+    inputs: dict,
+    traffic_data: dict,
+    cost_data: dict,
+    annualisation: dict,
+    safety_vkt_data: dict = None,
+    params: dict = None,
+    n_simulations: int = 1000,
+    seed: int = 42,
+    vtts_cv: float = 0.20,
+    safety_cv: float = 0.30,
+    traffic_cv: float = 0.15,
+    cost_overrun_min: float = 1.0,
+    cost_overrun_mode: float = 1.10,
+    cost_overrun_max: float = 1.40,
+) -> dict:
+    """Run Monte Carlo simulation for a single project case.
+
+    Each iteration independently samples:
+      - VTTS (all contexts/vehicle types): Normal(1, vtts_cv)
+      - Safety $/VKT: Lognormal with sigma = safety_cv
+      - Traffic VHT/VKT (base and project): Normal(1, traffic_cv), clamped > 0
+      - Capital construction cost: Triangular(min, mode, max)
+
+    Args:
+        case_key:          e.g. ``"project_1"``
+        inputs:            project config dict (same as calculate_matrix)
+        traffic_data:      full traffic_data dict (keyed by case)
+        cost_data:         full cost_data dict (keyed by case)
+        annualisation:     annualisation dict
+        safety_vkt_data:   optional per-case safety rates
+        params:            effective params (from build_effective_params())
+        n_simulations:     number of iterations
+        seed:              RNG seed for reproducibility
+        vtts_cv:           coefficient of variation for VTTS sampling
+        safety_cv:         CV for safety cost sampling (lognormal sigma)
+        traffic_cv:        CV for traffic volume sampling
+        cost_overrun_min/mode/max: triangular distribution bounds for capex factor
+
+    Returns:
+        dict with keys ``npv``, ``bcr`` (numpy arrays), percentile summaries,
+        ``prob_npv_positive``, and per-parameter sensitivity arrays for tornado.
+    """
+    import numpy as np
+    import copy
+
+    rng = np.random.default_rng(seed)
+    _p_base = params if params is not None else PARAMS
+
+    npv_arr = np.empty(n_simulations)
+    bcr_arr = np.empty(n_simulations)
+
+    # Pre-draw all random factors for speed
+    vtts_factors    = rng.normal(1.0, vtts_cv,     n_simulations).clip(0.01)
+    safety_sigmas   = np.sqrt(np.log(1 + safety_cv**2))
+    safety_means    = -0.5 * safety_sigmas**2
+    safety_factors  = rng.lognormal(safety_means, safety_sigmas, n_simulations)
+    traffic_factors = rng.normal(1.0, traffic_cv,  (n_simulations, 2)).clip(0.01)  # [base, proj]
+    cost_factors    = rng.triangular(cost_overrun_min, cost_overrun_mode, cost_overrun_max, n_simulations)
+
+    base_traffic_orig = traffic_data["base_case"]
+    proj_traffic_orig = traffic_data[case_key]
+    cost_orig         = cost_data[case_key]
+    sv_base_orig      = safety_vkt_data.get("base_case") if safety_vkt_data else None
+    sv_proj_orig      = safety_vkt_data.get(case_key)    if safety_vkt_data else None
+
+    for i in range(n_simulations):
+        # ── Perturb params ──────────────────────────────────────────────────
+        p = copy.deepcopy(_p_base)
+        for _ctx in ("urban", "rural"):
+            for _vt in VTYPES:
+                p["vtts"][_ctx][_vt] *= vtts_factors[i]
+
+        sf = safety_factors[i]
+        sv_base = {vt: (sv_base_orig[vt] if sv_base_orig else p["safety_vkt"][vt]) * sf for vt in VTYPES}
+        sv_proj = {vt: (sv_proj_orig[vt] if sv_proj_orig else p["safety_vkt"][vt]) * sf for vt in VTYPES}
+
+        # ── Perturb traffic (multiplicative, independent for base vs project) ─
+        f_base = traffic_factors[i, 0]
+        f_proj = traffic_factors[i, 1]
+
+        def _scale_traffic(orig: dict, factor: float) -> dict:
+            tc = copy.deepcopy(orig)
+            for vt in VTYPES:
+                for metric in ("vht", "vkt"):
+                    tc[vt][metric] = [v * factor for v in orig[vt][metric]]
+            return tc
+
+        base_traffic_s = _scale_traffic(base_traffic_orig, f_base)
+        proj_traffic_s = _scale_traffic(proj_traffic_orig, f_proj)
+
+        # ── Perturb construction cost ────────────────────────────────────────
+        cost_s = dict(cost_orig)
+        cost_s["cap_construction"] = cost_orig["cap_construction"] * cost_factors[i]
+
+        # ── Calculate ────────────────────────────────────────────────────────
+        result = calculate_matrix(
+            inputs=inputs,
+            base_traffic=base_traffic_s,
+            proj_traffic=proj_traffic_s,
+            cost=cost_s,
+            annualisation=annualisation,
+            safety_vkt_base=sv_base,
+            safety_vkt_proj=sv_proj,
+            params=p,
+        )
+        npv_arr[i] = result["npv"]
+        bcr_arr[i] = result["bcr"]
+
+    p10_npv, p25_npv, p50_npv, p75_npv, p90_npv = np.percentile(npv_arr, [10, 25, 50, 75, 90])
+    p10_bcr, p25_bcr, p50_bcr, p75_bcr, p90_bcr = np.percentile(bcr_arr, [10, 25, 50, 75, 90])
+
+    # ── Tornado: one-at-a-time sensitivity around central values ────────────
+    # Each parameter held at its P10 / P90 while others stay at median (factor=1)
+    _central = calculate_matrix(
+        inputs=inputs,
+        base_traffic=base_traffic_orig,
+        proj_traffic=proj_traffic_orig,
+        cost=cost_orig,
+        annualisation=annualisation,
+        safety_vkt_base=sv_base_orig,
+        safety_vkt_proj=sv_proj_orig,
+        params=_p_base,
+    )
+    central_npv = _central["npv"]
+
+    def _npv_with(vtts_f=1.0, safety_f=1.0, traffic_base_f=1.0, traffic_proj_f=1.0, cost_f=1.0):
+        _p = copy.deepcopy(_p_base)
+        for _ctx in ("urban", "rural"):
+            for _vt in VTYPES:
+                _p["vtts"][_ctx][_vt] *= vtts_f
+        _sv_b = {vt: (_p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
+        _sv_p = {vt: (_p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
+        _bt = _scale_traffic(base_traffic_orig, traffic_base_f)
+        _pt = _scale_traffic(proj_traffic_orig, traffic_proj_f)
+        _c = dict(cost_orig)
+        _c["cap_construction"] = cost_orig["cap_construction"] * cost_f
+        return calculate_matrix(
+            inputs=inputs, base_traffic=_bt, proj_traffic=_pt,
+            cost=_c, annualisation=annualisation,
+            safety_vkt_base=_sv_b, safety_vkt_proj=_sv_p, params=_p,
+        )["npv"]
+
+    _vtts_p10_f   = float(np.percentile(vtts_factors, 10))
+    _vtts_p90_f   = float(np.percentile(vtts_factors, 90))
+    _safety_p10_f = float(np.percentile(safety_factors, 10))
+    _safety_p90_f = float(np.percentile(safety_factors, 90))
+    _traf_p10_f   = float(np.percentile(traffic_factors[:, 1], 10))
+    _traf_p90_f   = float(np.percentile(traffic_factors[:, 1], 90))
+    _cost_p10_f   = float(np.percentile(cost_factors, 10))
+    _cost_p90_f   = float(np.percentile(cost_factors, 90))
+
+    tornado = {
+        "VTTS":             (_npv_with(vtts_f=_vtts_p10_f),   _npv_with(vtts_f=_vtts_p90_f)),
+        "Safety cost/VKT":  (_npv_with(safety_f=_safety_p10_f), _npv_with(safety_f=_safety_p90_f)),
+        "Traffic volumes":  (_npv_with(traffic_proj_f=_traf_p10_f), _npv_with(traffic_proj_f=_traf_p90_f)),
+        "Capital cost":     (_npv_with(cost_f=_cost_p90_f),   _npv_with(cost_f=_cost_p10_f)),
+    }
+
+    return {
+        "npv": npv_arr,
+        "bcr": bcr_arr,
+        "n_simulations": n_simulations,
+        "central_npv": central_npv,
+        "npv_percentiles": {"p10": p10_npv, "p25": p25_npv, "p50": p50_npv, "p75": p75_npv, "p90": p90_npv},
+        "bcr_percentiles": {"p10": p10_bcr, "p25": p25_bcr, "p50": p50_bcr, "p75": p75_bcr, "p90": p90_bcr},
+        "prob_npv_positive": float((npv_arr > 0).mean()),
+        "prob_bcr_gt1":      float((bcr_arr > 1).mean()),
+        "tornado": tornado,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CSV EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2292,6 +2469,165 @@ with tab_sensitivity:
             st.metric(label, f"${fy.get(key, 0.0):.2f}M")
     with fy_cols[6]:
         st.metric("Total", f"${fy.get('total', 0.0):.2f}M")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # MONTE CARLO SIMULATION
+    # ═══════════════════════════════════════════════════════════════════════
+    st.markdown('<div class="section-header">Monte Carlo Simulation</div>', unsafe_allow_html=True)
+    st.caption(
+        "Runs thousands of CBA iterations with randomly sampled parameters to produce "
+        "a probability distribution of NPV and BCR outcomes."
+    )
+
+    with st.expander("Simulation Settings", expanded=False):
+        mc_col1, mc_col2 = st.columns(2)
+        with mc_col1:
+            mc_n = st.slider("Number of simulations", 200, 5000, 1000, step=100, key="mc_n_sims")
+            mc_vtts_cv = st.slider("VTTS uncertainty (CV %)", 5, 40, 20, key="mc_vtts_cv") / 100
+            mc_traffic_cv = st.slider("Traffic volume uncertainty (CV %)", 5, 30, 15, key="mc_traffic_cv") / 100
+        with mc_col2:
+            mc_safety_cv = st.slider("Safety cost uncertainty (CV %)", 10, 50, 30, key="mc_safety_cv") / 100
+            mc_cost_min = st.number_input("Capex overrun — min factor", 0.8, 1.2, 1.0, 0.05, key="mc_cost_min")
+            mc_cost_mode = st.number_input("Capex overrun — most likely", 1.0, 1.5, 1.10, 0.05, key="mc_cost_mode")
+            mc_cost_max = st.number_input("Capex overrun — max factor", 1.0, 2.0, 1.40, 0.05, key="mc_cost_max")
+
+    if st.button("Run Monte Carlo", type="primary", key="mc_run_btn"):
+        _mc_inputs = {
+            "context": context,
+            "evaluation_period": evaluation_period,
+            "construction_years": construction_years,
+            "discount_rate": discount_rate,
+            "discount_base_year": discount_base_year,
+            "construction_start_year": construction_start_year,
+            "zero_growth_after_last_year": st.session_state.get("zero_growth_after_last_year", False),
+            "n_project_cases": st.session_state.n_project_cases,
+        }
+        with st.spinner(f"Running {mc_n:,} simulations…"):
+            mc_results_all = {}
+            for _ck in matrix_results:
+                mc_results_all[_ck] = run_monte_carlo(
+                    case_key=_ck,
+                    inputs=_mc_inputs,
+                    traffic_data=st.session_state.traffic_data,
+                    cost_data=st.session_state.cost_data,
+                    annualisation=st.session_state.annualisation,
+                    safety_vkt_data=st.session_state.get("safety_vkt_data"),
+                    params=build_effective_params(),
+                    n_simulations=mc_n,
+                    vtts_cv=mc_vtts_cv,
+                    safety_cv=mc_safety_cv,
+                    traffic_cv=mc_traffic_cv,
+                    cost_overrun_min=mc_cost_min,
+                    cost_overrun_mode=mc_cost_mode,
+                    cost_overrun_max=mc_cost_max,
+                )
+        st.session_state["mc_results"] = mc_results_all
+        st.rerun()
+
+    mc_stored = st.session_state.get("mc_results")
+    if mc_stored and _sens_sel in mc_stored:
+        import numpy as np
+        _mc = mc_stored[_sens_sel]
+        npv_arr = _mc["npv"]
+        bcr_arr = _mc["bcr"]
+        pct_npv = _mc["npv_percentiles"]
+        pct_bcr = _mc["bcr_percentiles"]
+        n_sims  = _mc["n_simulations"]
+
+        # ── KPI row ─────────────────────────────────────────────────────────
+        st.markdown(f"**Results — {n_sims:,} simulations**")
+        kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+        kc1.metric("P10 NPV", f"${pct_npv['p10']:.1f}M")
+        kc2.metric("Median NPV", f"${pct_npv['p50']:.1f}M")
+        kc3.metric("P90 NPV", f"${pct_npv['p90']:.1f}M")
+        kc4.metric("P(NPV > 0)", f"{_mc['prob_npv_positive']*100:.0f}%")
+        kc5.metric("P(BCR > 1)", f"{_mc['prob_bcr_gt1']*100:.0f}%")
+
+        # ── Histograms ───────────────────────────────────────────────────────
+        mc_h1, mc_h2 = st.columns(2)
+        with mc_h1:
+            st.subheader("NPV Distribution ($M)")
+            fig_npv = go.Figure()
+            fig_npv.add_trace(go.Histogram(
+                x=npv_arr, nbinsx=50,
+                marker_color="#0d6efd", opacity=0.75, name="NPV",
+            ))
+            fig_npv.add_vline(x=0, line_dash="dash", line_color="#dc3545",
+                              annotation_text="NPV = 0", annotation_position="top right")
+            fig_npv.add_vline(x=pct_npv["p50"], line_dash="dot", line_color="#6c757d",
+                              annotation_text=f"P50={pct_npv['p50']:.1f}M",
+                              annotation_position="top left")
+            fig_npv.update_layout(
+                xaxis_title="NPV ($M)", yaxis_title="Count",
+                height=320, margin=dict(t=10, b=20, l=20, r=20),
+                showlegend=False, **PLOTLY_TRANSPARENT,
+            )
+            st.plotly_chart(fig_npv, use_container_width=True)
+
+        with mc_h2:
+            st.subheader("BCR Distribution")
+            fig_bcr = go.Figure()
+            fig_bcr.add_trace(go.Histogram(
+                x=bcr_arr, nbinsx=50,
+                marker_color="#198754", opacity=0.75, name="BCR",
+            ))
+            fig_bcr.add_vline(x=1.0, line_dash="dash", line_color="#dc3545",
+                              annotation_text="BCR = 1.0", annotation_position="top right")
+            fig_bcr.add_vline(x=pct_bcr["p50"], line_dash="dot", line_color="#6c757d",
+                              annotation_text=f"P50={pct_bcr['p50']:.2f}",
+                              annotation_position="top left")
+            fig_bcr.update_layout(
+                xaxis_title="BCR", yaxis_title="Count",
+                height=320, margin=dict(t=10, b=20, l=20, r=20),
+                showlegend=False, **PLOTLY_TRANSPARENT,
+            )
+            st.plotly_chart(fig_bcr, use_container_width=True)
+
+        # ── Percentile table ─────────────────────────────────────────────────
+        df_pct = pd.DataFrame({
+            "Percentile": ["P10", "P25", "P50 (Median)", "P75", "P90"],
+            "NPV ($M)": [round(pct_npv[k], 1) for k in ("p10", "p25", "p50", "p75", "p90")],
+            "BCR":       [round(pct_bcr[k], 2) for k in ("p10", "p25", "p50", "p75", "p90")],
+        })
+        st.dataframe(df_pct, use_container_width=True, hide_index=True)
+
+        # ── Tornado chart ─────────────────────────────────────────────────────
+        st.subheader("Tornado Chart — Parameter Impact on NPV ($M)")
+        st.caption("Each bar shows NPV range from P10 to P90 of that parameter alone (others held at central values).")
+        tornado = _mc["tornado"]
+        central_npv = _mc["central_npv"]
+        t_labels = list(tornado.keys())
+        t_low    = [tornado[k][0] for k in t_labels]
+        t_high   = [tornado[k][1] for k in t_labels]
+        t_swing  = [abs(tornado[k][1] - tornado[k][0]) for k in t_labels]
+        # Sort by swing (largest at top)
+        _order = sorted(range(len(t_swing)), key=lambda x: t_swing[x])
+        t_labels = [t_labels[j] for j in _order]
+        t_low    = [t_low[j]    for j in _order]
+        t_high   = [t_high[j]   for j in _order]
+
+        fig_tornado = go.Figure()
+        fig_tornado.add_trace(go.Bar(
+            y=t_labels,
+            x=[h - central_npv for h in t_high],
+            base=[l - central_npv for l in t_low],
+            orientation="h",
+            marker_color="#0d6efd",
+            name="NPV range",
+        ))
+        fig_tornado.add_vline(x=0, line_color="#6c757d")
+        fig_tornado.update_layout(
+            xaxis_title="NPV deviation from central ($M)",
+            height=320, margin=dict(t=10, b=20, l=160, r=20),
+            showlegend=False, **PLOTLY_TRANSPARENT,
+        )
+        st.plotly_chart(fig_tornado, use_container_width=True)
+        st.caption(
+            f"Seed: 42 · Distributions: VTTS Normal(μ=1, σ={st.session_state.get('mc_vtts_cv',20)}%), "
+            f"Safety Lognormal(CV={st.session_state.get('mc_safety_cv',30)}%), "
+            f"Traffic Normal(μ=1, σ={st.session_state.get('mc_traffic_cv',15)}%), "
+            f"Capex Triangular({mc_cost_min:.2f}–{mc_cost_mode:.2f}–{mc_cost_max:.2f})."
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
