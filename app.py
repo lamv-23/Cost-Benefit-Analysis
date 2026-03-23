@@ -2004,7 +2004,7 @@ with tab_dash:
         st.subheader("Benefit Composition (PV $M)")
         pv = _r["pv_by_type"]
         labels_list, values_list, colors_list = [], [], []
-        for t in ["tts", "reliability", "voc", "safety", "env", "active"]:
+        for t in TYPE_LABELS:
             if pv.get(t, 0) > 0:
                 labels_list.append(TYPE_LABELS[t])
                 values_list.append(round(pv[t], 2))
@@ -2029,7 +2029,7 @@ with tab_dash:
         wf_values = [pv.get(t, 0) for t in TYPE_LABELS] + [
             _r["pv_benefits"], -_r["pv_costs"], _r["npv"]
         ]
-        wf_measures = ["relative"] * 6 + ["total", "relative", "total"]
+        wf_measures = ["relative"] * len(TYPE_LABELS) + ["total", "relative", "total"]
         fig_wf = go.Figure(go.Waterfall(
             x=wf_labels, y=wf_values, measure=wf_measures,
             connector={"line": {"color": "#ced4da"}},
