@@ -243,6 +243,7 @@ def make_cost_data(n_project_cases: int = 1) -> dict:
         "cap_planning": 0.0, "cap_land": 0.0, "cap_construction": 0.0,
         "contingency_pct": 0.0, "opex_maint": 0.0, "opex_op": 0.0, "residual": 0.0,
         "construction_disbenefit_annual": 0.0,
+        "construction_asset_life": 40,   # years; drives auto-calculated residual value
         "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
         "pavement_saving_annual": 0.0,
     }
@@ -315,8 +316,9 @@ def _load_sample_data() -> None:
             "contingency_pct": 10.0,
             "opex_maint": 1.2,
             "opex_op": 0.0,
-            "residual": 8.0,
+            "residual": 0.0,                  # 0 = use auto-calculated residual
             "construction_disbenefit_annual": 0.0,
+            "construction_asset_life": 40,
             "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
             "pavement_saving_annual": 0.0,
         }
@@ -520,12 +522,16 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
 # COST ENTRY UI HELPER — Step 5
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_cost_entry() -> None:
+def render_cost_entry(eval_period: int = 30) -> None:
     """Render cost input forms per project case (Step 5).
 
     One expandable section per project case with capital costs (planning, land,
     construction, contingency %), recurrent costs (maintenance, operating), and
     residual value.  Updates ``st.session_state.cost_data`` in-place.
+
+    Args:
+        eval_period: Operational evaluation period in years (from sidebar).
+                     Used to compute auto-calculated residual value.
     """
     n = st.session_state.n_project_cases
     for i in range(1, n + 1):
@@ -544,6 +550,20 @@ def render_cost_entry() -> None:
                     "Construction ($M)", min_value=0.0,
                     value=float(cd["cap_construction"]), step=1.0, key=f"cost_construction_{i}",
                 )
+                cd["construction_asset_life"] = st.number_input(
+                    "Construction Asset Life (years)",
+                    min_value=1, max_value=200,
+                    value=int(cd.get("construction_asset_life", 40)),
+                    step=5, key=f"cost_asset_life_{i}",
+                    help=(
+                        "Useful life of the constructed asset — used to auto-calculate residual "
+                        "value at end of evaluation period (straight-line depreciation). "
+                        "Typical values: sealed rural road 40–60 yr · urban arterial 30–50 yr · "
+                        "bridge/major structure 80–100 yr · flexible pavement 25–35 yr · "
+                        "unsealed road 15–20 yr · ITS/signals 15–25 yr. "
+                        "Land acquisition always retains full value regardless of this setting."
+                    ),
+                )
             with c2:
                 cd["cap_land"] = st.number_input(
                     "Land Acquisition ($M)", min_value=0.0,
@@ -561,6 +581,39 @@ def render_cost_entry() -> None:
             st.metric(
                 f"Total Capital incl. {cd['contingency_pct']:.0f}% contingency ($M)",
                 f"${total_cap:.2f}M",
+            )
+
+            # ── Auto-calculated Residual Value ───────────────────────────────
+            _life = int(cd.get("construction_asset_life", 40))
+            _rem_frac = max(0.0, (_life - eval_period) / _life) if _life > 0 else 0.0
+            _const_with_cont = cd["cap_construction"] * (1 + cd["contingency_pct"] / 100)
+            _land_res = cd["cap_land"]
+            _const_res = _const_with_cont * _rem_frac
+            _auto_res = _land_res + _const_res
+            _override = cd.get("residual", 0.0) > 0.0
+            st.markdown("**Residual Value (auto-calculated)**")
+            _rc1, _rc2, _rc3 = st.columns(3)
+            _rc1.metric(
+                "Land Residual ($M)", f"${_land_res:.2f}M",
+                help="Land acquisition retains full value (no depreciation).",
+            )
+            _rc2.metric(
+                "Construction Residual ($M)", f"${_const_res:.2f}M",
+                help=(
+                    f"{_rem_frac*100:.0f}% of construction cost (incl. contingency) remaining "
+                    f"after {eval_period}-yr evaluation period "
+                    f"(asset life {_life} yr). "
+                    "Formula: cost × max(0, (asset_life − eval_period) / asset_life)."
+                ),
+            )
+            _rc3.metric(
+                "Auto Residual ($M)" + (" — OVERRIDDEN" if _override else ""),
+                f"${_auto_res:.2f}M",
+                help=(
+                    "Sum of land + construction residuals. "
+                    "Planning/design has no residual value (professional services). "
+                    "Overridden if Manual Residual Override below is > $0."
+                ),
             )
 
             st.markdown("**Recurrent Costs ($M/year)**")
@@ -592,8 +645,15 @@ def render_cost_entry() -> None:
             )
 
             cd["residual"] = st.number_input(
-                "Residual Value ($M, at end of evaluation period)", min_value=0.0,
+                "Manual Residual Override ($M)",
+                min_value=0.0,
                 value=float(cd["residual"]), step=0.1, key=f"cost_residual_{i}",
+                help=(
+                    "Leave at $0 to use the auto-calculated residual shown above. "
+                    "Enter a value > $0 to override the auto-calculation entirely. "
+                    "Source: TfNSW CBA Guidelines — residual value = "
+                    "(remaining asset life / total asset life) × capital cost."
+                ),
             )
 
             st.markdown("**Active Transport — Incremental Health Benefits**")
@@ -945,7 +1005,18 @@ def calculate_matrix(
     total_capital = raw_cap * (1 + cost["contingency_pct"] / 100)
     annual_capital = total_capital / const_years if const_years > 0 else 0.0
     opex = cost["opex_maint"] + cost["opex_op"]
-    residual = cost["residual"]
+    # Residual value: straight-line depreciation per ATAP T2 / TfNSW CBA Guidelines.
+    # Land: full value retained (perpetual, no depreciation).
+    # Construction (incl. contingency): depreciated proportionally over construction_asset_life.
+    # Planning/design: no residual (professional services, no physical asset).
+    # Manual override: cost["residual"] > 0 takes precedence over auto-calculation.
+    _const_life = cost.get("construction_asset_life", 40)
+    _remaining_frac = (
+        max(0.0, (_const_life - eval_period) / _const_life) if _const_life > 0 else 0.0
+    )
+    _cap_construction_with_cont = cost["cap_construction"] * (1 + cost["contingency_pct"] / 100)
+    _auto_residual = cost["cap_land"] + _cap_construction_with_cont * _remaining_frac
+    residual = cost["residual"] if cost.get("residual", 0.0) > 0.0 else _auto_residual
 
     modelling_years = base_traffic["years"]
     total_years = const_years + eval_period
@@ -1970,7 +2041,7 @@ with tab_datainput:
             "Per project case. Base Case has no project costs. Construction cost is spread "
             "evenly over the construction period defined in Project Details (sidebar)."
         )
-        render_cost_entry()
+        render_cost_entry(eval_period=eval_period)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
