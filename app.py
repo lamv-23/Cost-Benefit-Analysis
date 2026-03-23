@@ -78,6 +78,12 @@ PARAMS = {
         "HCV": 0.198,
         "Bus": 0.167,
     },
+    # Proportion of blended safety_vkt rate attributable to each crash severity class.
+    # Used to isolate the fatal component for VSL sensitivity testing.
+    # Source: TfNSW EPV Jan 2025 crash unit costs × NSW crash rate distribution.
+    "safety_severity_share": {
+        "fatal": 0.36, "serious": 0.30, "minor": 0.20, "pdo": 0.14,
+    },
     "vsl": 8_100_000,
     # Carbon shadow price used as the basis for emission_cost values below.
     # Source: TfNSW EPV Jan 2025 (June 2024 prices): $123/tCO₂e.
@@ -97,6 +103,7 @@ PARAMS = {
     },
     "health_benefits": {"walking": 3.17, "cycling": 1.60},
     "reliability_ratio": 0.9,
+    "reliability_ratio_freight": 0.6,  # LCV/HCV — lower than passenger per TfNSW EPV
     "working_days_per_year": 253,
     "days_per_year": 365,
     "traffic_composition": {
@@ -235,6 +242,10 @@ def make_cost_data(n_project_cases: int = 1) -> dict:
     template = {
         "cap_planning": 0.0, "cap_land": 0.0, "cap_construction": 0.0,
         "contingency_pct": 0.0, "opex_maint": 0.0, "opex_op": 0.0, "residual": 0.0,
+        "construction_disbenefit_annual": 0.0,
+        "construction_asset_life": 40,   # years; drives auto-calculated residual value
+        "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
+        "pavement_saving_annual": 0.0,
     }
     return {f"project_{i}": dict(template) for i in range(1, n_project_cases + 1)}
 
@@ -305,7 +316,11 @@ def _load_sample_data() -> None:
             "contingency_pct": 10.0,
             "opex_maint": 1.2,
             "opex_op": 0.0,
-            "residual": 8.0,
+            "residual": 0.0,                  # 0 = use auto-calculated residual
+            "construction_disbenefit_annual": 0.0,
+            "construction_asset_life": 40,
+            "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
+            "pavement_saving_annual": 0.0,
         }
     }
 
@@ -507,12 +522,16 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
 # COST ENTRY UI HELPER — Step 5
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_cost_entry() -> None:
+def render_cost_entry(eval_period: int = 30) -> None:
     """Render cost input forms per project case (Step 5).
 
     One expandable section per project case with capital costs (planning, land,
     construction, contingency %), recurrent costs (maintenance, operating), and
     residual value.  Updates ``st.session_state.cost_data`` in-place.
+
+    Args:
+        eval_period: Operational evaluation period in years (from sidebar).
+                     Used to compute auto-calculated residual value.
     """
     n = st.session_state.n_project_cases
     for i in range(1, n + 1):
@@ -530,6 +549,20 @@ def render_cost_entry() -> None:
                 cd["cap_construction"] = st.number_input(
                     "Construction ($M)", min_value=0.0,
                     value=float(cd["cap_construction"]), step=1.0, key=f"cost_construction_{i}",
+                )
+                cd["construction_asset_life"] = st.number_input(
+                    "Construction Asset Life (years)",
+                    min_value=1, max_value=200,
+                    value=int(cd.get("construction_asset_life", 40)),
+                    step=5, key=f"cost_asset_life_{i}",
+                    help=(
+                        "Useful life of the constructed asset — used to auto-calculate residual "
+                        "value at end of evaluation period (straight-line depreciation). "
+                        "Typical values: sealed rural road 40–60 yr · urban arterial 30–50 yr · "
+                        "bridge/major structure 80–100 yr · flexible pavement 25–35 yr · "
+                        "unsealed road 15–20 yr · ITS/signals 15–25 yr. "
+                        "Land acquisition always retains full value regardless of this setting."
+                    ),
                 )
             with c2:
                 cd["cap_land"] = st.number_input(
@@ -550,6 +583,39 @@ def render_cost_entry() -> None:
                 f"${total_cap:.2f}M",
             )
 
+            # ── Auto-calculated Residual Value ───────────────────────────────
+            _life = int(cd.get("construction_asset_life", 40))
+            _rem_frac = max(0.0, (_life - eval_period) / _life) if _life > 0 else 0.0
+            _const_with_cont = cd["cap_construction"] * (1 + cd["contingency_pct"] / 100)
+            _land_res = cd["cap_land"]
+            _const_res = _const_with_cont * _rem_frac
+            _auto_res = _land_res + _const_res
+            _override = cd.get("residual", 0.0) > 0.0
+            st.markdown("**Residual Value (auto-calculated)**")
+            _rc1, _rc2, _rc3 = st.columns(3)
+            _rc1.metric(
+                "Land Residual ($M)", f"${_land_res:.2f}M",
+                help="Land acquisition retains full value (no depreciation).",
+            )
+            _rc2.metric(
+                "Construction Residual ($M)", f"${_const_res:.2f}M",
+                help=(
+                    f"{_rem_frac*100:.0f}% of construction cost (incl. contingency) remaining "
+                    f"after {eval_period}-yr evaluation period "
+                    f"(asset life {_life} yr). "
+                    "Formula: cost × max(0, (asset_life − eval_period) / asset_life)."
+                ),
+            )
+            _rc3.metric(
+                "Auto Residual ($M)" + (" — OVERRIDDEN" if _override else ""),
+                f"${_auto_res:.2f}M",
+                help=(
+                    "Sum of land + construction residuals. "
+                    "Planning/design has no residual value (professional services). "
+                    "Overridden if Manual Residual Override below is > $0."
+                ),
+            )
+
             st.markdown("**Recurrent Costs ($M/year)**")
             r1, r2 = st.columns(2)
             with r1:
@@ -563,10 +629,74 @@ def render_cost_entry() -> None:
                     value=float(cd["opex_op"]), step=0.1, key=f"cost_op_{i}",
                 )
 
-            cd["residual"] = st.number_input(
-                "Residual Value ($M, at end of evaluation period)", min_value=0.0,
-                value=float(cd["residual"]), step=0.1, key=f"cost_residual_{i}",
+            st.markdown("**Construction-Phase Disbenefits ($M/year)**")
+            cd["construction_disbenefit_annual"] = st.number_input(
+                "Traffic Disruption During Construction ($M/yr)",
+                min_value=0.0,
+                value=float(cd.get("construction_disbenefit_annual", 0.0)),
+                step=0.1,
+                key=f"cost_const_disb_{i}",
+                help=(
+                    "Annual road-user delay cost during construction (e.g. detour travel time, "
+                    "VOC on diversion routes). Applied each year of the construction period and "
+                    "added to project costs. Source: TfNSW CBA Guidelines — model delays using "
+                    "affected AADT × detour delay × VTTS, or use a lump-sum estimate."
+                ),
             )
+
+            cd["residual"] = st.number_input(
+                "Manual Residual Override ($M)",
+                min_value=0.0,
+                value=float(cd["residual"]), step=0.1, key=f"cost_residual_{i}",
+                help=(
+                    "Leave at $0 to use the auto-calculated residual shown above. "
+                    "Enter a value > $0 to override the auto-calculation entirely. "
+                    "Source: TfNSW CBA Guidelines — residual value = "
+                    "(remaining asset life / total asset life) × capital cost."
+                ),
+            )
+
+            st.markdown("**Active Transport — Incremental Health Benefits**")
+            at1, at2 = st.columns(2)
+            with at1:
+                cd["walk_pkm_day"] = st.number_input(
+                    "Incremental Walking (person-km/day)", min_value=0.0,
+                    value=float(cd.get("walk_pkm_day", 0.0)), step=1.0,
+                    key=f"cost_walk_{i}",
+                    help=(
+                        "New walking person-km/day generated by this project vs. base case "
+                        "(e.g. new footpaths, bridge crossings). "
+                        "Benefit = person-km/day × $3.17/person-km × 365. "
+                        "Source: TfNSW EPV Jan 2025, Table 18."
+                    ),
+                )
+            with at2:
+                cd["cycle_pkm_day"] = st.number_input(
+                    "Incremental Cycling (person-km/day)", min_value=0.0,
+                    value=float(cd.get("cycle_pkm_day", 0.0)), step=1.0,
+                    key=f"cost_cycle_{i}",
+                    help=(
+                        "New cycling person-km/day generated by this project vs. base case "
+                        "(e.g. new shared paths, separated lanes). "
+                        "Benefit = person-km/day × $1.60/person-km × 365. "
+                        "Source: TfNSW EPV Jan 2025, Table 18."
+                    ),
+                )
+
+            st.markdown("**Pavement Maintenance Savings ($M/year)**")
+            cd["pavement_saving_annual"] = st.number_input(
+                "Road Authority Maintenance Saving ($M/yr)", min_value=0.0,
+                value=float(cd.get("pavement_saving_annual", 0.0)), step=0.1,
+                key=f"cost_pavement_{i}",
+                help=(
+                    "Avoided road authority pavement maintenance cost during the operational "
+                    "period (e.g. reduced resurfacing on routes that lose heavy freight traffic, "
+                    "or longer pavement life on a new alignment). Applied as a benefit from "
+                    "first operational year. Source: TfNSW CBA Guidelines — pavement "
+                    "deterioration modelling or agency-supplied unit cost rates."
+                ),
+            )
+
             st.session_state.cost_data[case_key] = cd
 
 
@@ -943,15 +1073,27 @@ def calculate_matrix(
     total_capital = raw_cap * (1 + cost["contingency_pct"] / 100)
     annual_capital = total_capital / const_years if const_years > 0 else 0.0
     opex = cost["opex_maint"] + cost["opex_op"]
-    residual = cost["residual"]
+    # Residual value: straight-line depreciation per ATAP T2 / TfNSW CBA Guidelines.
+    # Land: full value retained (perpetual, no depreciation).
+    # Construction (incl. contingency): depreciated proportionally over construction_asset_life.
+    # Planning/design: no residual (professional services, no physical asset).
+    # Manual override: cost["residual"] > 0 takes precedence over auto-calculation.
+    _const_life = cost.get("construction_asset_life", 40)
+    _remaining_frac = (
+        max(0.0, (_const_life - eval_period) / _const_life) if _const_life > 0 else 0.0
+    )
+    _cap_construction_with_cont = cost["cap_construction"] * (1 + cost["contingency_pct"] / 100)
+    _auto_residual = cost["cap_land"] + _cap_construction_with_cont * _remaining_frac
+    residual = cost["residual"] if cost.get("residual", 0.0) > 0.0 else _auto_residual
 
     modelling_years = base_traffic["years"]
     total_years = const_years + eval_period
 
     annual_costs: list = []
     annual_benefits: list = []
-    annual_env_emit: list = []   # emission_cost component only (used for carbon sensitivity)
-    benefits_by_type: dict = {k: [] for k in ("tts", "tts_Car", "tts_LCV", "tts_HCV", "tts_Bus", "reliability", "voc", "safety", "env", "active")}
+    annual_env_emit: list = []       # emission_cost component only (used for carbon sensitivity)
+    annual_safety_fatal: list = []   # fatal component of safety benefit (used for VSL sensitivity)
+    benefits_by_type: dict = {k: [] for k in ("tts", "tts_Car", "tts_LCV", "tts_HCV", "tts_Bus", "reliability", "voc", "safety", "env", "active", "pavement")}
     annual_net: list = []
     disc_costs: list = []
     disc_benefits: list = []
@@ -974,11 +1116,12 @@ def calculate_matrix(
         # Clamp traffic eval year to last modelling year when zero-growth is selected
         ey = min(eval_year, modelling_years[-1]) if zero_growth_after_last_year else eval_year
         cost_y = 0.0
-        b_tts = b_rel = b_voc = b_safety = b_env = b_env_emit = b_active = 0.0
+        b_tts = b_rel = b_voc = b_safety = b_env = b_env_emit = b_active = b_pavement = 0.0
+        b_safety_fatal = 0.0
         b_tts_by_vt: dict = {vt: 0.0 for vt in VTYPES}
 
         if y < const_years:
-            cost_y = annual_capital
+            cost_y = annual_capital + cost.get("construction_disbenefit_annual", 0.0)
         else:
             cost_y = opex
 
@@ -995,12 +1138,17 @@ def calculate_matrix(
                 b_tts_by_vt[vt] = vt_tts
                 b_tts += vt_tts
 
-            # Reliability benefit: TTS × reliability_ratio × 0.3.
+            # Reliability benefit: per-vehicle-type TTS × reliability_ratio × 0.3.
             # The 0.3 (30%) is the Austroads / TfNSW standard apportionment of
-            # travel-time savings attributable to reliability improvement
-            # (i.e. not all VHT savings are also reliability savings).
-            # reliability_ratio (default 0.9) is the relative VTTS for reliability.
-            b_rel = b_tts * _p["reliability_ratio"] * 0.3
+            # travel-time savings attributable to reliability improvement.
+            # Passenger (Car, Bus): reliability_ratio (default 0.9, relative VTTS for reliability).
+            # Freight (LCV, HCV): reliability_ratio_freight (default 0.6) — lower per TfNSW EPV,
+            # reflecting that freight scheduling has less sensitivity to travel time variability.
+            b_rel = 0.0
+            for vt in VTYPES:
+                _rr = (_p["reliability_ratio_freight"] if vt in ("LCV", "HCV")
+                       else _p["reliability_ratio"])
+                b_rel += b_tts_by_vt[vt] * _rr * 0.3
 
             # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
             for vt in VTYPES:
@@ -1032,6 +1180,8 @@ def calculate_matrix(
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
                 b_safety += (vkt_b * _sv_base[vt] - vkt_p * _sv_proj[vt]) * ann_factors[vt] / 1e6
+            # Fatal component: used for VSL sensitivity (scales this share ±, rest held fixed).
+            b_safety_fatal = b_safety * _p["safety_severity_share"]["fatal"]
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
             for vt in VTYPES:
@@ -1047,7 +1197,20 @@ def calculate_matrix(
                 b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
                 b_env_emit += vkt_delta * emit_rate / 1e6
 
-        benefit_y = b_tts + b_rel + b_voc + b_safety + b_env + b_active
+            # ── Active Transport: incremental walking/cycling health benefits ─
+            # Inputs are steady-state incremental person-km/day (project − base).
+            # Formula mirrors cba-engine.js: pkm_day × $/person-km × 365.
+            _walk = cost.get("walk_pkm_day", 0.0)
+            _cycle = cost.get("cycle_pkm_day", 0.0)
+            b_active = (
+                _walk * _p["health_benefits"]["walking"]
+                + _cycle * _p["health_benefits"]["cycling"]
+            ) * 365 / 1e6
+
+            # ── Pavement Maintenance Savings: road authority avoided cost ─────
+            b_pavement = cost.get("pavement_saving_annual", 0.0)
+
+        benefit_y = b_tts + b_rel + b_voc + b_safety + b_env + b_active + b_pavement
         if y == total_years - 1:
             benefit_y += residual
 
@@ -1055,8 +1218,11 @@ def calculate_matrix(
         annual_costs.append(cost_y)
         annual_benefits.append(benefit_y)
         annual_env_emit.append(b_env_emit)
-        for k, v in zip(("tts", "reliability", "voc", "safety", "env", "active"),
-                        (b_tts, b_rel, b_voc, b_safety, b_env, b_active)):
+        annual_safety_fatal.append(b_safety_fatal)
+        for k, v in zip(
+            ("tts", "reliability", "voc", "safety", "env", "active", "pavement"),
+            (b_tts, b_rel, b_voc, b_safety, b_env, b_active, b_pavement),
+        ):
             benefits_by_type[k].append(v)
         for vt in VTYPES:
             benefits_by_type[f"tts_{vt}"].append(b_tts_by_vt[vt])
@@ -1122,6 +1288,30 @@ def calculate_matrix(
             "carbon_price": round(_base_carbon * _factor, 2),
         }
 
+    # VSL sensitivity: scale only the fatal crash cost component of safety benefits.
+    # Fatal share (default 36%) of the blended safety_vkt rate is isolated in annual_safety_fatal.
+    # Other severity classes (serious, minor, PDO) are held at base values.
+    # Source: TfNSW EPV Jan 2025 VSL = $8.1M; sensitivity range per ATAP T2.
+    _base_vsl_m = PARAMS["vsl"] / 1e6  # 8.1 ($M)
+    sensitivity_vsl = {}
+    for _label, _factor in [
+        ("Low (0.7×, $5.7M)", 0.7),
+        ("Central ($8.1M)", 1.0),
+        ("High (1.3×, $10.5M)", 1.3),
+        ("Very High (2.0×, $16.2M)", 2.0),
+    ]:
+        s_pvb = sum(
+            (annual_benefits[y] + annual_safety_fatal[y] * (_factor - 1.0))
+            * discount_factor(dr, base_offset + y)
+            for y in range(total_years)
+        )
+        sensitivity_vsl[_label] = {
+            "pvb": s_pvb, "pvc": pv_costs,
+            "npv": s_pvb - pv_costs,
+            "bcr": s_pvb / pv_costs if pv_costs > 0 else 0.0,
+            "vsl": round(_base_vsl_m * _factor, 2),
+        }
+
     switching = {}
     if pv_benefits > 0 and pv_costs > 0:
         switching["Total Benefits"] = -((pv_benefits - pv_costs) / pv_benefits) * 100
@@ -1179,6 +1369,7 @@ def calculate_matrix(
         "cum_disc_net": cum_disc_net,
         "pv_by_type": pv_by_type, "sensitivity_dr": sensitivity_dr,
         "sensitivity_carbon": sensitivity_carbon,
+        "sensitivity_vsl": sensitivity_vsl,
         "switching": switching, "scenarios": scenarios,
         "const_years": const_years, "eval_period": eval_period,
         "total_years": total_years, "dr": dr,
@@ -1221,6 +1412,183 @@ def calculate_all_cases(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MONTE CARLO SIMULATION — Step 8b
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_monte_carlo(
+    case_key: str,
+    inputs: dict,
+    traffic_data: dict,
+    cost_data: dict,
+    annualisation: dict,
+    safety_vkt_data: dict = None,
+    params: dict = None,
+    n_simulations: int = 1000,
+    seed: int = 42,
+    vtts_cv: float = 0.20,
+    safety_cv: float = 0.30,
+    traffic_cv: float = 0.15,
+    cost_overrun_min: float = 1.0,
+    cost_overrun_mode: float = 1.10,
+    cost_overrun_max: float = 1.40,
+) -> dict:
+    """Run Monte Carlo simulation for a single project case.
+
+    Each iteration independently samples:
+      - VTTS (all contexts/vehicle types): Normal(1, vtts_cv)
+      - Safety $/VKT: Lognormal with sigma = safety_cv
+      - Traffic VHT/VKT (base and project): Normal(1, traffic_cv), clamped > 0
+      - Capital construction cost: Triangular(min, mode, max)
+
+    Args:
+        case_key:          e.g. ``"project_1"``
+        inputs:            project config dict (same as calculate_matrix)
+        traffic_data:      full traffic_data dict (keyed by case)
+        cost_data:         full cost_data dict (keyed by case)
+        annualisation:     annualisation dict
+        safety_vkt_data:   optional per-case safety rates
+        params:            effective params (from build_effective_params())
+        n_simulations:     number of iterations
+        seed:              RNG seed for reproducibility
+        vtts_cv:           coefficient of variation for VTTS sampling
+        safety_cv:         CV for safety cost sampling (lognormal sigma)
+        traffic_cv:        CV for traffic volume sampling
+        cost_overrun_min/mode/max: triangular distribution bounds for capex factor
+
+    Returns:
+        dict with keys ``npv``, ``bcr`` (numpy arrays), percentile summaries,
+        ``prob_npv_positive``, and per-parameter sensitivity arrays for tornado.
+    """
+    import numpy as np
+    import copy
+
+    rng = np.random.default_rng(seed)
+    _p_base = params if params is not None else PARAMS
+
+    npv_arr = np.empty(n_simulations)
+    bcr_arr = np.empty(n_simulations)
+
+    # Pre-draw all random factors for speed
+    vtts_factors    = rng.normal(1.0, vtts_cv,     n_simulations).clip(0.01)
+    safety_sigmas   = np.sqrt(np.log(1 + safety_cv**2))
+    safety_means    = -0.5 * safety_sigmas**2
+    safety_factors  = rng.lognormal(safety_means, safety_sigmas, n_simulations)
+    traffic_factors = rng.normal(1.0, traffic_cv,  (n_simulations, 2)).clip(0.01)  # [base, proj]
+    cost_factors    = rng.triangular(cost_overrun_min, cost_overrun_mode, cost_overrun_max, n_simulations)
+
+    base_traffic_orig = traffic_data["base_case"]
+    proj_traffic_orig = traffic_data[case_key]
+    cost_orig         = cost_data[case_key]
+    sv_base_orig      = safety_vkt_data.get("base_case") if safety_vkt_data else None
+    sv_proj_orig      = safety_vkt_data.get(case_key)    if safety_vkt_data else None
+
+    for i in range(n_simulations):
+        # ── Perturb params ──────────────────────────────────────────────────
+        p = copy.deepcopy(_p_base)
+        for _ctx in ("urban", "rural"):
+            for _vt in VTYPES:
+                p["vtts"][_ctx][_vt] *= vtts_factors[i]
+
+        sf = safety_factors[i]
+        sv_base = {vt: (sv_base_orig[vt] if sv_base_orig else p["safety_vkt"][vt]) * sf for vt in VTYPES}
+        sv_proj = {vt: (sv_proj_orig[vt] if sv_proj_orig else p["safety_vkt"][vt]) * sf for vt in VTYPES}
+
+        # ── Perturb traffic (multiplicative, independent for base vs project) ─
+        f_base = traffic_factors[i, 0]
+        f_proj = traffic_factors[i, 1]
+
+        def _scale_traffic(orig: dict, factor: float) -> dict:
+            tc = copy.deepcopy(orig)
+            for vt in VTYPES:
+                for metric in ("vht", "vkt"):
+                    tc[vt][metric] = [v * factor for v in orig[vt][metric]]
+            return tc
+
+        base_traffic_s = _scale_traffic(base_traffic_orig, f_base)
+        proj_traffic_s = _scale_traffic(proj_traffic_orig, f_proj)
+
+        # ── Perturb construction cost ────────────────────────────────────────
+        cost_s = dict(cost_orig)
+        cost_s["cap_construction"] = cost_orig["cap_construction"] * cost_factors[i]
+
+        # ── Calculate ────────────────────────────────────────────────────────
+        result = calculate_matrix(
+            inputs=inputs,
+            base_traffic=base_traffic_s,
+            proj_traffic=proj_traffic_s,
+            cost=cost_s,
+            annualisation=annualisation,
+            safety_vkt_base=sv_base,
+            safety_vkt_proj=sv_proj,
+            params=p,
+        )
+        npv_arr[i] = result["npv"]
+        bcr_arr[i] = result["bcr"]
+
+    p10_npv, p25_npv, p50_npv, p75_npv, p90_npv = np.percentile(npv_arr, [10, 25, 50, 75, 90])
+    p10_bcr, p25_bcr, p50_bcr, p75_bcr, p90_bcr = np.percentile(bcr_arr, [10, 25, 50, 75, 90])
+
+    # ── Tornado: one-at-a-time sensitivity around central values ────────────
+    # Each parameter held at its P10 / P90 while others stay at median (factor=1)
+    _central = calculate_matrix(
+        inputs=inputs,
+        base_traffic=base_traffic_orig,
+        proj_traffic=proj_traffic_orig,
+        cost=cost_orig,
+        annualisation=annualisation,
+        safety_vkt_base=sv_base_orig,
+        safety_vkt_proj=sv_proj_orig,
+        params=_p_base,
+    )
+    central_npv = _central["npv"]
+
+    def _npv_with(vtts_f=1.0, safety_f=1.0, traffic_base_f=1.0, traffic_proj_f=1.0, cost_f=1.0):
+        _p = copy.deepcopy(_p_base)
+        for _ctx in ("urban", "rural"):
+            for _vt in VTYPES:
+                _p["vtts"][_ctx][_vt] *= vtts_f
+        _sv_b = {vt: (_p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
+        _sv_p = {vt: (_p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
+        _bt = _scale_traffic(base_traffic_orig, traffic_base_f)
+        _pt = _scale_traffic(proj_traffic_orig, traffic_proj_f)
+        _c = dict(cost_orig)
+        _c["cap_construction"] = cost_orig["cap_construction"] * cost_f
+        return calculate_matrix(
+            inputs=inputs, base_traffic=_bt, proj_traffic=_pt,
+            cost=_c, annualisation=annualisation,
+            safety_vkt_base=_sv_b, safety_vkt_proj=_sv_p, params=_p,
+        )["npv"]
+
+    _vtts_p10_f   = float(np.percentile(vtts_factors, 10))
+    _vtts_p90_f   = float(np.percentile(vtts_factors, 90))
+    _safety_p10_f = float(np.percentile(safety_factors, 10))
+    _safety_p90_f = float(np.percentile(safety_factors, 90))
+    _traf_p10_f   = float(np.percentile(traffic_factors[:, 1], 10))
+    _traf_p90_f   = float(np.percentile(traffic_factors[:, 1], 90))
+    _cost_p10_f   = float(np.percentile(cost_factors, 10))
+    _cost_p90_f   = float(np.percentile(cost_factors, 90))
+
+    tornado = {
+        "VTTS":             (_npv_with(vtts_f=_vtts_p10_f),   _npv_with(vtts_f=_vtts_p90_f)),
+        "Safety cost/VKT":  (_npv_with(safety_f=_safety_p10_f), _npv_with(safety_f=_safety_p90_f)),
+        "Traffic volumes":  (_npv_with(traffic_proj_f=_traf_p10_f), _npv_with(traffic_proj_f=_traf_p90_f)),
+        "Capital cost":     (_npv_with(cost_f=_cost_p90_f),   _npv_with(cost_f=_cost_p10_f)),
+    }
+
+    return {
+        "npv": npv_arr,
+        "bcr": bcr_arr,
+        "n_simulations": n_simulations,
+        "central_npv": central_npv,
+        "npv_percentiles": {"p10": p10_npv, "p25": p25_npv, "p50": p50_npv, "p75": p75_npv, "p90": p90_npv},
+        "bcr_percentiles": {"p10": p10_bcr, "p25": p25_bcr, "p50": p50_bcr, "p75": p75_bcr, "p90": p90_bcr},
+        "prob_npv_positive": float((npv_arr > 0).mean()),
+        "prob_bcr_gt1":      float((bcr_arr > 1).mean()),
+        "tornado": tornado,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CSV EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1239,7 +1607,8 @@ def generate_csv(results: dict, project_name: str) -> str:
     w.writerow(["PV Benefits by Category"])
     labels = {"tts": "Travel Time Savings", "reliability": "Reliability",
               "voc": "Vehicle Operating Costs", "safety": "Safety",
-              "env": "Environmental", "active": "Active Transport"}
+              "env": "Environmental", "active": "Active Transport",
+              "pavement": "Pavement Maintenance Savings"}
     for k, lbl in labels.items():
         w.writerow([lbl, f"{r['pv_by_type'][k]:.2f}"])
     w.writerow([])
@@ -1338,6 +1707,8 @@ def build_effective_params() -> dict:
                 p["occupancy"][_ctx][_vt] = float(ss[_k])
     if "param_reliability_ratio" in ss:
         p["reliability_ratio"] = float(ss["param_reliability_ratio"])
+    if "param_reliability_ratio_freight" in ss:
+        p["reliability_ratio_freight"] = float(ss["param_reliability_ratio_freight"])
     for _vt in VTYPES:
         _k = f"param_safety_vkt_{_vt}"
         if _k in ss:
@@ -1446,6 +1817,7 @@ COLORS = {
     "safety": "#dc3545",
     "env": "#198754",
     "active": "#20c997",
+    "pavement": "#795548",
     "cost": "#6c757d",
     "positive": "#198754",
     "negative": "#dc3545",
@@ -1459,6 +1831,7 @@ TYPE_LABELS = {
     "safety": "Safety",
     "env": "Environmental",
     "active": "Active Transport",
+    "pavement": "Pavement Maintenance Savings",
 }
 
 
@@ -1949,7 +2322,7 @@ with tab_datainput:
             "Per project case. Base Case has no project costs. Construction cost is spread "
             "evenly over the construction period defined in Project Details (sidebar)."
         )
-        render_cost_entry()
+        render_cost_entry(eval_period=eval_period)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2425,14 +2798,142 @@ with tab_sensitivity:
     else:
         st.info("No carbon sensitivity data available.")
 
+    # --- Wider Economic Benefits (WEBs) Sensitivity ---
+    st.subheader("Wider Economic Benefits (WEBs) Sensitivity")
+    st.caption(
+        "WEBs represent productivity gains not captured in conventional transport benefits "
+        "(agglomeration, labour supply, imperfect competition). TfNSW and ATAP guidelines "
+        "treat WEBs as additive to PV Benefits — typically 10–20% of PV Travel Time Savings "
+        "for urban projects, lower for rural. They are reported separately and do not form "
+        "part of the primary BCR."
+    )
+    _pv_tts = _r_sens["pv_by_type"].get("tts", 0.0)
+    _pv_costs_sens = _r_sens["pv_costs"]
+    _pv_benefits_sens = _r_sens["pv_benefits"]
+
+    _web_scenarios = [
+        ("No WEBs (0%)", 0.0),
+        ("Low — Rural / minor road (5%)", 0.05),
+        ("Low-Medium — Regional road (10%)", 0.10),
+        ("Medium — Urban arterial (15%)", 0.15),
+        ("High — Urban strategic corridor (20%)", 0.20),
+        ("Very High — Major urban CBD access (30%)", 0.30),
+    ]
+    _web_rows = []
+    for _wlabel, _wfactor in _web_scenarios:
+        _web_pvb_add = _pv_tts * _wfactor
+        _adj_pvb = _pv_benefits_sens + _web_pvb_add
+        _adj_npv = _adj_pvb - _pv_costs_sens
+        _adj_bcr = _adj_pvb / _pv_costs_sens if _pv_costs_sens > 0 else 0.0
+        _web_rows.append({
+            "WEB Scenario": _wlabel,
+            "WEB Uplift ($M)": round(_web_pvb_add, 1),
+            "Adjusted PV Benefits ($M)": round(_adj_pvb, 1),
+            "Adjusted NPV ($M)": round(_adj_npv, 1),
+            "Adjusted BCR": round(_adj_bcr, 2),
+        })
+    _df_web = pd.DataFrame(_web_rows)
+
+    def _highlight_web(row):
+        styles = [""] * len(row)
+        if "No WEBs" in row["WEB Scenario"]:
+            styles = ["background-color: rgba(13, 110, 253, 0.08); font-weight: 700"] * len(row)
+        _bcr_idx = _df_web.columns.get_loc("Adjusted BCR")
+        if row["Adjusted BCR"] >= 1:
+            styles[_bcr_idx] += "; color: #198754; font-weight: 700"
+        else:
+            styles[_bcr_idx] += "; color: #dc3545; font-weight: 700"
+        return styles
+
+    _styled_web = _df_web.style.apply(_highlight_web, axis=1).format({
+        "WEB Uplift ($M)": "{:.1f}",
+        "Adjusted PV Benefits ($M)": "{:.1f}",
+        "Adjusted NPV ($M)": "{:.1f}",
+        "Adjusted BCR": "{:.2f}",
+    })
+    st.dataframe(_styled_web, use_container_width=True, hide_index=True)
+    st.caption(
+        "WEB uplift = WEB factor × PV Travel Time Savings. "
+        "Highlighted row = base case (no WEBs). "
+        "Source: TfNSW Infrastructure Investor Assurance Framework; ATAP T2 (2022) §6. "
+        "WEB factors are indicative — apply project-specific agglomeration analysis for "
+        "major submissions to Infrastructure NSW or NSW Treasury."
+    )
+
+    # --- VSL Sensitivity ---
+    st.subheader("Value of Statistical Life (VSL) Sensitivity")
+    st.caption(
+        "Scales only the fatal crash cost component of safety benefits "
+        f"({PARAMS['safety_severity_share']['fatal']*100:.0f}% of blended safety PV by default). "
+        "Serious injury, minor, and PDO components are held at base values. "
+        "Source: TfNSW EPV Jan 2025 — VSL = $8.1M (June 2024 prices)."
+    )
+    _vsl_sens = _r_sens.get("sensitivity_vsl", {})
+    if _vsl_sens:
+        _vsl_labels = list(_vsl_sens.keys())
+        _vsl_bcrs = [_vsl_sens[l]["bcr"] for l in _vsl_labels]
+        _vsl_fig = go.Figure()
+        _vsl_fig.add_trace(go.Bar(
+            x=_vsl_labels, y=_vsl_bcrs,
+            marker_color=COLORS["safety"],
+            text=[f"{v:.2f}" for v in _vsl_bcrs],
+            textposition="outside",
+        ))
+        _vsl_fig.add_hline(y=1.0, line_dash="dash", line_color="red",
+                           annotation_text="BCR = 1.0", annotation_position="top right")
+        _vsl_fig.update_layout(
+            yaxis_title="BCR", xaxis_title="VSL Scenario",
+            **PLOTLY_TRANSPARENT,
+            margin=dict(t=30, b=10), height=320,
+        )
+        st.plotly_chart(_vsl_fig, use_container_width=True)
+
+        _vsl_rows = []
+        for _lbl in _vsl_labels:
+            _vv = _vsl_sens[_lbl]
+            _vsl_rows.append({
+                "VSL Scenario": _lbl,
+                "VSL ($M)": _vv["vsl"],
+                "PV Benefits ($M)": round(_vv["pvb"], 1),
+                "NPV ($M)": round(_vv["npv"], 1),
+                "BCR": round(_vv["bcr"], 2),
+            })
+        _df_vsl = pd.DataFrame(_vsl_rows)
+
+        def _highlight_vsl(row):
+            styles = [""] * len(row)
+            if "Central" in row["VSL Scenario"]:
+                styles = ["background-color: rgba(220, 53, 69, 0.08); font-weight: 700"] * len(row)
+            _bcr_idx = _df_vsl.columns.get_loc("BCR")
+            if row["BCR"] >= 1:
+                styles[_bcr_idx] += "; color: #198754; font-weight: 700"
+            else:
+                styles[_bcr_idx] += "; color: #dc3545; font-weight: 700"
+            return styles
+
+        _styled_vsl = _df_vsl.style.apply(_highlight_vsl, axis=1).format({
+            "VSL ($M)": "{:.2f}",
+            "PV Benefits ($M)": "{:.1f}",
+            "NPV ($M)": "{:.1f}",
+            "BCR": "{:.2f}",
+        })
+        st.dataframe(_styled_vsl, use_container_width=True, hide_index=True)
+        st.caption(
+            "Highlighted row = Central (base case) VSL. "
+            "Only the fatal component of safety benefits is scaled; other severity classes are unchanged. "
+            "Source: TfNSW EPV Jan 2025; ATAP T2 (2022) recommends ±30% VSL sensitivity."
+        )
+    else:
+        st.info("No VSL sensitivity data available.")
+
     # --- First-Year Benefit Breakdown ---
     st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
     fy = _r_sens["first_year"]
-    fy_cols = st.columns(7)
+    fy_cols = st.columns(8)
     for i, (key, label) in enumerate(TYPE_LABELS.items()):
         with fy_cols[i]:
             st.metric(label, f"${fy.get(key, 0.0):.2f}M")
-    with fy_cols[6]:
+    with fy_cols[7]:
         st.metric("Total", f"${fy.get('total', 0.0):.2f}M")
 
     # --- Monte Carlo Risk Analysis (advanced only) ---
@@ -2631,11 +3132,19 @@ with tab_params:
     # ── Reliability Ratio ────────────────────────────────────────────────────
     with st.expander("Reliability Ratio"):
         param_editor(
-            label="Reliability Ratio (of VTTS)",
+            label="Passenger Reliability Ratio — Car / Bus (of VTTS)",
             key="param_reliability_ratio",
             default=PARAMS["reliability_ratio"],
             min_val=0.0, max_val=2.0, step=0.05,
             unit="ratio", source="TfNSW EPV Jan 2025, §4.3",
+        )
+        param_editor(
+            label="Freight Reliability Ratio — LCV / HCV (of VTTS)",
+            key="param_reliability_ratio_freight",
+            default=PARAMS["reliability_ratio_freight"],
+            min_val=0.0, max_val=2.0, step=0.05,
+            unit="ratio",
+            source="TfNSW EPV Jan 2025 — freight travel-time variability has lower relative VTTS than passenger",
         )
 
     # ── Safety Cost ($/VKT) ───────────────────────────────────────────────────
@@ -2650,6 +3159,20 @@ with tab_params:
                 min_val=0.0, max_val=5.0, step=0.001,
                 unit="$/VKT", source="Agency default",
             )
+        st.markdown("**Crash Severity Shares** *(informational — used for VSL sensitivity only)*")
+        _sev = PARAMS["safety_severity_share"]
+        _sev_cols = st.columns(4)
+        for _col, (_sev_key, _sev_label) in zip(
+            _sev_cols,
+            [("fatal", "Fatal"), ("serious", "Serious Injury"),
+             ("minor", "Minor Injury"), ("pdo", "PDO")],
+        ):
+            _col.metric(_sev_label, f"{_sev[_sev_key]*100:.0f}%")
+        st.caption(
+            "These proportions decompose the blended $/VKT safety rate by crash severity class. "
+            "They do not affect the core safety benefit — only the VSL sensitivity table in the "
+            "Sensitivity tab. Source: TfNSW EPV Jan 2025 crash unit costs × NSW crash rate distribution."
+        )
 
     # ── Emission Costs (CO₂) ─────────────────────────────────────────────────
     with st.expander("Emission Costs — CO₂ ($/veh-km)"):
