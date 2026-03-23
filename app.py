@@ -219,6 +219,85 @@ def make_cost_data(n_project_cases: int = 1) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SAMPLE DATA LOADER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_sample_data() -> None:
+    """Pre-populate session state with a representative rural road upgrade scenario.
+
+    Scenario: 2-lane rural highway bypass, Car-dominant with moderate HCV freight.
+    Base case = existing alignment; Project 1 = new bypass with higher speeds.
+    All values are illustrative only (not based on any real project).
+    """
+    years = [2026, 2031, 2041, 2056]
+    st.session_state["modelling_years"] = years
+    st.session_state["n_project_cases"] = 1
+
+    td = make_traffic_data(years, 1)
+
+    # ── Base Case ──────────────────────────────────────────────────────────
+    bc = td["base_case"]
+    bc["Car"]  = {"vht": [1200.0, 1350.0, 1550.0, 1800.0],
+                  "vkt": [85000.0, 96000.0, 110000.0, 128000.0],
+                  "stops": [180.0, 200.0, 225.0, 260.0],
+                  "demand": [8500.0, 9600.0, 11000.0, 12800.0]}
+    bc["LCV"]  = {"vht": [95.0, 107.0, 123.0, 143.0],
+                  "vkt": [7200.0, 8100.0, 9300.0, 10800.0],
+                  "stops": [12.0, 14.0, 16.0, 19.0],
+                  "demand": [720.0, 810.0, 930.0, 1080.0]}
+    bc["HCV"]  = {"vht": [120.0, 135.0, 155.0, 180.0],
+                  "vkt": [9500.0, 10700.0, 12300.0, 14300.0],
+                  "stops": [8.0, 9.0, 10.0, 12.0],
+                  "demand": [480.0, 540.0, 620.0, 720.0]}
+    bc["Bus"]  = {"vht": [18.0, 20.0, 23.0, 27.0],
+                  "vkt": [1400.0, 1580.0, 1810.0, 2110.0],
+                  "stops": [90.0, 100.0, 115.0, 133.0],
+                  "demand": [1200.0, 1350.0, 1550.0, 1800.0]}
+
+    # ── Project 1 (bypass: faster, longer route — higher VKT, lower VHT) ──
+    p1 = td["project_1"]
+    p1["Car"]  = {"vht": [1050.0, 1180.0, 1360.0, 1580.0],
+                  "vkt": [88000.0, 99000.0, 114000.0, 133000.0],
+                  "stops": [40.0, 45.0, 52.0, 60.0],
+                  "demand": [8800.0, 9900.0, 11400.0, 13300.0]}
+    p1["LCV"]  = {"vht": [82.0, 93.0, 107.0, 124.0],
+                  "vkt": [7400.0, 8300.0, 9600.0, 11100.0],
+                  "stops": [3.0, 3.0, 4.0, 4.0],
+                  "demand": [740.0, 830.0, 960.0, 1110.0]}
+    p1["HCV"]  = {"vht": [105.0, 118.0, 135.0, 157.0],
+                  "vkt": [9800.0, 11100.0, 12700.0, 14800.0],
+                  "stops": [2.0, 2.0, 2.0, 3.0],
+                  "demand": [490.0, 555.0, 635.0, 740.0]}
+    p1["Bus"]  = {"vht": [16.0, 18.0, 21.0, 24.0],
+                  "vkt": [1450.0, 1630.0, 1870.0, 2180.0],
+                  "stops": [20.0, 22.0, 26.0, 30.0],
+                  "demand": [1240.0, 1390.0, 1600.0, 1860.0]}
+
+    st.session_state["traffic_data"] = td
+
+    # ── Costs (Project 1) ──────────────────────────────────────────────────
+    st.session_state["cost_data"] = {
+        "project_1": {
+            "cap_planning": 3.0,
+            "cap_land": 6.5,
+            "cap_construction": 48.0,
+            "contingency_pct": 10.0,
+            "opex_maint": 1.2,
+            "opex_op": 0.0,
+            "residual": 8.0,
+        }
+    }
+
+    # ── Safety rates — keep defaults from PARAMS ───────────────────────────
+    _case_keys = ["base_case", "project_1"]
+    st.session_state["safety_vkt_data"] = {
+        ck: dict(PARAMS["safety_vkt"]) for ck in _case_keys
+    }
+
+    st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1312,6 +1391,14 @@ _init_session_state()
 with st.sidebar:
     st.markdown("## Transport CBA")
     st.caption("TfNSW Economic Parameter Values (Jan 2025) · June 2024 prices")
+
+    # ── Quick Start ───────────────────────────────────────────────────────────
+    with st.expander("Quick Start", expanded=True):
+        st.caption("Load a sample rural bypass scenario to explore the dashboard without entering data manually.")
+        if st.button("Load Sample Data", use_container_width=True):
+            _load_sample_data()
+
+    st.divider()
 
     # ── Matrix Input Configuration (Step 2) ──────────────────────────────────
     st.markdown("### Modelling Configuration")
