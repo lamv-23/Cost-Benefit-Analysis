@@ -235,6 +235,7 @@ def make_cost_data(n_project_cases: int = 1) -> dict:
     template = {
         "cap_planning": 0.0, "cap_land": 0.0, "cap_construction": 0.0,
         "contingency_pct": 0.0, "opex_maint": 0.0, "opex_op": 0.0, "residual": 0.0,
+        "construction_disbenefit_annual": 0.0,
     }
     return {f"project_{i}": dict(template) for i in range(1, n_project_cases + 1)}
 
@@ -306,6 +307,7 @@ def _load_sample_data() -> None:
             "opex_maint": 1.2,
             "opex_op": 0.0,
             "residual": 8.0,
+            "construction_disbenefit_annual": 0.0,
         }
     }
 
@@ -562,6 +564,21 @@ def render_cost_entry() -> None:
                     "Operating ($M/yr)", min_value=0.0,
                     value=float(cd["opex_op"]), step=0.1, key=f"cost_op_{i}",
                 )
+
+            st.markdown("**Construction-Phase Disbenefits ($M/year)**")
+            cd["construction_disbenefit_annual"] = st.number_input(
+                "Traffic Disruption During Construction ($M/yr)",
+                min_value=0.0,
+                value=float(cd.get("construction_disbenefit_annual", 0.0)),
+                step=0.1,
+                key=f"cost_const_disb_{i}",
+                help=(
+                    "Annual road-user delay cost during construction (e.g. detour travel time, "
+                    "VOC on diversion routes). Applied each year of the construction period and "
+                    "added to project costs. Source: TfNSW CBA Guidelines — model delays using "
+                    "affected AADT × detour delay × VTTS, or use a lump-sum estimate."
+                ),
+            )
 
             cd["residual"] = st.number_input(
                 "Residual Value ($M, at end of evaluation period)", min_value=0.0,
@@ -910,7 +927,7 @@ def calculate_matrix(
         b_tts_by_vt: dict = {vt: 0.0 for vt in VTYPES}
 
         if y < const_years:
-            cost_y = annual_capital
+            cost_y = annual_capital + cost.get("construction_disbenefit_annual", 0.0)
         else:
             cost_y = opex
 
@@ -2282,6 +2299,68 @@ with tab_sensitivity:
         )
     else:
         st.info("No carbon sensitivity data available.")
+
+    # --- Wider Economic Benefits (WEBs) Sensitivity ---
+    st.subheader("Wider Economic Benefits (WEBs) Sensitivity")
+    st.caption(
+        "WEBs represent productivity gains not captured in conventional transport benefits "
+        "(agglomeration, labour supply, imperfect competition). TfNSW and ATAP guidelines "
+        "treat WEBs as additive to PV Benefits — typically 10–20% of PV Travel Time Savings "
+        "for urban projects, lower for rural. They are reported separately and do not form "
+        "part of the primary BCR."
+    )
+    _pv_tts = _r_sens["pv_by_type"].get("tts", 0.0)
+    _pv_costs_sens = _r_sens["pv_costs"]
+    _pv_benefits_sens = _r_sens["pv_benefits"]
+
+    _web_scenarios = [
+        ("No WEBs (0%)", 0.0),
+        ("Low — Rural / minor road (5%)", 0.05),
+        ("Low-Medium — Regional road (10%)", 0.10),
+        ("Medium — Urban arterial (15%)", 0.15),
+        ("High — Urban strategic corridor (20%)", 0.20),
+        ("Very High — Major urban CBD access (30%)", 0.30),
+    ]
+    _web_rows = []
+    for _wlabel, _wfactor in _web_scenarios:
+        _web_pvb_add = _pv_tts * _wfactor
+        _adj_pvb = _pv_benefits_sens + _web_pvb_add
+        _adj_npv = _adj_pvb - _pv_costs_sens
+        _adj_bcr = _adj_pvb / _pv_costs_sens if _pv_costs_sens > 0 else 0.0
+        _web_rows.append({
+            "WEB Scenario": _wlabel,
+            "WEB Uplift ($M)": round(_web_pvb_add, 1),
+            "Adjusted PV Benefits ($M)": round(_adj_pvb, 1),
+            "Adjusted NPV ($M)": round(_adj_npv, 1),
+            "Adjusted BCR": round(_adj_bcr, 2),
+        })
+    _df_web = pd.DataFrame(_web_rows)
+
+    def _highlight_web(row):
+        styles = [""] * len(row)
+        if "No WEBs" in row["WEB Scenario"]:
+            styles = ["background-color: rgba(13, 110, 253, 0.08); font-weight: 700"] * len(row)
+        _bcr_idx = _df_web.columns.get_loc("Adjusted BCR")
+        if row["Adjusted BCR"] >= 1:
+            styles[_bcr_idx] += "; color: #198754; font-weight: 700"
+        else:
+            styles[_bcr_idx] += "; color: #dc3545; font-weight: 700"
+        return styles
+
+    _styled_web = _df_web.style.apply(_highlight_web, axis=1).format({
+        "WEB Uplift ($M)": "{:.1f}",
+        "Adjusted PV Benefits ($M)": "{:.1f}",
+        "Adjusted NPV ($M)": "{:.1f}",
+        "Adjusted BCR": "{:.2f}",
+    })
+    st.dataframe(_styled_web, use_container_width=True, hide_index=True)
+    st.caption(
+        "WEB uplift = WEB factor × PV Travel Time Savings. "
+        "Highlighted row = base case (no WEBs). "
+        "Source: TfNSW Infrastructure Investor Assurance Framework; ATAP T2 (2022) §6. "
+        "WEB factors are indicative — apply project-specific agglomeration analysis for "
+        "major submissions to Infrastructure NSW or NSW Treasury."
+    )
 
     # --- First-Year Benefit Breakdown ---
     st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
