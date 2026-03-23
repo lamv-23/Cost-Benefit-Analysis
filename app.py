@@ -1596,8 +1596,8 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 # TABBED LAYOUT
 # ─────────────────────────────────────────────────────────────────────────────
-tab_datainput, tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
-    ["Data Input", "Dashboard", "Detailed Cashflow", "Sensitivity", "Parameters"]
+tab_datainput, tab_dash, tab_cashflow, tab_sensitivity, tab_params, tab_about = st.tabs(
+    ["Data Input", "Dashboard", "Detailed Cashflow", "Sensitivity", "Parameters", "About"]
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2275,6 +2275,211 @@ with tab_params:
                 "Articulated Truck": PARAMS["voc"]["rural"]["artic"].get(s, "–"),
             })
         st.dataframe(pd.DataFrame(voc_rows_r), hide_index=True, use_container_width=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 5: ABOUT
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_about:
+    st.markdown("## About This Tool")
+    st.markdown(
+        "This dashboard helps CBA practitioners and business case writers in NSW "
+        "assess the economic viability of transport infrastructure projects. "
+        "It implements the **TfNSW Economic Parameter Values (January 2025, June 2024 prices)** "
+        "framework and produces the standard outputs required for NSW Government business cases: "
+        "Net Present Value (NPV), Benefit–Cost Ratio (BCR), and sensitivity analysis."
+    )
+
+    st.divider()
+
+    # ── What the model calculates ────────────────────────────────────────────
+    st.markdown("### What the Model Calculates")
+    st.markdown(
+        "The tool compares a **Base Case** (do-minimum, typically the existing network) "
+        "against up to five **Project Cases** (proposed interventions). "
+        "All benefits are *incremental* — the difference between each project case and the base case. "
+        "Costs and benefits are discounted to a common base year, summed over the appraisal period, "
+        "and expressed as:"
+    )
+    col_npv, col_bcr, col_pv = st.columns(3)
+    with col_npv:
+        st.info("**Net Present Value (NPV)**\nPV Benefits minus PV Costs. Positive NPV indicates the project returns more to society than it costs.")
+    with col_bcr:
+        st.info("**Benefit–Cost Ratio (BCR)**\nPV Benefits ÷ PV Costs. A BCR above 1.0 means benefits exceed costs. NSW Treasury typically requires BCR ≥ 1.5 for strong cases.")
+    with col_pv:
+        st.info("**Present Value of Benefits by Type**\nBreaks the total benefit into its components so you can see which categories drive the result.")
+
+    st.divider()
+
+    # ── Benefit categories ───────────────────────────────────────────────────
+    st.markdown("### Benefit Categories")
+    st.markdown(
+        "The model quantifies five categories of economic benefit, all derived from changes in traffic "
+        "volumes, travel times, and speeds between the base case and each project case:"
+    )
+
+    benefit_rows = [
+        ("Travel Time Savings (TTS)", "tts", "blue",
+         "The most significant benefit in most road projects. "
+         "Calculated from the reduction in vehicle-hours travelled (VHT), multiplied by vehicle occupancy "
+         "and the Value of Travel Time Savings (VTTS) rate. "
+         "Car and Bus passengers use the personal travel rate (~$19.76/person-hr urban); "
+         "freight vehicles (LCV, HCV) use the business rate (~$54.87/person-hr urban). "
+         "Source: TfNSW EPV Table 3."),
+        ("Vehicle Operating Costs (VOC)", "voc", "orange",
+         "Savings in fuel, tyres, maintenance, and depreciation when a project changes vehicle speeds. "
+         "Rates depend on speed (km/h) and are interpolated from TfNSW lookup tables "
+         "(different tables for urban and rural contexts). "
+         "Faster travel on a new bypass, for example, typically reduces VOC per kilometre. "
+         "Source: TfNSW EPV Tables 5–8."),
+        ("Safety", "safety", "red",
+         "Reduction in crash costs when vehicle-kilometres travelled (VKT) change. "
+         "Rates are expressed in dollars per vehicle-kilometre by vehicle type "
+         "(e.g. Car: $0.153/veh-km). These already incorporate the Value of a Statistical Life "
+         "(VSL: $8.1 million) blended across crash severity distributions. "
+         "Source: TfNSW EPV Table 11."),
+        ("Environmental", "env", "green",
+         "Three components, all calculated per change in VKT: "
+         "(1) **Carbon emissions** — fleet-average CO₂ factors × carbon price ($123/tonne); "
+         "(2) **Air pollution** — local pollutants (NOx, PM2.5) priced at health damage costs; "
+         "(3) **Noise** — annoyance and health impacts on surrounding residents. "
+         "Urban rates are higher than rural for all three. "
+         "Source: TfNSW EPV Tables 13–15."),
+        ("Active Transport Health Benefits", "active", "purple",
+         "Benefits from additional walking or cycling induced by the project, "
+         "valued using health monetisation rates (Walking: $3.17/person-km; Cycling: $1.60/person-km). "
+         "This component is zero unless demand data includes active mode trips. "
+         "Source: TfNSW EPV Table 18."),
+    ]
+
+    for name, key, colour, explanation in benefit_rows:
+        with st.expander(f"**{name}**"):
+            st.markdown(explanation)
+
+    st.divider()
+
+    # ── How costs are treated ────────────────────────────────────────────────
+    st.markdown("### How Costs Are Treated")
+    st.markdown(
+        "Project costs are entered in the **sidebar** and cover four categories:"
+    )
+    cost_data = {
+        "Cost Category": [
+            "Planning & design",
+            "Land acquisition",
+            "Construction",
+            "Contingency",
+            "Operating & maintenance (annual)",
+            "Residual value",
+        ],
+        "How it is used": [
+            "Treated as a lump-sum expenditure in the first year of the appraisal period.",
+            "Treated as a lump-sum expenditure in the first year of the appraisal period.",
+            "Spread evenly across the construction period and discounted.",
+            "Applied as a percentage uplift on the sum of planning, land, and construction costs.",
+            "Repeated each year over the appraisal period and discounted.",
+            "A negative cost (credit) applied in the final year, representing the remaining useful life of assets.",
+        ],
+    }
+    st.dataframe(pd.DataFrame(cost_data), hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # ── Discounting ─────────────────────────────────────────────────────────
+    st.markdown("### Discounting")
+    st.markdown(
+        "All future cash flows are converted to present-value terms using a **start-of-year** "
+        "discount convention: a dollar in year *n* is worth `1 / (1 + r)^n` today, "
+        "where *r* is the discount rate. "
+        "The default rate is **7%** per annum, consistent with NSW Treasury guidance for transport "
+        "infrastructure. Sensitivity analysis automatically re-runs the model at 4% and 10% "
+        "so you can report the standard three-rate range required by Infrastructure Australia "
+        "and NSW Treasury."
+    )
+
+    st.divider()
+
+    # ── Annualisation ───────────────────────────────────────────────────────
+    st.markdown("### From Model Years to Annual Traffic")
+    st.markdown(
+        "Traffic models typically produce results for a small number of **modelling years** "
+        "(e.g. 2026, 2031, 2041, 2056). The tool interpolates between these years using "
+        "**compound annual growth rate (CAGR)** — the geometric mean — rather than straight-line "
+        "interpolation. This better reflects how traffic volumes typically grow."
+    )
+    st.markdown(
+        "Peak-period model outputs are converted to annual totals using an "
+        "**annualisation factor** and **days per year** for each vehicle type. "
+        "These defaults reflect typical NSW peak-period survey expansion factors "
+        "and can be adjusted in the sidebar."
+    )
+
+    st.divider()
+
+    # ── Sensitivity analysis ─────────────────────────────────────────────────
+    st.markdown("### Sensitivity Analysis")
+    st.markdown(
+        "The **Sensitivity** tab reports three types of analysis automatically:"
+    )
+    sens_rows = [
+        ("Discount rate sensitivity", "Re-runs NPV and BCR at 4%, 7%, and 10% to show how sensitive the result is to the choice of discount rate."),
+        ("Switching values", "Calculates how far key inputs (benefits, costs, demand) would have to move before the BCR falls below 1.0. This tells decision-makers the margin of safety in the result."),
+        ("Scenario analysis", "Applies optimistic (+20% benefits, –10% costs) and pessimistic (–20% benefits, +20% costs) scenarios to bound the likely range of outcomes."),
+    ]
+    sens_df = pd.DataFrame(sens_rows, columns=["Analysis", "What it shows"])
+    st.dataframe(sens_df, hide_index=True, use_container_width=True)
+
+    st.divider()
+
+    # ── Parameter sources ────────────────────────────────────────────────────
+    st.markdown("### Parameter Sources and Overrides")
+    st.markdown(
+        "All default parameter values are sourced from the "
+        "**TfNSW Economic Parameter Values, January 2025 (June 2024 prices)**. "
+        "These are the values that should be used in NSW Government business cases unless "
+        "a project-specific study has been approved by TfNSW."
+    )
+    st.markdown(
+        "The **Parameters** tab lets you view and override individual values "
+        "(e.g. VTTS rates, VOC tables, carbon price) if your business case has approved "
+        "project-specific values. Overrides are applied at calculation time and do not "
+        "permanently alter the default parameters."
+    )
+
+    st.divider()
+
+    # ── Limitations ──────────────────────────────────────────────────────────
+    st.markdown("### Limitations and Appropriate Use")
+    st.warning(
+        "**This tool supports, but does not replace, professional CBA judgement.** "
+        "It does not cover all benefit categories recognised in the TfNSW framework — "
+        "for example, wider economic benefits (agglomeration, labour market impacts), "
+        "public transport fare revenue, or land-use change benefits are not modelled. "
+        "For large or complex projects, outputs should be reviewed by an accredited "
+        "transport economist before inclusion in a formal business case.",
+        icon="⚠️",
+    )
+
+    st.markdown(
+        "| Suitable for | Not suitable for |\n"
+        "|---|---|\n"
+        "| Early-stage option screening | Final submission to Infrastructure Australia |\n"
+        "| Sensitivity and switching value testing | Projects with significant PT or active-mode mode shift |\n"
+        "| Checking third-party CBA outputs | Projects requiring wider economic benefit analysis |\n"
+        "| Internal workshop and briefing support | Projects where NTC emission factors may be materially inaccurate |"
+    )
+
+    st.divider()
+
+    # ── Reference ────────────────────────────────────────────────────────────
+    st.markdown("### Key References")
+    st.markdown(
+        "- Transport for NSW — *Economic Parameter Values*, January 2025 (June 2024 prices)\n"
+        "- NSW Treasury — *NSW Government Guide to Cost-Benefit Analysis* (TPP17-03)\n"
+        "- Infrastructure Australia — *Assessment Framework*, 2021\n"
+        "- National Transport Commission — *Australian Fleet Emission Factors*, 2023\n"
+        "- Department of Infrastructure, Transport, Regional Development, Communications and the Arts — "
+        "*Australian Transport Assessment and Planning (ATAP) Guidelines*"
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOOTER
