@@ -940,7 +940,7 @@ def calculate_matrix(
     # TfNSW CBA Guidelines / NSW Treasury TPG23-08 sensitivity rates:
     # 4% (low), 7% (base), 10% (high). ATAP T2 (2022) specifies the same core rates.
     # 3.5% = NSW Treasury long-run real risk-free reference rate (TPP20-07).
-    for r in [3.5, 4, 7, 10]:
+    for r in [3.5, 5, 7, 10]:
         s_pvb = sum(annual_benefits[y] * discount_factor(r, base_offset + y) for y in range(total_years))
         s_pvc = sum(annual_costs[y] * discount_factor(r, base_offset + y) for y in range(total_years))
         sensitivity_dr[r] = {
@@ -1477,7 +1477,7 @@ with st.sidebar:
             help="Calendar year construction begins. Benefits start after the construction period.")
     with col2:
         const_years = st.number_input("Construction Period (years)", 1, 10, 3)
-        discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 7.0, step=0.5)
+        discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 5.0, step=0.5)
     context = st.selectbox("Context", ["urban", "rural"], format_func=str.title)
     zero_growth_after_last_year = st.checkbox(
         "Zero growth after last modelling year",
@@ -2057,7 +2057,7 @@ with tab_sensitivity:
     # --- Scenario Analysis Table ---
     st.subheader("Scenario Analysis")
     # TfNSW CBA / NSW Treasury TPG23-08 required sensitivity rates
-    _tfnsw_required_rates = {4, 7, 10}
+    _tfnsw_required_rates = {5, 7, 10}
     rows = []
     for r_val in sorted(_r_sens["sensitivity_dr"].keys()):
         v = _r_sens["sensitivity_dr"][r_val]
