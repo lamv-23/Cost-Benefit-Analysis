@@ -803,6 +803,7 @@ def calculate_matrix(
 
     annual_costs: list = []
     annual_benefits: list = []
+    annual_env_emit: list = []   # emission_cost component only (used for carbon sensitivity)
     benefits_by_type: dict = {k: [] for k in ("tts", "tts_Car", "tts_LCV", "tts_HCV", "tts_Bus", "reliability", "voc", "safety", "env", "active")}
     annual_net: list = []
     disc_costs: list = []
@@ -826,7 +827,7 @@ def calculate_matrix(
         # Clamp traffic eval year to last modelling year when zero-growth is selected
         ey = min(eval_year, modelling_years[-1]) if zero_growth_after_last_year else eval_year
         cost_y = 0.0
-        b_tts = b_rel = b_voc = b_safety = b_env = b_active = 0.0
+        b_tts = b_rel = b_voc = b_safety = b_env = b_env_emit = b_active = 0.0
         b_tts_by_vt: dict = {vt: 0.0 for vt in VTYPES}
 
         if y < const_years:
@@ -897,6 +898,7 @@ def calculate_matrix(
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
                 vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
                 b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
+                b_env_emit += vkt_delta * emit_rate / 1e6
 
         benefit_y = b_tts + b_rel + b_voc + b_safety + b_env + b_active
         if y == total_years - 1:
@@ -905,6 +907,7 @@ def calculate_matrix(
         net = benefit_y - cost_y
         annual_costs.append(cost_y)
         annual_benefits.append(benefit_y)
+        annual_env_emit.append(b_env_emit)
         for k, v in zip(("tts", "reliability", "voc", "safety", "env", "active"),
                         (b_tts, b_rel, b_voc, b_safety, b_env, b_active)):
             benefits_by_type[k].append(v)
@@ -947,6 +950,29 @@ def calculate_matrix(
             "pvb": s_pvb, "pvc": s_pvc,
             "npv": s_pvb - s_pvc,
             "bcr": s_pvb / s_pvc if s_pvc > 0 else 0.0,
+        }
+
+    # Carbon price sensitivity: scale only the emission_cost component of env benefits.
+    # Base carbon price: $123/tCO₂e (TfNSW EPV Jan 2025, June 2024 prices).
+    # NSW Treasury TPG24-34 mandates $135.74/tCO₂e — included as a distinct scenario.
+    _base_carbon = PARAMS["carbon_per_tonne"]  # 123
+    sensitivity_carbon = {}
+    for _label, _factor in [
+        ("Low (0.5×, $62/t)", 0.5),
+        ("Central ($123/t)", 1.0),
+        (f"Treasury (${135.74}/t)", 135.74 / _base_carbon),
+        ("High (2.0×, $246/t)", 2.0),
+    ]:
+        s_pvb = sum(
+            (annual_benefits[y] + annual_env_emit[y] * (_factor - 1.0))
+            * discount_factor(dr, base_offset + y)
+            for y in range(total_years)
+        )
+        sensitivity_carbon[_label] = {
+            "pvb": s_pvb, "pvc": pv_costs,
+            "npv": s_pvb - pv_costs,
+            "bcr": s_pvb / pv_costs if pv_costs > 0 else 0.0,
+            "carbon_price": round(_base_carbon * _factor, 2),
         }
 
     switching = {}
@@ -1005,6 +1031,7 @@ def calculate_matrix(
         "disc_costs": disc_costs, "disc_benefits": disc_benefits, "disc_net": disc_net,
         "cum_disc_net": cum_disc_net,
         "pv_by_type": pv_by_type, "sensitivity_dr": sensitivity_dr,
+        "sensitivity_carbon": sensitivity_carbon,
         "switching": switching, "scenarios": scenarios,
         "const_years": const_years, "eval_period": eval_period,
         "total_years": total_years, "dr": dr,
@@ -2104,6 +2131,70 @@ with tab_sensitivity:
                "4% (low), 7% (base), 10% (high). ATAP T2 (2022) specifies the same core rates. "
                "3.5% = NSW Treasury long-run real risk-free rate (TPP20-07). "
                "Highlighted row = project base case discount rate.")
+
+    # --- Carbon Price Sensitivity ---
+    st.subheader("Carbon Price Sensitivity")
+    _carbon_sens = _r_sens.get("sensitivity_carbon", {})
+    if _carbon_sens:
+        _c_labels = list(_carbon_sens.keys())
+        _c_bcrs = [_carbon_sens[l]["bcr"] for l in _c_labels]
+        _c_npvs = [_carbon_sens[l]["npv"] for l in _c_labels]
+        _c_prices = [_carbon_sens[l]["carbon_price"] for l in _c_labels]
+        _c_fig = go.Figure()
+        _c_fig.add_trace(go.Bar(
+            x=_c_labels, y=_c_bcrs,
+            marker_color="#198754",
+            text=[f"{v:.2f}" for v in _c_bcrs],
+            textposition="outside",
+        ))
+        _c_fig.add_hline(y=1.0, line_dash="dash", line_color="red",
+                         annotation_text="BCR = 1.0", annotation_position="top right")
+        _c_fig.update_layout(
+            yaxis_title="BCR", xaxis_title="Carbon Price Scenario",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=30, b=10), height=320,
+        )
+        st.plotly_chart(_c_fig, use_container_width=True)
+
+        _c_rows = []
+        for _lbl in _c_labels:
+            _cv = _carbon_sens[_lbl]
+            _c_rows.append({
+                "Carbon Price Scenario": _lbl,
+                "Carbon Price ($/tCO₂e)": _cv["carbon_price"],
+                "PV Benefits ($M)": round(_cv["pvb"], 1),
+                "NPV ($M)": round(_cv["npv"], 1),
+                "BCR": round(_cv["bcr"], 2),
+            })
+        _df_c = pd.DataFrame(_c_rows)
+
+        def _highlight_carbon(row):
+            styles = [""] * len(row)
+            if "Central" in row["Carbon Price Scenario"]:
+                styles = ["background-color: rgba(25, 135, 84, 0.1); font-weight: 700"] * len(row)
+            _bcr_idx = _df_c.columns.get_loc("BCR")
+            if row["BCR"] >= 1:
+                styles[_bcr_idx] += "; color: #198754; font-weight: 700"
+            else:
+                styles[_bcr_idx] += "; color: #dc3545; font-weight: 700"
+            return styles
+
+        _styled_c = _df_c.style.apply(_highlight_carbon, axis=1).format({
+            "Carbon Price ($/tCO₂e)": "{:.2f}",
+            "PV Benefits ($M)": "{:.1f}",
+            "NPV ($M)": "{:.1f}",
+            "BCR": "{:.2f}",
+        })
+        st.dataframe(_styled_c, use_container_width=True, hide_index=True)
+        st.caption(
+            "Scales only the emission_cost (carbon) component of environmental benefits; "
+            "air pollution and noise costs are held at base values. "
+            "Base: $123/tCO₂e (TfNSW EPV Jan 2025). "
+            "Treasury: $135.74/tCO₂e (NSW Treasury TPG24-34). "
+            "Highlighted row = Central (base case) carbon price."
+        )
+    else:
+        st.info("No carbon sensitivity data available.")
 
     # --- First-Year Benefit Breakdown ---
     st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
