@@ -983,7 +983,7 @@ def run_monte_carlo(
     vtts_pct: float,
     safety_pct: float,
     cost_pct: float,
-) -> tuple[list, list]:
+) -> tuple:
     """Run Monte Carlo simulation, sampling key inputs from uniform distributions.
 
     Returns (npvs, bcrs) — one value per simulation.
