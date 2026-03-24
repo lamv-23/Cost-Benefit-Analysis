@@ -955,73 +955,6 @@ def _render_user_mapping_upload(uploaded_file) -> None:
         st.rerun()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MONTE CARLO HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def scale_traffic_case(case: dict, factor: float) -> dict:
-    """Return a deep copy of a traffic case with VHT and VKT scaled by factor."""
-    scaled = copy.deepcopy(case)
-    for vt in ("Car", "LCV", "HCV", "Bus"):
-        if vt in scaled:
-            scaled[vt]["vht"] = [v * factor for v in scaled[vt]["vht"]]
-            scaled[vt]["vkt"] = [v * factor for v in scaled[vt]["vkt"]]
-    return scaled
-
-
-def run_monte_carlo(
-    n_sims: int,
-    inputs: dict,
-    base_traffic: dict,
-    proj_traffic: dict,
-    cost_data: dict,
-    annualisation: dict,
-    safety_vkt_base: dict,
-    safety_vkt_proj: dict,
-    effective_params: dict,
-    demand_pct: float,
-    vtts_pct: float,
-    safety_pct: float,
-    cost_pct: float,
-) -> tuple:
-    """Run Monte Carlo simulation, sampling key inputs from uniform distributions.
-
-    Returns (npvs, bcrs) — one value per simulation.
-    """
-    import random
-    npvs: list = []
-    bcrs: list = []
-    for _ in range(n_sims):
-        d = random.uniform(1 - demand_pct / 100, 1 + demand_pct / 100)
-        v = random.uniform(1 - vtts_pct / 100, 1 + vtts_pct / 100)
-        s = random.uniform(1 - safety_pct / 100, 1 + safety_pct / 100)
-        c = random.uniform(1 - cost_pct / 100, 1 + cost_pct / 100)
-
-        p = copy.deepcopy(effective_params)
-        for ctx in p["vtts"]:
-            for vt in p["vtts"][ctx]:
-                p["vtts"][ctx][vt] *= v
-        for vt in p.get("safety_vkt", {}):
-            p["safety_vkt"][vt] *= s
-
-        proj = scale_traffic_case(proj_traffic, d)
-
-        cd = copy.deepcopy(cost_data)
-        for k in ("cap_planning", "cap_land", "cap_construction"):
-            cd[k] = cd.get(k, 0.0) * c
-
-        sv_base = copy.deepcopy(safety_vkt_base) if safety_vkt_base else None
-        sv_proj = copy.deepcopy(safety_vkt_proj) if safety_vkt_proj else None
-        if sv_proj:
-            for vt in sv_proj:
-                sv_proj[vt] *= s
-
-        r = calculate_matrix(inputs, base_traffic, proj, cd, annualisation,
-                             sv_base, sv_proj, p)
-        npvs.append(r["npv"])
-        bcrs.append(r["bcr"])
-    return npvs, bcrs
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MATRIX CALCULATION ENGINE — Step 7
@@ -2947,63 +2880,63 @@ with tab_sensitivity:
         _mc_col1, _mc_col2 = st.columns(2)
         with _mc_col1:
             _mc_n = st.slider("Number of simulations", 100, 2000, 500, step=100, key="mc_n")
-            _mc_demand = st.slider("Demand uncertainty ±%", 0, 40, 20, key="mc_demand",
-                                   help="Traffic volume (VHT/VKT) sampled within this range around the central estimate.")
-            _mc_vtts = st.slider("VTTS uncertainty ±%", 0, 30, 15, key="mc_vtts",
-                                 help="Value of Travel Time Savings rate sampled within this range.")
+            _mc_demand = st.slider("Traffic volume uncertainty (CV %)", 1, 30, 15, key="mc_demand",
+                                   help="Coefficient of variation for traffic VHT/VKT (normal distribution). 15% → roughly ±30% at 2σ.")
+            _mc_vtts = st.slider("VTTS uncertainty (CV %)", 1, 30, 20, key="mc_vtts",
+                                 help="Coefficient of variation for Value of Travel Time Savings (normal distribution).")
         with _mc_col2:
-            _mc_safety = st.slider("Safety rate uncertainty ±%", 0, 50, 25, key="mc_safety",
-                                   help="Safety $/VKT rates sampled within this range.")
-            _mc_cost = st.slider("Capital cost uncertainty ±%", 0, 30, 10, key="mc_cost",
-                                 help="Capital cost items (planning, land, construction) sampled within this range.")
+            _mc_safety = st.slider("Safety rate uncertainty (CV %)", 1, 50, 30, key="mc_safety",
+                                   help="Coefficient of variation for safety $/VKT rates (lognormal distribution).")
+            _mc_cost = st.slider("Capital cost overrun max %", 0, 100, 40, key="mc_cost",
+                                 help="Maximum capital cost overrun as % above base. Triangular distribution: base, +½max, +max.")
 
         if st.button("Run Monte Carlo", key="mc_run"):
             with st.spinner(f"Running {_mc_n} simulations…"):
                 _mc_case_keys = list(matrix_results.keys())
                 _mc_all_results: dict = {}
                 _eff_params = build_effective_params()
+                _cost_overrun_max = 1.0 + _mc_cost / 100
+                _cost_overrun_mode = 1.0 + _mc_cost / 200
                 for _mc_ck in _mc_case_keys:
-                    _sv_base = st.session_state.safety_vkt_data.get("base_case")
-                    _sv_proj = st.session_state.safety_vkt_data.get(_mc_ck)
-                    _npvs, _bcrs = run_monte_carlo(
-                        n_sims=_mc_n,
+                    _mc_result = run_monte_carlo(
+                        case_key=_mc_ck,
                         inputs=_matrix_inputs,
-                        base_traffic=st.session_state.traffic_data["base_case"],
-                        proj_traffic=st.session_state.traffic_data[_mc_ck],
-                        cost_data=st.session_state.cost_data[_mc_ck],
+                        traffic_data=st.session_state.traffic_data,
+                        cost_data=st.session_state.cost_data,
                         annualisation=st.session_state.annualisation,
-                        safety_vkt_base=_sv_base,
-                        safety_vkt_proj=_sv_proj,
-                        effective_params=_eff_params,
-                        demand_pct=_mc_demand,
-                        vtts_pct=_mc_vtts,
-                        safety_pct=_mc_safety,
-                        cost_pct=_mc_cost,
+                        safety_vkt_data=st.session_state.safety_vkt_data,
+                        params=_eff_params,
+                        n_simulations=_mc_n,
+                        vtts_cv=_mc_vtts / 100,
+                        safety_cv=_mc_safety / 100,
+                        traffic_cv=_mc_demand / 100,
+                        cost_overrun_min=1.0,
+                        cost_overrun_mode=_cost_overrun_mode,
+                        cost_overrun_max=_cost_overrun_max,
                     )
-                    _mc_all_results[_mc_ck] = {"npvs": _npvs, "bcrs": _bcrs}
+                    # Convert numpy arrays to lists for JSON-serialisable session state
+                    _mc_all_results[_mc_ck] = {
+                        **_mc_result,
+                        "npv": list(_mc_result["npv"]),
+                        "bcr": list(_mc_result["bcr"]),
+                    }
             st.session_state["mc_results"] = _mc_all_results
 
         if st.session_state.get("mc_results"):
             _mc_res = st.session_state["mc_results"]
-            # Case selector for MC results
             _mc_display_key = _sens_sel if len(_mc_res) > 1 else list(_mc_res.keys())[0]
             if _mc_display_key not in _mc_res:
                 _mc_display_key = list(_mc_res.keys())[0]
-            _npvs = _mc_res[_mc_display_key]["npvs"]
-            _bcrs = _mc_res[_mc_display_key]["bcrs"]
-            _n_total = len(_npvs)
-
-            # Percentiles
-            _sorted_npv = sorted(_npvs)
-            _sorted_bcr = sorted(_bcrs)
-            _p10_npv = _sorted_npv[max(0, int(0.10 * _n_total) - 1)]
-            _p50_npv = _sorted_npv[int(0.50 * _n_total) - 1]
-            _p90_npv = _sorted_npv[min(_n_total - 1, int(0.90 * _n_total))]
-            _p10_bcr = _sorted_bcr[max(0, int(0.10 * _n_total) - 1)]
-            _p50_bcr = _sorted_bcr[int(0.50 * _n_total) - 1]
-            _p90_bcr = _sorted_bcr[min(_n_total - 1, int(0.90 * _n_total))]
-            _prob_pos_npv = sum(1 for v in _npvs if v > 0) / _n_total * 100
-            _prob_bcr_ge1 = sum(1 for v in _bcrs if v >= 1.0) / _n_total * 100
+            _mc_r = _mc_res[_mc_display_key]
+            _npvs = _mc_r["npv"]
+            _bcrs = _mc_r["bcr"]
+            _npv_pct = _mc_r["npv_percentiles"]
+            _bcr_pct = _mc_r["bcr_percentiles"]
+            _p10_npv, _p50_npv, _p90_npv = _npv_pct["p10"], _npv_pct["p50"], _npv_pct["p90"]
+            _p10_bcr, _p50_bcr, _p90_bcr = _bcr_pct["p10"], _bcr_pct["p50"], _bcr_pct["p90"]
+            _prob_pos_npv = _mc_r["prob_npv_positive"] * 100
+            _prob_bcr_ge1 = _mc_r["prob_bcr_gt1"] * 100
+            _n_total = _mc_r["n_simulations"]
             _mean_npv = sum(_npvs) / _n_total
             _mean_bcr = sum(_bcrs) / _n_total
 
@@ -3060,6 +2993,37 @@ with tab_sensitivity:
                 )
                 st.plotly_chart(fig_mc_bcr, use_container_width=True)
 
+            # Tornado chart
+            _tornado = _mc_r.get("tornado", {})
+            if _tornado:
+                st.subheader("Tornado Chart — NPV sensitivity (P10/P90 of each input)")
+                _central_npv = _mc_r.get("central_npv", 0)
+                _t_params = list(_tornado.keys())
+                _t_low  = [_tornado[p][0] - _central_npv for p in _t_params]
+                _t_high = [_tornado[p][1] - _central_npv for p in _t_params]
+                # Sort by total swing descending
+                _t_order = sorted(range(len(_t_params)),
+                                  key=lambda i: abs(_t_high[i] - _t_low[i]), reverse=True)
+                _t_params = [_t_params[i] for i in _t_order]
+                _t_low    = [_t_low[i]    for i in _t_order]
+                _t_high   = [_t_high[i]   for i in _t_order]
+                fig_tornado = go.Figure()
+                fig_tornado.add_trace(go.Bar(
+                    y=_t_params, x=_t_low, orientation="h",
+                    name="P10 effect", marker_color=COLORS["negative"],
+                ))
+                fig_tornado.add_trace(go.Bar(
+                    y=_t_params, x=_t_high, orientation="h",
+                    name="P90 effect", marker_color=COLORS["positive"],
+                ))
+                fig_tornado.update_layout(
+                    barmode="overlay", height=300,
+                    xaxis_title="NPV change vs central ($M)", yaxis_title="",
+                    margin=dict(t=20, b=20, l=20, r=20),
+                    **PLOTLY_TRANSPARENT,
+                )
+                st.plotly_chart(fig_tornado, use_container_width=True)
+
             # Summary statistics table
             _mc_stats = pd.DataFrame({
                 "Statistic": ["Mean", "P10 (pessimistic)", "P50 (median)", "P90 (optimistic)",
@@ -3072,10 +3036,10 @@ with tab_sensitivity:
             st.dataframe(_mc_stats, use_container_width=True, hide_index=True)
             st.caption(
                 f"{_n_total} simulations · "
-                f"Demand ±{st.session_state.get('mc_demand', 20)}% · "
-                f"VTTS ±{st.session_state.get('mc_vtts', 15)}% · "
-                f"Safety ±{st.session_state.get('mc_safety', 25)}% · "
-                f"Capital cost ±{st.session_state.get('mc_cost', 10)}%"
+                f"Traffic CV {st.session_state.get('mc_demand', 15)}% · "
+                f"VTTS CV {st.session_state.get('mc_vtts', 20)}% · "
+                f"Safety CV {st.session_state.get('mc_safety', 30)}% · "
+                f"Cost overrun max +{st.session_state.get('mc_cost', 40)}%"
             )
 
 
