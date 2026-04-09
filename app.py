@@ -1154,6 +1154,7 @@ def calculate_matrix(
                 b_rel += b_tts_by_vt[vt] * _rr * 0.3
 
             # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
+            # Rule-of-Half: split VKT delta into diverted and generated
             for vt in VTYPES:
                 param_vt = VTYPE_MAP[vt]
                 voc_table = _p["voc"][ctx].get(param_vt, {})
@@ -1173,7 +1174,21 @@ def calculate_matrix(
 
                 annual_vkt_b = vkt_b * ann_factors[vt]
                 annual_vkt_p = vkt_p * ann_factors[vt]
-                voc_saving = annual_vkt_b * voc_b - annual_vkt_p * voc_p
+
+                # Resolve per-vehicle-type generated demand % (override or global)
+                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
+
+                # Split VKT delta: diverted vs generated
+                vkt_delta = (annual_vkt_b - annual_vkt_p)
+                diverted_vkt_delta = vkt_delta * (1.0 - gen_pct / 100.0)
+                generated_vkt_delta = vkt_delta * (gen_pct / 100.0)
+
+                # VOC benefit for diverted: full cost difference
+                diverted_voc = diverted_vkt_delta * (voc_b - voc_p)
+                # VOC benefit for generated: 0.5× project VOC (Rule-of-Half)
+                generated_voc = generated_vkt_delta * voc_p * 0.5
+
+                voc_saving = diverted_voc + generated_voc
                 b_voc += max(0.0, voc_saving) / 1e6
 
             # ── Safety: $/VKT per vehicle type (per-case rates) ─────────────
