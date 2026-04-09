@@ -1792,6 +1792,36 @@ def build_effective_params() -> dict:
 # INCREMENTAL BENEFITS SUMMARY HELPER — Step 11
 # ─────────────────────────────────────────────────────────────────────────────
 
+def render_rule_of_half_assumptions(cost_case: dict) -> None:
+    """Display Rule-of-Half assumptions from cost data for a project case.
+
+    Extracts and displays the generated demand percentage(s) and any per-vehicle-type
+    overrides to show users what appraisal methodology was applied.
+    """
+    gen_pct_global = cost_case.get("generated_demand_pct_global", 0.0)
+    gen_pct_override = cost_case.get("generated_demand_pct_override", {})
+
+    # Check if any settings are non-zero
+    has_overrides = any(v is not None for v in gen_pct_override.values())
+    has_global = gen_pct_global > 0
+
+    if has_global or has_overrides:
+        # Build info message with overrides if present
+        if has_overrides:
+            override_parts = []
+            for vt in VTYPES:
+                if gen_pct_override.get(vt) is not None:
+                    override_parts.append(f"{vt}: {gen_pct_override[vt]}%")
+            overrides_str = ", ".join(override_parts)
+            msg = f"**Rule-of-Half (Generated Demand):** {gen_pct_global}% global (overrides: {overrides_str})"
+        else:
+            msg = f"**Rule-of-Half (Generated Demand):** {gen_pct_global}% global"
+        st.info(msg)
+    else:
+        # No Rule-of-Half applied
+        st.info("**Rule-of-Half:** Not applied (0% generated demand — all traffic diverted)")
+
+
 def render_incremental_summary() -> None:
     """Step 11: Render the Incremental Benefits Summary table.
 
@@ -2405,6 +2435,12 @@ with tab_dash:
         _r = matrix_results[_dash_case]
     else:
         _r = matrix_results["project_1"]
+        _dash_case = "project_1"
+
+    # Display Rule-of-Half assumptions for transparency
+    _cost_data = st.session_state.get("cost_data", {})
+    _case_cost = _cost_data.get(_dash_case, {})
+    render_rule_of_half_assumptions(_case_cost)
 
     chart1, chart2 = st.columns(2)
 
