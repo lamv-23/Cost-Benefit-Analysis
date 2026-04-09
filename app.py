@@ -237,6 +237,13 @@ def make_cost_data(n_project_cases: int = 1) -> dict:
           "opex_maint": 0.0,     # $M/year
           "opex_op": 0.0,        # $M/year
           "residual": 0.0,       # $M
+          "construction_disbenefit_annual": 0.0,  # $M/year
+          "construction_asset_life": 40,  # years
+          "walk_pkm_day": 0.0,   # pkm/day
+          "cycle_pkm_day": 0.0,  # pkm/day
+          "pavement_saving_annual": 0.0,  # $M/year
+          "generated_demand_pct_global": 0.0,  # % (Rule-of-Half global default)
+          "generated_demand_pct_override": {"Car": None, "LCV": None, "HCV": None, "Bus": None},  # % (per-vtype overrides)
         }
     """
     template = {
@@ -246,6 +253,8 @@ def make_cost_data(n_project_cases: int = 1) -> dict:
         "construction_asset_life": 40,   # years; drives auto-calculated residual value
         "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
         "pavement_saving_annual": 0.0,
+        "generated_demand_pct_global": 0.0,
+        "generated_demand_pct_override": {"Car": None, "LCV": None, "HCV": None, "Bus": None},
     }
     return {f"project_{i}": dict(template) for i in range(1, n_project_cases + 1)}
 
@@ -321,6 +330,8 @@ def _load_sample_data() -> None:
             "construction_asset_life": 40,
             "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
             "pavement_saving_annual": 0.0,
+            "generated_demand_pct_global": 0.0,
+            "generated_demand_pct_override": {"Car": None, "LCV": None, "HCV": None, "Bus": None},
         }
     }
 
