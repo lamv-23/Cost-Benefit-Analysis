@@ -667,6 +667,49 @@ def render_cost_entry(eval_period: int = 30) -> None:
                 ),
             )
 
+            st.markdown("**Generated Demand Assumptions (Rule-of-Half)**")
+            st.caption(
+                "Specify what % of the project traffic benefit represents 'new' (generated) demand "
+                "vs. 'redistributed' demand. Used in demand sensitivity analysis. "
+                "Default: 0% (all demand is redistributed)."
+            )
+            cd["generated_demand_pct_global"] = st.slider(
+                "Global Generated Demand (%)",
+                min_value=0, max_value=100, step=5,
+                value=int(cd.get("generated_demand_pct_global", 0)),
+                key=f"gend_demand_global_{i}",
+                help=(
+                    "Apply this % globally to all vehicle types unless overridden below. "
+                    "Rule-of-Half: typically 50% of time benefit is 'generated' (new trips), "
+                    "50% is 'redistributed' (faster existing trips). "
+                    "Source: TfNSW CBA Guidelines."
+                ),
+            )
+
+            with st.expander("Per-Vehicle-Type Overrides", expanded=False):
+                st.caption("Enable and set custom % for individual vehicle types (overrides global setting)")
+                for vtype in VTYPES:
+                    c_check, c_slider = st.columns([1, 3])
+                    with c_check:
+                        override_enabled = st.checkbox(
+                            f"{vtype} override",
+                            value=(cd["generated_demand_pct_override"].get(vtype) is not None),
+                            key=f"gend_demand_override_check_{i}_{vtype}",
+                        )
+                    with c_slider:
+                        if override_enabled:
+                            override_val = cd["generated_demand_pct_override"].get(vtype, 0)
+                            cd["generated_demand_pct_override"][vtype] = st.slider(
+                                f"{vtype} Generated Demand (%)",
+                                min_value=0, max_value=100, step=5,
+                                value=int(override_val if override_val is not None else 0),
+                                key=f"gend_demand_override_val_{i}_{vtype}",
+                                label_visibility="collapsed",
+                            )
+                        else:
+                            cd["generated_demand_pct_override"][vtype] = None
+                            st.caption(f"Using global setting ({cd['generated_demand_pct_global']}%)")
+
             st.markdown("**Active Transport — Incremental Health Benefits**")
             at1, at2 = st.columns(2)
             with at1:
