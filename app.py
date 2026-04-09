@@ -1219,6 +1219,7 @@ def calculate_matrix(
             b_safety_fatal = b_safety * _p["safety_severity_share"]["fatal"]
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
+            # Rule-of-Half: split VKT delta into diverted and generated
             for vt in VTYPES:
                 emit_vt = EMISSION_VTYPE_MAP[vt]
                 air_noise_vt = AIR_NOISE_VTYPE_MAP[vt]
@@ -1228,9 +1229,29 @@ def calculate_matrix(
 
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
-                vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
-                b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
-                b_env_emit += vkt_delta * emit_rate / 1e6
+                annual_vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
+
+                # Resolve per-vehicle-type generated demand % (override or global)
+                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
+
+                # Split VKT delta: diverted vs generated
+                diverted_vkt_delta = annual_vkt_delta * (1.0 - gen_pct / 100.0)
+                generated_vkt_delta = annual_vkt_delta * (gen_pct / 100.0)
+
+                # Calculate total environmental rate (emission + air + noise)
+                total_env_rate = emit_rate + air_rate + noise_rate
+
+                # Apply Rule-of-Half: diverted uses full rate, generated uses 0.5x
+                diverted_env = diverted_vkt_delta * total_env_rate
+                generated_env = generated_vkt_delta * total_env_rate * 0.5
+
+                b_env += (diverted_env + generated_env) / 1e6
+
+                # Track emission component separately (for carbon price sensitivity)
+                # Diverted at 1.0x, generated at 0.5x
+                diverted_emit = diverted_vkt_delta * emit_rate
+                generated_emit = generated_vkt_delta * emit_rate * 0.5
+                b_env_emit += (diverted_emit + generated_emit) / 1e6
 
             # ── Active Transport: incremental walking/cycling health benefits ─
             # Inputs are steady-state incremental person-km/day (project − base).
