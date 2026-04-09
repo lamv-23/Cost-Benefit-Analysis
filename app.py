@@ -1192,12 +1192,29 @@ def calculate_matrix(
                 b_voc += max(0.0, voc_saving) / 1e6
 
             # ── Safety: $/VKT per vehicle type (per-case rates) ─────────────
+            # Rule-of-Half: split VKT delta into diverted and generated
             _sv_base = safety_vkt_base if safety_vkt_base is not None else _p["safety_vkt"]
             _sv_proj = safety_vkt_proj if safety_vkt_proj is not None else _p["safety_vkt"]
             for vt in VTYPES:
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
-                b_safety += (vkt_b * _sv_base[vt] - vkt_p * _sv_proj[vt]) * ann_factors[vt] / 1e6
+                annual_vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
+
+                # Resolve per-vehicle-type generated demand % (override or global)
+                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
+
+                # Split VKT delta: diverted vs generated
+                diverted_vkt_delta = annual_vkt_delta * (1.0 - gen_pct / 100.0)
+                generated_vkt_delta = annual_vkt_delta * (gen_pct / 100.0)
+
+                # Safety cost difference (per VKT)
+                safety_cost_diff = _sv_base[vt] - _sv_proj[vt]
+
+                # Apply Rule-of-Half: diverted uses full cost difference, generated uses 0.5x
+                diverted_safety = diverted_vkt_delta * safety_cost_diff
+                generated_safety = generated_vkt_delta * safety_cost_diff * 0.5
+
+                b_safety += (diverted_safety + generated_safety) / 1e6
             # Fatal component: used for VSL sensitivity (scales this share ±, rest held fixed).
             b_safety_fatal = b_safety * _p["safety_severity_share"]["fatal"]
 
