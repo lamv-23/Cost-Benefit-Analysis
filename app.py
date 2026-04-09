@@ -1884,7 +1884,7 @@ def render_incremental_summary() -> None:
 
     styled = df_inc.style.format(fmt)
     for col in delta_cols:
-        styled = styled.applymap(_colour_delta, subset=[col])
+        styled = styled.map(_colour_delta, subset=[col])
 
     st.dataframe(styled, use_container_width=True)
     st.caption(
