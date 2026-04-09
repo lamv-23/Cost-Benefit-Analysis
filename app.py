@@ -1113,6 +1113,10 @@ def calculate_matrix(
             cost_y = opex
 
             # ── TTS: per vehicle type ───────────────────────────────────────
+            # Rule-of-Half: extract generated demand settings from cost dict
+            gen_pct_global = cost.get("generated_demand_pct_global", 0.0)
+            gen_pct_override = cost.get("generated_demand_pct_override", {})
+
             for vt in VTYPES:
                 vht_base = interpolate_modelling_years(
                     modelling_years, base_traffic[vt]["vht"], ey
@@ -1121,7 +1125,19 @@ def calculate_matrix(
                     modelling_years, proj_traffic[vt]["vht"], ey
                 )
                 annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factors[vt]
-                vt_tts = annual_vht_saving * occupancy_by_vtype[vt] * vtts_by_vtype[vt] / 1e6
+
+                # Resolve per-vehicle-type generated demand % (override or global)
+                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
+
+                # Split VHT delta: diverted vs generated
+                diverted_vht = annual_vht_saving * (1.0 - gen_pct / 100.0)
+                generated_vht = annual_vht_saving * (gen_pct / 100.0)
+
+                # Calculate TTS for diverted (1.0x VTTS) and generated (0.5x VTTS)
+                diverted_tts = diverted_vht * occupancy_by_vtype[vt] * vtts_by_vtype[vt] / 1e6
+                generated_tts = generated_vht * occupancy_by_vtype[vt] * vtts_by_vtype[vt] * 0.5 / 1e6
+
+                vt_tts = diverted_tts + generated_tts
                 b_tts_by_vt[vt] = vt_tts
                 b_tts += vt_tts
 
