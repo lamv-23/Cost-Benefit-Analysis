@@ -4,6 +4,10 @@ Parameters based on TfNSW Economic Parameter Values (January 2025)
 All monetary values in June 2024 prices (AUD)
 """
 
+__version__ = "1.0.0"
+
+import html
+import json
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -31,7 +35,7 @@ column_mapper = components.declare_component("column_mapper", path=_COMPONENT_DI
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Transport CBA Dashboard — TfNSW",
+    page_title=f"Transport CBA Dashboard — TfNSW v{__version__}",
     page_icon="🚦",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -267,7 +271,7 @@ def _load_sample_data() -> None:
 
     td = make_traffic_data(years, 1)
 
-    # ── Base Case ──────────────────────────────────────────────────────────
+    # ── Base Case (existing road: congested, longer route, more stops) ──────
     bc = td["base_case"]
     bc["Car"]  = {"vht": [1200.0, 1350.0, 1550.0, 1800.0],
                   "vkt": [85000.0, 96000.0, 110000.0, 128000.0],
@@ -286,41 +290,42 @@ def _load_sample_data() -> None:
                   "stops": [90.0, 100.0, 115.0, 133.0],
                   "demand": [1200.0, 1350.0, 1550.0, 1800.0]}
 
-    # ── Project 1 (bypass: faster, longer route — higher VKT, lower VHT) ──
+    # ── Project 1 (bypass: shorter route, fewer stops, free-flow) ───────
+    # VKT and VHT both decrease — benefits across TTS, VOC, safety, env.
     p1 = td["project_1"]
-    p1["Car"]  = {"vht": [1050.0, 1180.0, 1360.0, 1580.0],
-                  "vkt": [88000.0, 99000.0, 114000.0, 133000.0],
-                  "stops": [40.0, 45.0, 52.0, 60.0],
-                  "demand": [8800.0, 9900.0, 11400.0, 13300.0]}
-    p1["LCV"]  = {"vht": [82.0, 93.0, 107.0, 124.0],
-                  "vkt": [7400.0, 8300.0, 9600.0, 11100.0],
-                  "stops": [3.0, 3.0, 4.0, 4.0],
-                  "demand": [740.0, 830.0, 960.0, 1110.0]}
-    p1["HCV"]  = {"vht": [105.0, 118.0, 135.0, 157.0],
-                  "vkt": [9800.0, 11100.0, 12700.0, 14800.0],
+    p1["Car"]  = {"vht": [980.0, 1100.0, 1270.0, 1480.0],
+                  "vkt": [78000.0, 88000.0, 101000.0, 118000.0],
+                  "stops": [30.0, 34.0, 39.0, 45.0],
+                  "demand": [8200.0, 9300.0, 10700.0, 12400.0]}
+    p1["LCV"]  = {"vht": [78.0, 88.0, 101.0, 117.0],
+                  "vkt": [6600.0, 7400.0, 8500.0, 9900.0],
+                  "stops": [2.0, 2.0, 3.0, 3.0],
+                  "demand": [680.0, 760.0, 880.0, 1020.0]}
+    p1["HCV"]  = {"vht": [95.0, 107.0, 123.0, 143.0],
+                  "vkt": [8200.0, 9200.0, 10600.0, 12300.0],
                   "stops": [2.0, 2.0, 2.0, 3.0],
-                  "demand": [490.0, 555.0, 635.0, 740.0]}
-    p1["Bus"]  = {"vht": [16.0, 18.0, 21.0, 24.0],
-                  "vkt": [1450.0, 1630.0, 1870.0, 2180.0],
-                  "stops": [20.0, 22.0, 26.0, 30.0],
-                  "demand": [1240.0, 1390.0, 1600.0, 1860.0]}
+                  "demand": [420.0, 470.0, 540.0, 630.0]}
+    p1["Bus"]  = {"vht": [14.0, 16.0, 18.0, 21.0],
+                  "vkt": [1100.0, 1240.0, 1420.0, 1650.0],
+                  "stops": [15.0, 17.0, 20.0, 23.0],
+                  "demand": [1050.0, 1180.0, 1360.0, 1580.0]}
 
     st.session_state["traffic_data"] = td
 
     # ── Costs (Project 1) ──────────────────────────────────────────────────
     st.session_state["cost_data"] = {
         "project_1": {
-            "cap_planning": 3.0,
-            "cap_land": 6.5,
-            "cap_construction": 48.0,
-            "contingency_pct": 10.0,
-            "opex_maint": 1.2,
-            "opex_op": 0.0,
+            "cap_planning": 5.0,
+            "cap_land": 12.0,
+            "cap_construction": 85.0,
+            "contingency_pct": 15.0,
+            "opex_maint": 1.8,
+            "opex_op": 0.4,
             "residual": 0.0,                  # 0 = use auto-calculated residual
             "construction_disbenefit_annual": 0.0,
             "construction_asset_life": 40,
-            "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
-            "pavement_saving_annual": 0.0,
+            "walk_pkm_day": 800.0, "cycle_pkm_day": 400.0,
+            "pavement_saving_annual": 0.3,
         }
     }
 
@@ -331,6 +336,47 @@ def _load_sample_data() -> None:
     }
 
     st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAVE / LOAD PROJECT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _serialise_project() -> dict:
+    """Serialise all project state to a JSON-compatible dict."""
+    keys_to_save = [
+        "traffic_data", "cost_data", "safety_vkt_data", "crash_data",
+        "annualisation", "modelling_years", "n_project_cases",
+        "safety_mode", "env_mode", "reliability_mode", "show_advanced",
+        "project_name",
+    ]
+    data = {"version": __version__, "type": "cba_project"}
+    for k in keys_to_save:
+        if k in st.session_state:
+            data[k] = st.session_state[k]
+    for k in list(st.session_state.keys()):
+        if k.startswith("param_"):
+            data[k] = st.session_state[k]
+    return data
+
+
+def _deserialise_project(data: dict) -> None:
+    """Restore project state from a JSON dict."""
+    if data.get("type") != "cba_project":
+        st.error("Invalid file: not a CBA project export.")
+        return
+    if data.get("version") != __version__:
+        st.warning(f"File version {data.get('version')} differs from app version {__version__}. Some data may not load correctly.")
+    for k in ("traffic_data", "cost_data", "safety_vkt_data", "crash_data",
+              "annualisation", "modelling_years", "n_project_cases",
+              "safety_mode", "env_mode", "reliability_mode", "show_advanced"):
+        if k in data:
+            st.session_state[k] = data[k]
+    for k in list(data.keys()):
+        if k.startswith("param_"):
+            st.session_state[k] = data[k]
+    st.session_state["n_project_cases"] = data.get("n_project_cases", 1)
+    st.success("Project loaded successfully!")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -412,6 +458,15 @@ def interpolate_modelling_years(modelling_years: list, values: list, eval_year: 
 # ─────────────────────────────────────────────────────────────────────────────
 # MATRIX UI HELPERS — Step 3
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _style_incr(val):
+    if isinstance(val, (int, float)):
+        if val < 0:
+            return "background-color:rgba(220,53,69,0.12);color:#dc3545"
+        if val > 0:
+            return "background-color:rgba(25,135,84,0.12);color:#198754"
+    return ""
+
 
 def render_traffic_matrix(metric: str, unit_label: str) -> None:
     """Render st.data_editor tables for one traffic metric across all cases.
@@ -499,14 +554,6 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
 
             if n > 1:
                 st.caption(f"Project {i} − Base")
-
-            def _style_incr(val):
-                if isinstance(val, (int, float)):
-                    if val < 0:
-                        return "background-color:rgba(220,53,69,0.12);color:#dc3545"
-                    if val > 0:
-                        return "background-color:rgba(25,135,84,0.12);color:#198754"
-                return ""
 
             st.dataframe(
                 incr_df.style.map(_style_incr).format("{:+.0f}"),
@@ -794,7 +841,7 @@ def _smart_parse_upload(uploaded_file) -> None:
             xl = pd.ExcelFile(uploaded_file)
             # If it looks like our own template, delegate to the template handler
             template_sheets = {"VHT", "VKT", "Stops", "Demand", "Crashes"}
-            if template_sheets & set(xl.sheet_names):
+            if template_sheets.issubset(set(xl.sheet_names)):
                 _handle_template_upload(uploaded_file)
                 return
             dfs = {sh: xl.parse(sh) for sh in xl.sheet_names}
@@ -1318,6 +1365,28 @@ def calculate_matrix(
 # MULTI-CASE LOOP — Step 8
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _stable_hash(*args) -> str:
+    """Create a stable MD5 hex digest from JSON-serialised args for caching."""
+    import hashlib
+    payload = json.dumps(args, sort_keys=True, default=str)
+    return hashlib.md5(payload.encode()).hexdigest()
+
+
+@st.cache_data(show_spinner=False)
+def _cached_calculate_all_cases(_cache_key: str, inputs: dict,
+                                traffic_data: dict, cost_data: dict,
+                                annualisation: dict, safety_vkt_data: dict,
+                                params: dict) -> dict:
+    return calculate_all_cases(
+        inputs=inputs,
+        traffic_data=traffic_data,
+        cost_data=cost_data,
+        annualisation=annualisation,
+        safety_vkt_data=safety_vkt_data,
+        params=params,
+    )
+
+
 def calculate_all_cases(
     inputs: dict,
     traffic_data: dict,
@@ -1529,8 +1598,11 @@ def generate_csv(results: dict, project_name: str) -> str:
     buf = io.StringIO()
     w = csv.writer(buf)
     r = results
+    safe_name = project_name.replace("\t", " ").replace("\r", " ")
+    if safe_name.startswith(("=", "+", "-", "@", "\t")):
+        safe_name = "'" + safe_name
     w.writerow(["Transport CBA Dashboard Export"])
-    w.writerow(["Project", project_name])
+    w.writerow(["Project", safe_name])
     w.writerow(["Discount Rate", f"{r['dr']}%"])
     w.writerow(["NPV ($M)", f"{r['npv']:.2f}"])
     w.writerow(["BCR", f"{r['bcr']:.3f}"])
@@ -1606,14 +1678,14 @@ def param_editor(label: str, key: str, default: float,
             st.caption(f"{arrow} {abs(pct):.0f}% from default")
     with col_num:
         st.number_input(
-            "", key=f"{key}_num",
+            f"{label} value", key=f"{key}_num",
             min_value=float(min_val), max_value=float(max_val), step=float(step),
             label_visibility="collapsed",
             on_change=_param_sync_num, args=(key,),
         )
     with col_sl:
         st.slider(
-            "", key=f"{key}_sl",
+            f"{label} slider", key=f"{key}_sl",
             min_value=float(min_val), max_value=float(max_val), step=float(step),
             label_visibility="collapsed",
             on_change=_param_sync_sl, args=(key,),
@@ -1731,7 +1803,7 @@ def render_incremental_summary() -> None:
 
     styled = df_inc.style.format(fmt)
     for col in delta_cols:
-        styled = styled.applymap(_colour_delta, subset=[col])
+        styled = styled.map(_colour_delta, subset=[col])
 
     st.dataframe(styled, use_container_width=True)
     st.caption(
@@ -1882,13 +1954,41 @@ _init_session_state()
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Transport CBA")
-    st.caption("TfNSW Economic Parameter Values (Jan 2025) · June 2024 prices")
+    st.caption(f"v{__version__} · TfNSW EPV Jan 2025 · June 2024 prices")
+
+    # TODO: Save/Load Project — JSON export/import including inputs + results + MC outputs. Implementation deferred.
 
     # ── Quick Start ───────────────────────────────────────────────────────────
     with st.expander("Quick Start", expanded=True):
         st.caption("Load a sample rural bypass scenario to explore the dashboard without entering data manually.")
-        if st.button("Load Sample Data", use_container_width=True):
+        _confirm_load = st.checkbox("I understand this will overwrite all current data", key="confirm_load_sample")
+        if st.button("Load Sample Data", use_container_width=True, disabled=not _confirm_load):
             _load_sample_data()
+
+    # ── Save / Load Project ─────────────────────────────────────────────────
+    with st.expander("Save / Load Project", expanded=False):
+        st.caption("Download your project data as JSON or upload a previously saved file.")
+        _proj = _serialise_project()
+        _proj_json = json.dumps(_proj, default=str)
+        _safe_filename = re.sub(r'[^\w\s-]', '', st.session_state.get("project_name", "cba_project")).strip().replace(' ', '_') or "cba_project"
+        st.download_button(
+            "Save Project (.json)",
+            _proj_json,
+            file_name=f"{_safe_filename}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        _uploaded_project = st.file_uploader(
+            "Load Project (.json)", type=["json"], key="load_project_uploader",
+            label_visibility="collapsed",
+        )
+        if _uploaded_project is not None:
+            try:
+                _loaded = json.loads(_uploaded_project.read().decode("utf-8"))
+                _deserialise_project(_loaded)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error loading project: {e}")
 
     st.divider()
 
@@ -1899,7 +1999,7 @@ with st.sidebar:
     _n_input = st.number_input(
         "Number of Project Cases", min_value=1, max_value=5,
         value=st.session_state["n_project_cases"], step=1,
-        key="n_project_cases_widget",
+        help="Number of project alternatives to compare against the Base Case (1–5). Each has its own traffic and cost data.",
     )
     if _n_input != st.session_state["n_project_cases"]:
         st.session_state["n_project_cases"] = _n_input
@@ -1962,18 +2062,24 @@ with st.sidebar:
 
     # --- Project Details ---
     st.markdown("### Project Details")
-    project_name = st.text_input("Project Name", value="Sample Road Upgrade")
+    project_name = st.text_input("Project Name", value="Sample Road Upgrade",
+        help="A descriptive name for this cost-benefit analysis. Shown in the header and exported CSV.")
+    st.session_state["project_name"] = project_name
     col1, col2 = st.columns(2)
     with col1:
-        eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30)
+        eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30,
+            help="Total analysis period in years (typically 20–40). Includes construction and operating years.")
         discount_base_year = st.number_input("Discount Base Year", 2020, 2060, 2026,
             help="Calendar year used as Year 0 for discounting (PV anchor).")
         construction_start_year = st.number_input("Construction Start Year", 2020, 2060, 2026,
             help="Calendar year construction begins. Benefits start after the construction period.")
     with col2:
-        const_years = st.number_input("Construction Period (years)", 1, 10, 3)
-        discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 5.0, step=0.5)
-    context = st.selectbox("Context", ["urban", "rural"], format_func=str.title)
+        const_years = st.number_input("Construction Period (years)", 1, 10, 3,
+            help="Number of years over which capital costs are spread. Construction disbenefits apply during this period.")
+        discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 5.0, step=0.5,
+            help="TfNSW default: 5%. Used to discount future costs and benefits to present values. Higher rates reduce NPV.")
+    context = st.selectbox("Context", ["urban", "rural"], format_func=str.title,
+        help="Affects VTTS rates, VOC speed tables, emission costs, and air pollution rates. Urban uses higher rates.")
     zero_growth_after_last_year = st.checkbox(
         "Zero growth after last modelling year",
         value=False,
@@ -2022,18 +2128,21 @@ _matrix_inputs = {
     "n_project_cases": st.session_state.n_project_cases,
 }
 try:
-    matrix_results = calculate_all_cases(
-        inputs=_matrix_inputs,
+    _eff_params = build_effective_params()
+    _cache_key = _stable_hash(_matrix_inputs, st.session_state.traffic_data,
+                              st.session_state.cost_data, st.session_state.annualisation,
+                              st.session_state.safety_vkt_data, _eff_params)
+    matrix_results = _cached_calculate_all_cases(
+        _cache_key, _matrix_inputs,
         traffic_data=st.session_state.traffic_data,
         cost_data=st.session_state.cost_data,
         annualisation=st.session_state.annualisation,
         safety_vkt_data=st.session_state.safety_vkt_data,
-        params=build_effective_params(),
+        params=_eff_params,
     )
 except Exception as _calc_err:
     matrix_results = {}
-    if st.session_state.get("debug_mode"):
-        st.error(f"Matrix calculation error: {_calc_err}")
+    st.error(f"Calculation error: {_calc_err}. Please check your input data for missing or invalid values.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2048,7 +2157,7 @@ PLOTLY_TRANSPARENT = dict(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,
 st.markdown(f"""
 <div class="main-header">
     <h1>Transport Cost-Benefit Analysis</h1>
-    <p>{project_name} · TfNSW Framework · {context.title()} · {discount_rate}% discount rate</p>
+    <p>{html.escape(project_name)} · TfNSW Framework · {context.title()} · {discount_rate}% discount rate</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2154,18 +2263,26 @@ with tab_datainput:
                     "**User mapping**: drag-and-drop your column and row names onto the expected fields."
                 ),
             )
+            MAX_UPLOAD_MB = 50
+
             uploaded_file = st.file_uploader(
-                "Drop file here",
+                "Drop file here (max 50 MB)",
                 type=["csv", "xlsx"],
                 label_visibility="collapsed",
             )
             if uploaded_file is not None:
-                if parse_mode == "Template":
-                    _handle_template_upload(uploaded_file)
-                elif parse_mode == "Smart parse":
-                    _smart_parse_upload(uploaded_file)
+                if uploaded_file.size > MAX_UPLOAD_MB * 1024 * 1024:
+                    st.error(f"File too large. Maximum upload size is {MAX_UPLOAD_MB} MB.")
                 else:
-                    _render_user_mapping_upload(uploaded_file)
+                    try:
+                        if parse_mode == "Template":
+                            _handle_template_upload(uploaded_file)
+                        elif parse_mode == "Smart parse":
+                            _smart_parse_upload(uploaded_file)
+                        else:
+                            _render_user_mapping_upload(uploaded_file)
+                    except Exception as e:
+                        st.error(f"Error parsing file: {e}. Please check the file format and try again.")
 
         with tmpl_col:
             st.markdown("**Download blank template**")
@@ -2214,18 +2331,49 @@ with tab_datainput:
         )
         render_traffic_matrix("vkt", "veh-km / peak period")
 
-    # ── Stops ─────────────────────────────────────────────────────────────
-    with st.expander("Stops (stops / peak period)", expanded=False):
-        st.caption("Vehicle stops per peak period. Captured for reference.")
-        render_traffic_matrix("stops", "stops / peak period")
-
     # ── Demand ────────────────────────────────────────────────────────────
     with st.expander("Demand (person-trips / peak period)", expanded=False):
-        st.caption(
-            "Person-trips per peak period. "
-            "Captured for reference; TTS is driven by VHT, not demand."
+        st.info(
+            "Demand data is captured for reference only. "
+            "It does not affect benefit calculations — Travel Time Savings are driven by VHT, not demand."
         )
         render_traffic_matrix("demand", "person-trips / peak period")
+
+    # ── Crashes by Severity ──────────────────────────────────────────────
+    with st.expander("Crashes by Severity", expanded=False):
+        st.info(
+            "Safety benefits currently use blended $/VKT rates (see Parameters tab). "
+            "Per-severity crash analysis will be available in a future update. "
+            "Enter crash counts by severity and modelling year below for reference."
+        )
+        _sev_labels = ["Fatal", "Serious", "Moderate", "Minor", "PDO"]
+        _case_keys = ["base_case"] + [f"project_{i}" for i in range(1, st.session_state.n_project_cases + 1)]
+        _case_labels = ["Base Case"] + [f"Project {i}" for i in range(1, st.session_state.n_project_cases + 1)]
+        _years = st.session_state["modelling_years"]
+        if "crash_data" not in st.session_state:
+            st.session_state["crash_data"] = {
+                ck: {sev: [0.0] * len(_years) for sev in _sev_labels}
+                for ck in _case_keys
+            }
+        _cd = st.session_state["crash_data"]
+        for _ck, _cl in zip(_case_keys, _case_labels):
+            st.markdown(f"**{_cl}**")
+            _crash_rows = []
+            for sev in _sev_labels:
+                _row = {str(y): _cd[_ck].get(sev, [0.0] * len(_years))[yi] for yi, y in enumerate(_years)}
+                _row["Severity"] = sev
+                _crash_rows.append(_row)
+            _crash_df = pd.DataFrame(_crash_rows).set_index("Severity")[[str(y) for y in _years]]
+            _edited = st.data_editor(
+                _crash_df,
+                use_container_width=True,
+                key=f"crash_{_ck}_{st.session_state.get('_crash_edit_counter', 0)}",
+                num_rows="fixed",
+            )
+            for _si, sev in enumerate(_sev_labels):
+                for _yi, y in enumerate(_years):
+                    _cd[_ck][sev][_yi] = float(_edited.iloc[_si][str(y)])
+        st.session_state["crash_data"] = _cd
 
     # ── Safety $/VKT ──────────────────────────────────────────────────────
     if st.session_state.get("safety_mode", "General") == "Detailed":
@@ -2295,25 +2443,33 @@ with tab_dash:
         if _reliability_mode == "General":
             _pv_display["tts"] = pv.get("tts", 0) + pv.get("reliability", 0)
             _pv_display["reliability"] = 0.0
-        labels_list, values_list, colors_list = [], [], []
-        for t in ["tts", "reliability", "voc", "safety", "env", "active"]:
-            if _pv_display.get(t, 0) > 0:
-                labels_list.append(TYPE_LABELS[t])
-                values_list.append(round(_pv_display[t], 2))
-                colors_list.append(COLORS[t])
-        fig_pie = go.Figure(data=[go.Pie(
-            labels=labels_list, values=values_list,
-            hole=0.45, marker_colors=colors_list,
-            textinfo="label+percent", textposition="outside",
-            pull=[0.03] * len(labels_list),
-        )])
-        fig_pie.update_layout(
-            showlegend=True, height=400,
-            margin=dict(t=20, b=20, l=20, r=20),
-            legend=dict(orientation="h", yanchor="bottom", y=-0.15),
+        if "pavement" not in _pv_display:
+            _pv_display["pavement"] = 0.0
+        _bar_types = ["tts", "voc", "safety", "env", "active", "pavement"]
+        if _reliability_mode != "General":
+            _bar_types.insert(1, "reliability")
+        _bar_labels = [TYPE_LABELS[t] for t in _bar_types]
+        _bar_values = [round(_pv_display.get(t, 0), 2) for t in _bar_types]
+        _bar_colors = [COLORS.get(t, "#6c757d") for t in _bar_types]
+        fig_bar = go.Figure()
+        for i, (lbl, val, clr) in enumerate(zip(_bar_labels, _bar_values, _bar_colors)):
+            bar_color = clr if val >= 0 else "#dc3545"
+            fig_bar.add_trace(go.Bar(
+                y=[lbl], x=[val], orientation="h",
+                marker_color=bar_color,
+                text=[f"${val:+.1f}M"], textposition="auto",
+                textfont_size=11, showlegend=False,
+                hovertemplate=f"{lbl}: ${{x:+.2f}}M<extra></extra>",
+            ))
+        fig_bar.add_vline(x=0, line_width=1, line_color="#888888")
+        fig_bar.update_layout(
+            height=max(300, 45 * len(_bar_types) + 80),
+            margin=dict(t=20, b=30, l=160, r=40),
+            xaxis_title="Present Value ($M)",
+            bargap=0.35,
             **PLOTLY_TRANSPARENT,
         )
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_bar, use_container_width=True)
 
     with chart2:
         st.subheader("NPV Waterfall ($M)")
@@ -2737,8 +2893,8 @@ with tab_sensitivity:
         "WEBs represent productivity gains not captured in conventional transport benefits "
         "(agglomeration, labour supply, imperfect competition). TfNSW and ATAP guidelines "
         "treat WEBs as additive to PV Benefits — typically 10–20% of PV Travel Time Savings "
-        "for urban projects, lower for rural. They are reported separately and do not form "
-        "part of the primary BCR."
+        "for urban projects, lower for rural. "
+        "WEBs are shown separately and are **not included in the primary BCR or NPV** reported above."
     )
     _pv_tts = _r_sens["pv_by_type"].get("tts", 0.0)
     _pv_costs_sens = _r_sens["pv_costs"]
@@ -2862,24 +3018,28 @@ with tab_sensitivity:
     # --- First-Year Benefit Breakdown ---
     st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
     fy = _r_sens["first_year"]
-    fy_cols = st.columns(8)
-    for i, (key, label) in enumerate(TYPE_LABELS.items()):
-        with fy_cols[i]:
-            st.metric(label, f"${fy.get(key, 0.0):.2f}M")
-    with fy_cols[7]:
-        st.metric("Total", f"${fy.get('total', 0.0):.2f}M")
+    with st.expander("First-Year Detail", expanded=True):
+        fy_cols = st.columns(8)
+        for i, (key, label) in enumerate(TYPE_LABELS.items()):
+            with fy_cols[i]:
+                st.metric(label, f"${fy.get(key, 0.0):.2f}M")
+        with fy_cols[7]:
+            st.metric("Total", f"${fy.get('total', 0.0):.2f}M")
 
     # --- Monte Carlo Risk Analysis (advanced only) ---
     if show_advanced:
         st.markdown('<div class="section-header">Monte Carlo Risk Analysis</div>', unsafe_allow_html=True)
         st.caption(
-            "Samples key inputs from uniform distributions to estimate the spread of outcomes. "
-            "Useful for understanding how uncertainty in forecasts affects project viability."
+            "Simulates outcome uncertainty by sampling key inputs from probability distributions:\n"
+            "• VTTS ~ Normal(μ, CV%)\n"
+            "• Safety $/VKT ~ Lognormal(μ, CV%)\n"
+            "• Traffic volume ~ Normal(μ, CV%)\n"
+            "• Capital cost ~ Triangular(min, mode, max)"
         )
 
         _mc_col1, _mc_col2 = st.columns(2)
         with _mc_col1:
-            _mc_n = st.slider("Number of simulations", 100, 2000, 500, step=100, key="mc_n")
+            _mc_n = st.slider("Number of simulations", 10, 50, 50, step=10, key="mc_n")
             _mc_demand = st.slider("Traffic volume uncertainty (CV %)", 1, 30, 15, key="mc_demand",
                                    help="Coefficient of variation for traffic VHT/VKT (normal distribution). 15% → roughly ±30% at 2σ.")
             _mc_vtts = st.slider("VTTS uncertainty (CV %)", 1, 30, 20, key="mc_vtts",
@@ -2891,13 +3051,13 @@ with tab_sensitivity:
                                  help="Maximum capital cost overrun as % above base. Triangular distribution: base, +½max, +max.")
 
         if st.button("Run Monte Carlo", key="mc_run"):
-            with st.spinner(f"Running {_mc_n} simulations…"):
-                _mc_case_keys = list(matrix_results.keys())
-                _mc_all_results: dict = {}
-                _eff_params = build_effective_params()
-                _cost_overrun_max = 1.0 + _mc_cost / 100
-                _cost_overrun_mode = 1.0 + _mc_cost / 200
-                for _mc_ck in _mc_case_keys:
+            _mc_case_keys = list(matrix_results.keys())
+            _mc_all_results: dict = {}
+            _eff_params = build_effective_params()
+            _cost_overrun_max = 1.0 + _mc_cost / 100
+            _cost_overrun_mode = 1.0 + _mc_cost / 200
+            _mc_progress = st.progress(0, text=f"Running Monte Carlo simulation (0/{len(_mc_case_keys)} cases)…")
+            for _mc_idx, _mc_ck in enumerate(_mc_case_keys):
                     _mc_result = run_monte_carlo(
                         case_key=_mc_ck,
                         inputs=_matrix_inputs,
@@ -2920,6 +3080,8 @@ with tab_sensitivity:
                         "npv": list(_mc_result["npv"]),
                         "bcr": list(_mc_result["bcr"]),
                     }
+                    _mc_progress.progress((_mc_idx + 1) / len(_mc_case_keys),
+                        text=f"Running Monte Carlo simulation ({_mc_idx + 1}/{len(_mc_case_keys)} cases)…")
             st.session_state["mc_results"] = _mc_all_results
 
         if st.session_state.get("mc_results"):
@@ -3051,7 +3213,8 @@ with tab_params:
     st.caption("Edit values below. Changes take effect immediately in all calculations. "
                "Source: TfNSW Economic Parameter Values (January 2025), June 2024 prices.")
 
-    if st.button("Reset All to Defaults", key="reset_params"):
+    _confirm_reset = st.checkbox("I understand this will reset all parameters to TfNSW defaults", key="confirm_reset_params")
+    if st.button("Reset All to Defaults", key="reset_params", disabled=not _confirm_reset):
         for _k in list(st.session_state.keys()):
             if _k.startswith("param_"):
                 del st.session_state[_k]
