@@ -315,9 +315,9 @@ def _load_sample_data() -> None:
     # ── Costs (Project 1) ──────────────────────────────────────────────────
     st.session_state["cost_data"] = {
         "project_1": {
-            "cap_planning": 5.0,
-            "cap_land": 12.0,
-            "cap_construction": 85.0,
+            "cap_planning": 15.0,
+            "cap_land": 30.0,
+            "cap_construction": 260.0,
             "contingency_pct": 15.0,
             "opex_maint": 1.8,
             "opex_op": 0.4,
