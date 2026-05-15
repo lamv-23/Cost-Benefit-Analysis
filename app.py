@@ -2228,8 +2228,8 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 # TABBED LAYOUT
 # ─────────────────────────────────────────────────────────────────────────────
-tab_datainput, tab_dash, tab_cashflow, tab_sensitivity, tab_params, tab_about = st.tabs(
-    ["Data Input", "Dashboard", "Detailed Cashflow", "Sensitivity", "Parameters", "About"]
+tab_about, tab_datainput, tab_dash, tab_cashflow, tab_sensitivity, tab_params = st.tabs(
+    ["About", "Data Input", "Dashboard", "Detailed Cashflow", "Sensitivity", "Parameters"]
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3416,7 +3416,7 @@ with tab_about:
     with col_npv:
         st.info("**Net Present Value (NPV)**\nPV Benefits minus PV Costs. Positive NPV indicates the project returns more to society than it costs.")
     with col_bcr:
-        st.info("**Benefit–Cost Ratio (BCR)**\nPV Benefits ÷ PV Costs. A BCR above 1.0 means benefits exceed costs. NSW Treasury typically requires BCR ≥ 1.5 for strong cases.")
+        st.info("**Benefit–Cost Ratio (BCR)**\nPV Benefits ÷ PV Costs. BCR ≥ 1.0 indicates benefits ≥ costs. Higher values indicate greater relative economic returns.")
     with col_pv:
         st.info("**Present Value of Benefits by Type**\nBreaks the total benefit into its components so you can see which categories drive the result.")
 
