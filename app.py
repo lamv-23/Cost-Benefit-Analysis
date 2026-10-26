@@ -2438,11 +2438,16 @@ with tab_datainput:
                 for ck in _case_keys
             }
         _cd = st.session_state["crash_data"]
+        # Fit stored data to current cases and years (both can change after init)
+        for _ck in _case_keys:
+            _cd.setdefault(_ck, {})
+            for sev in _sev_labels:
+                _cd[_ck][sev] = (list(_cd[_ck].get(sev, [])) + [0.0] * len(_years))[:len(_years)]
         for _ck, _cl in zip(_case_keys, _case_labels):
             st.markdown(f"**{_cl}**")
             _crash_rows = []
             for sev in _sev_labels:
-                _row = {str(y): _cd[_ck].get(sev, [0.0] * len(_years))[yi] for yi, y in enumerate(_years)}
+                _row = {str(y): _cd[_ck][sev][yi] for yi, y in enumerate(_years)}
                 _row["Severity"] = sev
                 _crash_rows.append(_row)
             _crash_df = pd.DataFrame(_crash_rows).set_index("Severity")[[str(y) for y in _years]]
