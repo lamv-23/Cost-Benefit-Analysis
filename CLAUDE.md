@@ -169,7 +169,10 @@ Mapping is defined in `VTYPE_MAP` constant.
 |---------|-----------|
 | **Speed** | Derived: `speed = VKT / VHT` (never directly input) |
 | **Annualisation** | Peak-period × expansion_factor × days_per_year (per vehicle type) |
-| **Year interpolation** | CAGR: `v1 × (v2/v1)^((eval_year − y1) / (y2 − y1))` |
+| **Year interpolation** | CAGR: `v1 × (v2/v1)^((eval_year − y1) / (y2 − y1))`; linear (clamped ≥ 0) when either endpoint is 0 |
+| **Disbenefits** | Never clamp per-vehicle-type benefits at 0 — a slower/costlier project is a negative benefit |
+| **Rule-of-Half** | Halves only the generated-demand share of TTS, reliability and VOC; safety and environment use the full VKT change |
+| **Discount rates** | 5% central; required sensitivity at 3%, 4% (federal PPR) and 7% (TfNSW CBA Guide Aug 2024 / TPG23-08) |
 | **Discounting** | Start-of-year convention: `1 / (1 + rate/100)^year` |
 | **TTS** | From VHT delta × occupancy × VTTS (VHT only, not VKT) |
 | **VOC** | Speed-dependent rates, interpolated from lookup tables |
@@ -181,7 +184,10 @@ Mapping is defined in `VTYPE_MAP` constant.
 
 ## UI Patterns
 
-- **Sidebar**: project name, modelling years, costs, discount rate, annualisation
+- **Sidebar**: project name, periods, discount rate, context, save/load (costs are entered in the Data Input tab)
+- **Run order**: the calculation, KPI row and Save button run *after* the Data Input tab (filled into containers reserved earlier) so edits apply on the same run — anything reading cost/traffic edits must come after Data Input
+- **Restorable widgets**: use `key=` with no `value=`/`index=`, and set the default in `_init_session_state` (written back every run so an early `st.rerun()` can't reset it); never assign a widget's key after it renders
+- **File uploader** returns the file on every run — apply each upload once (guarded by `_loaded_project_id` / `file_id`)
 - **Tabs**: Data Input → Dashboard → Cashflow → Sensitivity → Parameters
 - Data entry via `st.data_editor` (supports paste-from-Excel)
 - Parameters tab: sliders synced with number inputs via session state callbacks
@@ -232,8 +238,18 @@ python3 -m pytest tests -q
 
 - `tests/test_engine.py` — unit tests of `cba_engine` (cost schedule, PV lines, required sensitivity rows, summary, CSV, project-file validation).
 - `tests/test_app_smoke.py` — headless `AppTest` runs of `app.py`: load sample (`confirm_load_sample` checkbox, then the "Load Sample Data" button), change periods, two options, save/load, sensitivity table, dashboard summary. Use `AppTest.from_file("app.py", default_timeout=300)`.
+- AppTest can't drive uploads/downloads: use `_capture_saves()` / `_open_in_fresh_app()` in `tests/test_app_smoke.py` (they monkeypatch `streamlit.download_button` / `file_uploader`)
 - Startup check: `streamlit run app.py` must load without errors.
 - Manual checks in `plan.md` still apply for new calculation features (unit chains for TTS, VOC, CO₂; CAGR interpolation).
+
+---
+
+## Deployment, Branches & Environment
+
+- `claude/complete-cba-dashboard-hBs4G` is the default branch and **deploys to Streamlit Cloud on push** — do feature work on a separate branch; merge/push only when the user says to
+- Push as GitHub account `lamv-23` (repo owner); a 403 on push means the wrong account is active — run `gh auth switch --user lamv-23`
+- `runtime.txt` pins Python 3.12 on Cloud; local is 3.9 — keep `from __future__ import annotations` in `cba_engine.py`
+- Shell is zsh: write `"${REV}:app.py"` not `$REV:app.py` (`:a` is a zsh modifier), and quote `'==='` in `echo`
 
 ---
 
