@@ -24,6 +24,8 @@ from cba_engine import (  # noqa: E402,F401
     PARAMS, VTYPE_MAP, EMISSION_VTYPE_MAP, AIR_NOISE_VTYPE_MAP, VTYPES,
     DEFAULT_MODELLING_YEARS, TYPE_LABELS,
     make_traffic_case, make_traffic_data, make_cost_data,
+    COST_FORMAT_VERSION, CAPEX_CATEGORIES, clean_row, make_base_case_costs,
+    fit_cost_rows, build_cost_schedule, validate_project_file,
     discount_factor, interpolate_voc, _cagr_interpolate, interpolate_modelling_years,
     calculate_matrix, calculate_all_cases, run_monte_carlo, generate_csv,
 )
@@ -158,24 +160,36 @@ def _load_sample_data() -> None:
 
     st.session_state["traffic_data"] = td
 
-    # ── Costs (Project 1) ──────────────────────────────────────────────────
-    st.session_state["cost_data"] = {
-        "project_1": {
-            "cap_planning": 15.0,
-            "cap_land": 30.0,
-            "cap_construction": 260.0,
-            "contingency_pct": 15.0,
-            "opex_maint": 1.8,
-            "opex_op": 0.4,
-            "residual": 0.0,                  # 0 = use auto-calculated residual
-            "construction_disbenefit_annual": 0.0,
-            "construction_asset_life": 40,
-            "walk_pkm_day": 800.0, "cycle_pkm_day": 400.0,
-            "pavement_saving_annual": 0.3,
-            "generated_demand_pct_global": 0.0,
-            "generated_demand_pct_override": {"Car": None, "LCV": None, "HCV": None, "Bus": None},
-        }
-    }
+    # ── Costs (Project 1): 3 construction years + 30-year appraisal period ──
+    # Real $M by year. Timeline index 0-2 = construction, 3-32 = operation.
+    _n_years = 3 + 30
+    _recurrent = [1.2] * 3 + [2.2] * 30      # existing road kept during construction
+    for _t in (12, 22, 32):                   # operating years 10, 20, 30: resurfacing
+        _recurrent[_t] = 2.2 + 6.0
+    _base_recurrent = [1.2] * _n_years
+    for _t in (8, 18, 28):                    # base case periodic resurfacing
+        _base_recurrent[_t] = 1.2 + 5.0
+    _p1_costs = make_cost_data(1, 3, 30)["project_1"]
+    _p1_costs.update({
+        "capex_base": {
+            "planning": [10.0, 3.0, 2.0],
+            "land": [25.0, 5.0, 0.0],
+            "construction": [60.0, 120.0, 80.0],
+        },
+        "contingency_p50": [8.0, 20.0, 17.0],
+        "contingency_p90": [14.0, 35.0, 29.0],
+        "recurrent": _recurrent,
+        "upfront_carbon_t": 45000.0,
+        "outturn_p50_nominal": 395.0,
+        "outturn_p90_nominal": 432.0,
+        "residual": 0.0,                  # 0 = use auto-calculated residual
+        "construction_disbenefit_annual": 0.0,
+        "construction_asset_life": 40,
+        "walk_pkm_day": 800.0, "cycle_pkm_day": 400.0,
+        "generated_demand_pct_global": 0.0,
+    })
+    st.session_state["cost_data"] = {"project_1": _p1_costs}
+    st.session_state["base_case_costs"] = {"recurrent": _base_recurrent}
 
     # ── Safety rates — keep defaults from PARAMS ───────────────────────────
     _case_keys = ["base_case", "project_1"]
@@ -193,12 +207,13 @@ def _load_sample_data() -> None:
 def _serialise_project() -> dict:
     """Serialise all project state to a JSON-compatible dict."""
     keys_to_save = [
-        "traffic_data", "cost_data", "safety_vkt_data", "crash_data",
+        "traffic_data", "cost_data", "base_case_costs", "safety_vkt_data", "crash_data",
         "annualisation", "modelling_years", "n_project_cases",
         "safety_mode", "env_mode", "reliability_mode", "show_advanced",
         "project_name",
     ]
-    data = {"version": __version__, "type": "cba_project"}
+    data = {"version": __version__, "type": "cba_project",
+            "cost_format": COST_FORMAT_VERSION}
     for k in keys_to_save:
         if k in st.session_state:
             data[k] = st.session_state[k]
@@ -209,13 +224,14 @@ def _serialise_project() -> dict:
 
 
 def _deserialise_project(data: dict) -> None:
-    """Restore project state from a JSON dict."""
-    if data.get("type") != "cba_project":
-        st.error("Invalid file: not a CBA project export.")
-        return
+    """Restore project state from a JSON dict. Returns False if nothing was loaded."""
+    _err = validate_project_file(data)
+    if _err:
+        st.error(_err)
+        return False
     if data.get("version") != __version__:
         st.warning(f"File version {data.get('version')} differs from app version {__version__}. Some data may not load correctly.")
-    for k in ("traffic_data", "cost_data", "safety_vkt_data", "crash_data",
+    for k in ("traffic_data", "cost_data", "base_case_costs", "safety_vkt_data", "crash_data",
               "annualisation", "modelling_years", "n_project_cases",
               "safety_mode", "env_mode", "reliability_mode", "show_advanced"):
         if k in data:
@@ -225,6 +241,7 @@ def _deserialise_project(data: dict) -> None:
             st.session_state[k] = data[k]
     st.session_state["n_project_cases"] = data.get("n_project_cases", 1)
     st.success("Project loaded successfully!")
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,88 +372,160 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
 # COST ENTRY UI HELPER — Step 5
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_cost_entry(eval_period: int = 30) -> None:
-    """Render cost input forms per project case (Step 5).
+_CAPEX_ROWS = [
+    ("Planning & design", "planning"),
+    ("Land", "land"),
+    ("Construction", "construction"),
+    ("Contingency to P50", "contingency_p50"),
+    ("Contingency to P90", "contingency_p90"),
+]
 
-    One expandable section per project case with capital costs (planning, land,
-    construction, contingency %), recurrent costs (maintenance, operating), and
-    residual value.  Updates ``st.session_state.cost_data`` in-place.
 
-    Args:
-        eval_period: Operational evaluation period in years (from sidebar).
-                     Used to compute auto-calculated residual value.
+def _edit_year_rows(rows: dict, years: list, key: str, help_text: str = None) -> dict:
+    """Render one ``st.data_editor`` with a row per entry of ``rows`` over ``years``.
+
+    Returns ``{row_label: [float per year]}``, with blank or pasted non-numbers as 0.0.
+    """
+    cols = [str(y) for y in years]
+    df = pd.DataFrame([list(v) for v in rows.values()], index=list(rows), columns=cols)
+    edited = st.data_editor(
+        df, num_rows="fixed", key=key, use_container_width=True,
+        column_config={c: st.column_config.NumberColumn(c, format="%.2f", help=help_text)
+                       for c in cols},
+    )
+    return {label: clean_row([edited.loc[label, c] for c in cols]) for label in rows}
+
+
+def render_cost_entry(const_years: int, eval_period: int, start_year: int) -> None:
+    """Render yearly cost tables: the shared base case, then each project option.
+
+    Capital rows cover the construction years; recurrent rows cover the whole
+    timeline (construction + appraisal period), starting at ``start_year``.
+    All values are real $M. Updates ``st.session_state`` cost dicts in place.
     """
     n = st.session_state.n_project_cases
+    base = st.session_state.base_case_costs
+    fit_cost_rows(base, const_years, eval_period)
+    for i in range(1, n + 1):
+        fit_cost_rows(st.session_state.cost_data[f"project_{i}"], const_years, eval_period)
+
+    build_years = list(range(start_year, start_year + const_years))
+    all_years = list(range(start_year, start_year + const_years + eval_period))
+
+    with st.expander("Base case — recurrent costs ($M, real)", expanded=True):
+        st.caption(
+            "Maintenance, operations and periodic renewals of the existing road if the "
+            "project does not go ahead. Shared by all options; counted as an avoided cost "
+            "(a benefit) for each option."
+        )
+        base["recurrent"] = _edit_year_rows(
+            {"Recurrent": base["recurrent"]}, all_years, key="cost_base_recurrent",
+        )["Recurrent"]
+
     for i in range(1, n + 1):
         case_key = f"project_{i}"
         cd = st.session_state.cost_data[case_key]
 
         with st.expander(f"Project {i} — Costs", expanded=(i == 1)):
-            st.markdown("**Capital Costs ($M, undiscounted)**")
-            c1, c2 = st.columns(2)
-            with c1:
-                cd["cap_planning"] = st.number_input(
-                    "Planning & Design ($M)", min_value=0.0,
-                    value=float(cd["cap_planning"]), step=0.1, key=f"cost_planning_{i}",
-                )
-                cd["cap_construction"] = st.number_input(
-                    "Construction ($M)", min_value=0.0,
-                    value=float(cd["cap_construction"]), step=1.0, key=f"cost_construction_{i}",
-                )
-                cd["construction_asset_life"] = st.number_input(
-                    "Construction Asset Life (years)",
-                    min_value=1, max_value=200,
-                    value=int(cd.get("construction_asset_life", 40)),
-                    step=5, key=f"cost_asset_life_{i}",
+            st.markdown("**Capital costs by construction year ($M, real)**")
+            st.caption(
+                "Base estimates (no contingency) for planning & design, land and construction, "
+                "plus the contingency that takes the base to P50 and to P90. Paste a row from Excel."
+            )
+            _cap_in = {
+                label: (cd["capex_base"][k] if k in CAPEX_CATEGORIES else cd[k])
+                for label, k in _CAPEX_ROWS
+            }
+            _cap_out = _edit_year_rows(_cap_in, build_years, key=f"cost_capex_{i}")
+            for label, k in _CAPEX_ROWS:
+                if k in CAPEX_CATEGORIES:
+                    cd["capex_base"][k] = _cap_out[label]
+                else:
+                    cd[k] = _cap_out[label]
+
+            _sched_p50 = build_cost_schedule(cd, base, const_years, eval_period)
+            _sched_p90 = build_cost_schedule(cd, base, const_years, eval_period, capital="p90")
+            _t1, _t2 = st.columns(2)
+            _t1.metric("P50 capital ($M, real)", format_m(_sched_p50["capital_total"]),
+                       help="Base estimate rows + contingency to P50. Used in the core result.")
+            _t2.metric("P90 capital ($M, real)", format_m(_sched_p90["capital_total"]),
+                       help="Base estimate rows + contingency to P90. Used as a sensitivity test.")
+
+            st.markdown("**Recurrent costs by year ($M, real)**")
+            _rec_help = (
+                "Operations, maintenance and periodic renewals with the project. "
+                "In construction years, enter the cost of maintaining the existing road."
+            )
+            st.caption(_rec_help)
+            cd["recurrent"] = _edit_year_rows(
+                {"Recurrent": cd["recurrent"]}, all_years,
+                key=f"cost_recurrent_{i}", help_text=_rec_help,
+            )["Recurrent"]
+
+            st.markdown("**Upfront carbon and outturn capital**")
+            _u1, _u2, _u3 = st.columns(3)
+            with _u1:
+                cd["upfront_carbon_t"] = st.number_input(
+                    "Upfront carbon (tCO₂e)", min_value=0.0,
+                    value=float(cd.get("upfront_carbon_t", 0.0) or 0.0), step=100.0,
+                    key=f"cost_upfront_carbon_{i}",
                     help=(
-                        "Useful life of the constructed asset — used to auto-calculate residual "
-                        "value at end of evaluation period (straight-line depreciation). "
-                        "Typical values: sealed rural road 40–60 yr · urban arterial 30–50 yr · "
-                        "bridge/major structure 80–100 yr · flexible pavement 25–35 yr · "
-                        "unsealed road 15–20 yr · ITS/signals 15–25 yr. "
-                        "Land acquisition always retains full value regardless of this setting."
+                        "Embodied carbon from construction. Spread over the construction years "
+                        "in proportion to P50 capital and valued at the carbon price "
+                        "(Parameters tab). Reported as a disbenefit."
                     ),
                 )
-            with c2:
-                cd["cap_land"] = st.number_input(
-                    "Land Acquisition ($M)", min_value=0.0,
-                    value=float(cd["cap_land"]), step=0.1, key=f"cost_land_{i}",
+            with _u2:
+                cd["outturn_p50_nominal"] = st.number_input(
+                    "P50 outturn capital (nominal $M)", min_value=0.0,
+                    value=cd.get("outturn_p50_nominal"), step=1.0,
+                    key=f"cost_outturn_p50_{i}",
+                    help="Copied from the cost estimate. Reporting only; never used in the calculation.",
                 )
-                cd["contingency_pct"] = st.number_input(
-                    "Contingency (%)", min_value=0.0, max_value=50.0,
-                    value=float(cd["contingency_pct"]), step=1.0, key=f"cost_contingency_{i}",
+            with _u3:
+                cd["outturn_p90_nominal"] = st.number_input(
+                    "P90 outturn capital (nominal $M)", min_value=0.0,
+                    value=cd.get("outturn_p90_nominal"), step=1.0,
+                    key=f"cost_outturn_p90_{i}",
+                    help="Copied from the cost estimate. Reporting only; never used in the calculation.",
                 )
 
-            total_cap = (
-                (cd["cap_planning"] + cd["cap_land"] + cd["cap_construction"])
-                * (1 + cd["contingency_pct"] / 100)
-            )
-            st.metric(
-                f"Total Capital incl. {cd['contingency_pct']:.0f}% contingency ($M)",
-                f"${total_cap:.2f}M",
+            cd["construction_asset_life"] = st.number_input(
+                "Construction Asset Life (years)",
+                min_value=1, max_value=200,
+                value=int(cd.get("construction_asset_life", 40)),
+                step=5, key=f"cost_asset_life_{i}",
+                help=(
+                    "Useful life of the constructed asset — used to auto-calculate residual "
+                    "value at end of evaluation period (straight-line depreciation). "
+                    "Typical values: sealed rural road 40–60 yr · urban arterial 30–50 yr · "
+                    "bridge/major structure 80–100 yr · flexible pavement 25–35 yr · "
+                    "unsealed road 15–20 yr · ITS/signals 15–25 yr. "
+                    "Land acquisition always retains full value regardless of this setting."
+                ),
             )
 
             # ── Auto-calculated Residual Value ───────────────────────────────
             _life = int(cd.get("construction_asset_life", 40))
             _rem_frac = max(0.0, (_life - eval_period) / _life) if _life > 0 else 0.0
-            _const_with_cont = cd["cap_construction"] * (1 + cd["contingency_pct"] / 100)
-            _land_res = cd["cap_land"]
-            _const_res = _const_with_cont * _rem_frac
+            _by_cat = _sched_p50["capital_by_category"]
+            _land_res = _by_cat["land"]
+            _const_res = _by_cat["construction"] * _rem_frac
             _auto_res = _land_res + _const_res
             _override = cd.get("residual", 0.0) > 0.0
             st.markdown("**Residual Value (auto-calculated)**")
             _rc1, _rc2, _rc3 = st.columns(3)
             _rc1.metric(
                 "Land Residual ($M)", f"${_land_res:.2f}M",
-                help="Land acquisition retains full value (no depreciation).",
+                help="Land (with its pro-rata share of P50 contingency) retains full value.",
             )
             _rc2.metric(
                 "Construction Residual ($M)", f"${_const_res:.2f}M",
                 help=(
-                    f"{_rem_frac*100:.0f}% of construction cost (incl. contingency) remaining "
-                    f"after {eval_period}-yr evaluation period "
+                    f"{_rem_frac*100:.0f}% of P50 construction cost (incl. its pro-rata share of "
+                    f"contingency) remaining after the {eval_period}-yr appraisal period "
                     f"(asset life {_life} yr). "
-                    "Formula: cost × max(0, (asset_life − eval_period) / asset_life)."
+                    "Formula: cost × max(0, (asset_life − appraisal_period) / asset_life)."
                 ),
             )
             _rc3.metric(
@@ -449,19 +538,6 @@ def render_cost_entry(eval_period: int = 30) -> None:
                 ),
             )
 
-            st.markdown("**Recurrent Costs ($M/year)**")
-            r1, r2 = st.columns(2)
-            with r1:
-                cd["opex_maint"] = st.number_input(
-                    "Maintenance ($M/yr)", min_value=0.0,
-                    value=float(cd["opex_maint"]), step=0.1, key=f"cost_maint_{i}",
-                )
-            with r2:
-                cd["opex_op"] = st.number_input(
-                    "Operating ($M/yr)", min_value=0.0,
-                    value=float(cd["opex_op"]), step=0.1, key=f"cost_op_{i}",
-                )
-
             st.markdown("**Construction-Phase Disbenefits ($M/year)**")
             cd["construction_disbenefit_annual"] = st.number_input(
                 "Traffic Disruption During Construction ($M/yr)",
@@ -472,8 +548,9 @@ def render_cost_entry(eval_period: int = 30) -> None:
                 help=(
                     "Annual road-user delay cost during construction (e.g. detour travel time, "
                     "VOC on diversion routes). Applied each year of the construction period and "
-                    "added to project costs. Source: TfNSW CBA Guidelines — model delays using "
-                    "affected AADT × detour delay × VTTS, or use a lump-sum estimate."
+                    "reported as a disbenefit (Construction disruption). Source: TfNSW CBA "
+                    "Guidelines — model delays using affected AADT × detour delay × VTTS, or use "
+                    "a lump-sum estimate."
                 ),
             )
 
@@ -508,8 +585,6 @@ def render_cost_entry(eval_period: int = 30) -> None:
                 ),
             )
 
-            # Projects saved before Rule-of-Half was added lack this key
-            cd.setdefault("generated_demand_pct_override", {vt: None for vt in VTYPES})
             with st.expander("Per-Vehicle-Type Overrides", expanded=False):
                 st.caption("Enable and set custom % for individual vehicle types (overrides global setting)")
                 for vtype in VTYPES:
@@ -560,20 +635,6 @@ def render_cost_entry(eval_period: int = 30) -> None:
                         "Source: TfNSW EPV Jan 2025, Table 18."
                     ),
                 )
-
-            st.markdown("**Pavement Maintenance Savings ($M/year)**")
-            cd["pavement_saving_annual"] = st.number_input(
-                "Road Authority Maintenance Saving ($M/yr)", min_value=0.0,
-                value=float(cd.get("pavement_saving_annual", 0.0)), step=0.1,
-                key=f"cost_pavement_{i}",
-                help=(
-                    "Avoided road authority pavement maintenance cost during the operational "
-                    "period (e.g. reduced resurfacing on routes that lose heavy freight traffic, "
-                    "or longer pavement life on a new alignment). Applied as a benefit from "
-                    "first operational year. Source: TfNSW CBA Guidelines — pavement "
-                    "deterioration modelling or agency-supplied unit cost rates."
-                ),
-            )
 
             st.session_state.cost_data[case_key] = cd
 
@@ -850,12 +911,14 @@ def _stable_hash(*args) -> str:
 @st.cache_data(show_spinner=False)
 def _cached_calculate_all_cases(_cache_key: str, inputs: dict,
                                 traffic_data: dict, cost_data: dict,
+                                base_case_costs: dict,
                                 annualisation: dict, safety_vkt_data: dict,
                                 params: dict) -> dict:
     return calculate_all_cases(
         inputs=inputs,
         traffic_data=traffic_data,
         cost_data=cost_data,
+        base_case_costs=base_case_costs,
         annualisation=annualisation,
         safety_vkt_data=safety_vkt_data,
         params=params,
@@ -1091,7 +1154,6 @@ COLORS = {
     "safety": "#dc3545",
     "env": "#198754",
     "active": "#20c997",
-    "pavement": "#795548",
     "cost": "#6c757d",
     "positive": "#198754",
     "negative": "#dc3545",
@@ -1202,6 +1264,12 @@ def _init_session_state() -> None:
             st.session_state.get("const_years", 3),
             st.session_state.get("eval_period", 30),
         )
+    # Base case costs are shared by all options and survive option-count changes
+    if "base_case_costs" not in st.session_state:
+        st.session_state["base_case_costs"] = make_base_case_costs(
+            st.session_state.get("const_years", 3),
+            st.session_state.get("eval_period", 30),
+        )
 
     st.session_state.setdefault("show_advanced", False)
     st.session_state.setdefault("safety_mode", "General")
@@ -1249,8 +1317,8 @@ with st.sidebar:
         if _uploaded_project is not None:
             try:
                 _loaded = json.loads(_uploaded_project.read().decode("utf-8"))
-                _deserialise_project(_loaded)
-                st.rerun()
+                if _deserialise_project(_loaded):
+                    st.rerun()
             except Exception as e:
                 st.error(f"Error loading project: {e}")
 
@@ -1332,7 +1400,7 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30, key="eval_period",
-            help="Total analysis period in years (typically 20–40). Includes construction and operating years.")
+            help="Appraisal period in years, counted from opening (TfNSW default: 30 years; maximum 50). Construction years are added before it.")
         discount_base_year = st.number_input("Discount Base Year", 2020, 2060, 2026,
             help="Calendar year used as Year 0 for discounting (PV anchor).")
         construction_start_year = st.number_input("Construction Start Year", 2020, 2060, 2026,
@@ -1598,12 +1666,12 @@ with tab_datainput:
             st.session_state["safety_vkt_data"] = _svd
 
     # ── Costs ─────────────────────────────────────────────────────────────
-    with st.expander("Costs — Capital & Recurrent ($M, undiscounted)", expanded=True):
+    with st.expander("Costs — Capital & Recurrent ($M, real, undiscounted)", expanded=True):
         st.caption(
-            "Per project case. Base Case has no project costs. Construction cost is spread "
-            "evenly over the construction period defined in Project Details (sidebar)."
+            "Yearly cashflows in real June 2024 dollars. Year columns follow the construction "
+            "start year, construction period and appraisal period in the sidebar."
         )
-        render_cost_entry(eval_period=eval_period)
+        render_cost_entry(const_years, eval_period, construction_start_year)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1614,12 +1682,14 @@ with _kpi_slot:
     try:
         _eff_params = build_effective_params()
         _cache_key = _stable_hash(_matrix_inputs, st.session_state.traffic_data,
-                                  st.session_state.cost_data, st.session_state.annualisation,
+                                  st.session_state.cost_data, st.session_state.base_case_costs,
+                                  st.session_state.annualisation,
                                   _calc_safety_vkt, _eff_params)
         matrix_results = _cached_calculate_all_cases(
             _cache_key, _matrix_inputs,
             traffic_data=st.session_state.traffic_data,
             cost_data=st.session_state.cost_data,
+            base_case_costs=st.session_state.base_case_costs,
             annualisation=st.session_state.annualisation,
             safety_vkt_data=_calc_safety_vkt,
             params=_eff_params,
@@ -1733,9 +1803,7 @@ with tab_dash:
         if _reliability_mode == "General":
             _pv_display["tts"] = pv.get("tts", 0) + pv.get("reliability", 0)
             _pv_display["reliability"] = 0.0
-        if "pavement" not in _pv_display:
-            _pv_display["pavement"] = 0.0
-        _bar_types = ["tts", "voc", "safety", "env", "active", "pavement"]
+        _bar_types = ["tts", "voc", "safety", "env", "active"]
         if _reliability_mode != "General":
             _bar_types.insert(1, "reliability")
         _bar_labels = [TYPE_LABELS[t] for t in _bar_types]
@@ -1765,10 +1833,10 @@ with tab_dash:
         st.subheader("NPV Waterfall ($M)")
         # Build waterfall series respecting reliability mode
         if _reliability_mode == "General":
-            _wf_types = ["tts", "voc", "safety", "env", "active"]
-            _wf_labels_benefit = [
-                "Travel Time & Reliability", "Vehicle Operating Costs",
-                "Safety", "Environmental", "Active Transport",
+            _wf_types = ["tts", "voc", "safety", "env", "active",
+                         "avoided_costs", "upfront_carbon", "construction_disruption", "residual"]
+            _wf_labels_benefit = ["Travel Time & Reliability"] + [
+                TYPE_LABELS[t] for t in _wf_types[1:]
             ]
         else:
             _wf_types = list(TYPE_LABELS.keys())
@@ -2309,11 +2377,11 @@ with tab_sensitivity:
     st.markdown('<div class="section-header">First-Year Benefit Breakdown ($M)</div>', unsafe_allow_html=True)
     fy = _r_sens["first_year"]
     with st.expander("First-Year Detail", expanded=True):
-        fy_cols = st.columns(8)
+        fy_cols = st.columns(len(TYPE_LABELS) + 1)
         for i, (key, label) in enumerate(TYPE_LABELS.items()):
             with fy_cols[i]:
                 st.metric(label, f"${fy.get(key, 0.0):.2f}M")
-        with fy_cols[7]:
+        with fy_cols[-1]:
             st.metric("Total", f"${fy.get('total', 0.0):.2f}M")
 
     # --- Monte Carlo Risk Analysis (advanced only) ---
@@ -2353,6 +2421,7 @@ with tab_sensitivity:
                         inputs=_matrix_inputs,
                         traffic_data=st.session_state.traffic_data,
                         cost_data=st.session_state.cost_data,
+                        base_case_costs=st.session_state.base_case_costs,
                         annualisation=st.session_state.annualisation,
                         safety_vkt_data=_calc_safety_vkt,
                         params=_eff_params,

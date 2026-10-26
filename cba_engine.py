@@ -118,7 +118,10 @@ TYPE_LABELS = {
     "safety": "Safety",
     "env": "Environmental",
     "active": "Active Transport",
-    "pavement": "Pavement Maintenance Savings",
+    "avoided_costs": "Avoided Base Case Costs",
+    "upfront_carbon": "Upfront Carbon Emissions",
+    "construction_disruption": "Construction Disruption",
+    "residual": "Residual Value",
 }
 
 
@@ -195,9 +198,6 @@ def make_cost_data(n_project_cases: int, const_years: int, eval_period: int) -> 
         construction_disbenefit_annual, construction_asset_life, residual,
         walk_pkm_day, cycle_pkm_day, generated_demand_pct_global,
         generated_demand_pct_override: {vtype: None}
-
-    The legacy flat keys (cap_planning, opex_maint, ...) are kept alongside the
-    new ones until the UI moves over to the yearly tables.
     """
     c, e = int(const_years), int(eval_period)
     template = {
@@ -214,10 +214,6 @@ def make_cost_data(n_project_cases: int, const_years: int, eval_period: int) -> 
         "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
         "generated_demand_pct_global": 0.0,
         "generated_demand_pct_override": {vt: None for vt in VTYPES},
-        # Legacy flat fields (removed once the UI uses the yearly tables)
-        "cap_planning": 0.0, "cap_land": 0.0, "cap_construction": 0.0,
-        "contingency_pct": 0.0, "opex_maint": 0.0, "opex_op": 0.0,
-        "pavement_saving_annual": 0.0,
     }
     return {f"project_{i}": copy.deepcopy(template) for i in range(1, n_project_cases + 1)}
 
@@ -321,6 +317,19 @@ def build_cost_schedule(
     }
 
 
+OLD_FILE_ERROR = (
+    "This project file was saved in an older format and can't be opened. "
+    "Please re-enter the project."
+)
+
+
+def validate_project_file(data: dict) -> str | None:
+    """Return the old-file error text unless ``data`` is a current-format project."""
+    if data.get("type") == "cba_project" and data.get("cost_format") == COST_FORMAT_VERSION:
+        return None
+    return OLD_FILE_ERROR
+
+
 def discount_factor(rate: float, year: int) -> float:
     return 1.0 / math.pow(1 + rate / 100, year)
 
@@ -392,6 +401,7 @@ def calculate_matrix(
     base_traffic: dict,
     proj_traffic: dict,
     cost: dict,
+    base_costs: dict,
     annualisation: dict,
     safety_vkt_base: dict = None,
     safety_vkt_proj: dict = None,
@@ -404,8 +414,13 @@ def calculate_matrix(
                        construction_years, discount_rate, base_year.
         base_traffic:  traffic_case dict for the base case.
         proj_traffic:  traffic_case dict for this project case.
-        cost:          cost_data entry for this project case.
+        cost:          cost_data entry for this project case (yearly cost rows).
+        base_costs:    shared base case costs (``make_base_case_costs``).
         annualisation: annualisation factor and days_per_year per vehicle type.
+
+    Costs per year are P50 capital + project recurrent. Avoided base case
+    recurrent costs, upfront carbon, construction disruption and residual value
+    are benefit lines (the last three usually negative or end-of-period).
 
     Returns:
         Result dict with the same keys as the legacy ``calculate()`` output so
@@ -428,32 +443,41 @@ def calculate_matrix(
     # Occupancy (persons/vehicle): converts VHT savings (veh-hrs) → person-hours
     occupancy_by_vtype = _p["occupancy"][ctx]
 
-    # Capital and recurrent costs
-    raw_cap = cost["cap_planning"] + cost["cap_land"] + cost["cap_construction"]
-    total_capital = raw_cap * (1 + cost["contingency_pct"] / 100)
-    annual_capital = total_capital / const_years if const_years > 0 else 0.0
-    opex = cost["opex_maint"] + cost["opex_op"]
+    # Yearly capital (P50) and recurrent cost schedule, real $M
+    schedule = build_cost_schedule(cost, base_costs, const_years, eval_period)
+    capital_p50_total = schedule["capital_total"]
+    capital_p90_total = build_cost_schedule(
+        cost, base_costs, const_years, eval_period, capital="p90",
+    )["capital_total"]
+    carbon_price = _p["carbon_per_tonne"]
+    disruption_annual = cost.get("construction_disbenefit_annual", 0.0) or 0.0
     # Residual value: straight-line depreciation per ATAP T2 / TfNSW CBA Guidelines.
     # Land: full value retained (perpetual, no depreciation).
-    # Construction (incl. contingency): depreciated proportionally over construction_asset_life.
+    # Construction (incl. attributed contingency): depreciated over construction_asset_life.
     # Planning/design: no residual (professional services, no physical asset).
     # Manual override: cost["residual"] > 0 takes precedence over auto-calculation.
     _const_life = cost.get("construction_asset_life", 40)
     _remaining_frac = (
         max(0.0, (_const_life - eval_period) / _const_life) if _const_life > 0 else 0.0
     )
-    _cap_construction_with_cont = cost["cap_construction"] * (1 + cost["contingency_pct"] / 100)
-    _auto_residual = cost["cap_land"] + _cap_construction_with_cont * _remaining_frac
-    residual = cost["residual"] if cost.get("residual", 0.0) > 0.0 else _auto_residual
+    _by_cat = schedule["capital_by_category"]
+    _auto_residual = _by_cat["land"] + _by_cat["construction"] * _remaining_frac
+    residual = cost["residual"] if (cost.get("residual", 0.0) or 0.0) > 0.0 else _auto_residual
 
     modelling_years = base_traffic["years"]
     total_years = const_years + eval_period
 
     annual_costs: list = []
+    annual_capital: list = []
+    annual_recurrent: list = []
     annual_benefits: list = []
     annual_env_emit: list = []       # emission_cost component only (used for carbon sensitivity)
     annual_safety_fatal: list = []   # fatal component of safety benefit (used for VSL sensitivity)
-    benefits_by_type: dict = {k: [] for k in ("tts", "tts_Car", "tts_LCV", "tts_HCV", "tts_Bus", "reliability", "voc", "safety", "env", "active", "pavement")}
+    _line_keys = ("tts", "reliability", "voc", "safety", "env", "active",
+                  "avoided_costs", "upfront_carbon", "construction_disruption", "residual")
+    benefits_by_type: dict = {k: [] for k in _line_keys}
+    for vt in VTYPES:
+        benefits_by_type[f"tts_{vt}"] = []
     annual_net: list = []
     disc_costs: list = []
     disc_benefits: list = []
@@ -475,15 +499,19 @@ def calculate_matrix(
         df_factor = discount_factor(dr, discount_exp)
         # Clamp traffic eval year to last modelling year when zero-growth is selected
         ey = min(eval_year, modelling_years[-1]) if zero_growth_after_last_year else eval_year
-        cost_y = 0.0
-        b_tts = b_rel = b_voc = b_safety = b_env = b_env_emit = b_active = b_pavement = 0.0
+        cap_y = schedule["capital"][y]
+        rec_y = schedule["project_recurrent"][y]
+        cost_y = cap_y + rec_y
+        b_tts = b_rel = b_voc = b_safety = b_env = b_env_emit = b_active = 0.0
         b_safety_fatal = 0.0
         b_tts_by_vt: dict = {vt: 0.0 for vt in VTYPES}
+        b_avoided = schedule["base_recurrent"][y]
+        # Disbenefits (0.0 - x keeps zero years at +0.0, not -0.0)
+        b_carbon = 0.0 - schedule["upfront_carbon_t"][y] * carbon_price / 1e6
+        b_disruption = 0.0 - disruption_annual if schedule["construction_years"][y] else 0.0
+        b_residual = residual if y == total_years - 1 else 0.0
 
-        if y < const_years:
-            cost_y = annual_capital + cost.get("construction_disbenefit_annual", 0.0)
-        else:
-            cost_y = opex
+        if y >= const_years:
 
             # ── TTS: per vehicle type ───────────────────────────────────────
             # Rule-of-Half: extract generated demand settings from cost dict
@@ -598,22 +626,18 @@ def calculate_matrix(
                 + _cycle * _p["health_benefits"]["cycling"]
             ) * 365 / 1e6
 
-            # ── Pavement Maintenance Savings: road authority avoided cost ─────
-            b_pavement = cost.get("pavement_saving_annual", 0.0)
-
-        benefit_y = b_tts + b_rel + b_voc + b_safety + b_env + b_active + b_pavement
-        if y == total_years - 1:
-            benefit_y += residual
+        line_values = (b_tts, b_rel, b_voc, b_safety, b_env, b_active,
+                       b_avoided, b_carbon, b_disruption, b_residual)
+        benefit_y = sum(line_values)
 
         net = benefit_y - cost_y
         annual_costs.append(cost_y)
+        annual_capital.append(cap_y)
+        annual_recurrent.append(rec_y)
         annual_benefits.append(benefit_y)
         annual_env_emit.append(b_env_emit)
         annual_safety_fatal.append(b_safety_fatal)
-        for k, v in zip(
-            ("tts", "reliability", "voc", "safety", "env", "active", "pavement"),
-            (b_tts, b_rel, b_voc, b_safety, b_env, b_active, b_pavement),
-        ):
+        for k, v in zip(_line_keys, line_values):
             benefits_by_type[k].append(v)
         for vt in VTYPES:
             benefits_by_type[f"tts_{vt}"].append(b_tts_by_vt[vt])
@@ -632,16 +656,18 @@ def calculate_matrix(
     bcr = pv_benefits / pv_costs if pv_costs > 0 else 0.0
     first_op = const_years if const_years < total_years else 0
     # FYRR (First Year Rate of Return): net benefit in first operational year
-    # expressed as a percentage of total undiscounted capital cost.
-    # Net benefit = gross benefits minus opex; excludes construction-period costs.
+    # expressed as a percentage of total undiscounted P50 capital cost.
+    # Net benefit = gross benefits minus recurrent costs; excludes construction-period costs.
     # Source: TfNSW CBA Practitioner's Guide; ATAP T2 §5.3 (supplementary).
     _first_op_net = annual_benefits[first_op] - annual_costs[first_op]
-    fyrr = (_first_op_net / total_capital * 100) if total_capital > 0 else 0.0
+    fyrr = (_first_op_net / capital_p50_total * 100) if capital_p50_total > 0 else 0.0
 
-    pv_by_type = {
-        t: sum(benefits_by_type[t][y] * discount_factor(dr, base_offset + y) for y in range(total_years))
-        for t in benefits_by_type
-    }
+    def _pv(row: list) -> float:
+        return sum(row[y] * discount_factor(dr, base_offset + y) for y in range(total_years))
+
+    pv_by_type = {t: _pv(benefits_by_type[t]) for t in benefits_by_type}
+    pv_capital = _pv(annual_capital)
+    pv_recurrent = _pv(annual_recurrent)
 
     sensitivity_dr = {}
     # TfNSW CBA Guidelines / NSW Treasury TPG23-08 sensitivity rates:
@@ -656,7 +682,8 @@ def calculate_matrix(
             "bcr": s_pvb / s_pvc if s_pvc > 0 else 0.0,
         }
 
-    # Carbon price sensitivity: scale only the emission_cost component of env benefits.
+    # Carbon price sensitivity: scale the emission_cost component of env benefits
+    # and the upfront (construction) carbon line.
     # Base carbon price: $123/tCO₂e (TfNSW EPV Jan 2025, June 2024 prices).
     # NSW Treasury TPG24-34 mandates $135.74/tCO₂e — included as a distinct scenario.
     _base_carbon = PARAMS["carbon_per_tonne"]  # 123
@@ -668,7 +695,8 @@ def calculate_matrix(
         ("High (2.0×, $246/t)", 2.0),
     ]:
         s_pvb = sum(
-            (annual_benefits[y] + annual_env_emit[y] * (_factor - 1.0))
+            (annual_benefits[y]
+             + (annual_env_emit[y] + benefits_by_type["upfront_carbon"][y]) * (_factor - 1.0))
             * discount_factor(dr, base_offset + y)
             for y in range(total_years)
         )
@@ -737,13 +765,15 @@ def calculate_matrix(
 
     # FYRR deferral test per TfNSW CBA Guidelines (ATAP T2 supplementary):
     # proceed if FYRR >= discount rate; otherwise consider deferral.
-    fyrr_deferral_pass = (fyrr >= dr) if total_capital > 0 else None
+    fyrr_deferral_pass = (fyrr >= dr) if capital_p50_total > 0 else None
 
-    # Benefit scenarios scale benefits only; residual value (an asset value) is held fixed
-    _pv_residual = residual * discount_factor(dr, base_offset + total_years - 1) if total_years > 0 else 0.0
+    # Benefit scenarios scale transport benefits only; residual value, avoided
+    # costs, upfront carbon and construction disruption are held fixed
+    _pv_fixed = sum(pv_by_type[k] for k in
+                    ("avoided_costs", "upfront_carbon", "construction_disruption", "residual"))
     scenarios = {}
     for label, factor in [("Low (-20%)", 0.8), ("Central", 1.0), ("High (+20%)", 1.2)]:
-        s_pvb = (pv_benefits - _pv_residual) * factor + _pv_residual
+        s_pvb = (pv_benefits - _pv_fixed) * factor + _pv_fixed
         s_pvc = sum(annual_costs[y] * discount_factor(dr, base_offset + y) for y in range(total_years))
         scenarios[label] = {
             "pvb": s_pvb, "pvc": s_pvc,
@@ -755,8 +785,12 @@ def calculate_matrix(
         "npv": npv, "bcr": bcr, "pv_benefits": pv_benefits, "pv_costs": pv_costs,
         "fyrr": fyrr, "fyrr_deferral_pass": fyrr_deferral_pass,
         "irr": irr,
-        "payback_year": payback_year, "total_capital": total_capital,
-        "annual_costs": annual_costs, "annual_benefits": annual_benefits,
+        "payback_year": payback_year,
+        "capital_p50_total": capital_p50_total, "capital_p90_total": capital_p90_total,
+        "residual": residual,
+        "pv_capital": pv_capital, "pv_recurrent": pv_recurrent,
+        "annual_costs": annual_costs, "annual_capital": annual_capital,
+        "annual_recurrent": annual_recurrent, "annual_benefits": annual_benefits,
         "annual_net": annual_net,
         "disc_costs": disc_costs, "disc_benefits": disc_benefits, "disc_net": disc_net,
         "cum_disc_net": cum_disc_net,
@@ -778,6 +812,7 @@ def calculate_all_cases(
     inputs: dict,
     traffic_data: dict,
     cost_data: dict,
+    base_case_costs: dict,
     annualisation: dict,
     safety_vkt_data: dict = None,
     params: dict = None,
@@ -792,6 +827,7 @@ def calculate_all_cases(
             base_traffic=traffic_data["base_case"],
             proj_traffic=traffic_data[case_key],
             cost=cost_data[case_key],
+            base_costs=base_case_costs,
             annualisation=annualisation,
             safety_vkt_base=safety_vkt_data.get("base_case") if safety_vkt_data else None,
             safety_vkt_proj=safety_vkt_data.get(case_key) if safety_vkt_data else None,
@@ -809,6 +845,7 @@ def run_monte_carlo(
     inputs: dict,
     traffic_data: dict,
     cost_data: dict,
+    base_case_costs: dict,
     annualisation: dict,
     safety_vkt_data: dict = None,
     params: dict = None,
@@ -828,13 +865,15 @@ def run_monte_carlo(
       - Safety $/VKT: Lognormal with sigma = safety_cv
       - Traffic VHT/VKT: Normal(1, traffic_cv), clamped > 0; one factor applied
         to both base and project so demand uncertainty moves them together
-      - Capital construction cost: Triangular(min, mode, max)
+      - P50 construction capital (construction base + P50 contingency):
+        Triangular(min, mode, max)
 
     Args:
         case_key:          e.g. ``"project_1"``
         inputs:            project config dict (same as calculate_matrix)
         traffic_data:      full traffic_data dict (keyed by case)
         cost_data:         full cost_data dict (keyed by case)
+        base_case_costs:   shared base case costs
         annualisation:     annualisation dict
         safety_vkt_data:   optional per-case safety rates
         params:            effective params (from build_effective_params())
@@ -850,7 +889,6 @@ def run_monte_carlo(
         ``prob_npv_positive``, and per-parameter sensitivity arrays for tornado.
     """
     import numpy as np
-    import copy
 
     rng = np.random.default_rng(seed)
     _p_base = params if params is not None else PARAMS
@@ -871,6 +909,13 @@ def run_monte_carlo(
     cost_orig         = cost_data[case_key]
     sv_base_orig      = safety_vkt_data.get("base_case") if safety_vkt_data else None
     sv_proj_orig      = safety_vkt_data.get(case_key)    if safety_vkt_data else None
+
+    def _scale_capital(factor: float) -> dict:
+        """Copy of the case costs with P50 construction capital scaled by ``factor``."""
+        c = copy.deepcopy(cost_orig)
+        c["capex_base"]["construction"] = [v * factor for v in c["capex_base"]["construction"]]
+        c["contingency_p50"] = [v * factor for v in c["contingency_p50"]]
+        return c
 
     for i in range(n_simulations):
         # ── Perturb params ──────────────────────────────────────────────────
@@ -897,8 +942,7 @@ def run_monte_carlo(
         proj_traffic_s = _scale_traffic(proj_traffic_orig, f_proj)
 
         # ── Perturb construction cost ────────────────────────────────────────
-        cost_s = dict(cost_orig)
-        cost_s["cap_construction"] = cost_orig["cap_construction"] * cost_factors[i]
+        cost_s = _scale_capital(cost_factors[i])
 
         # ── Calculate ────────────────────────────────────────────────────────
         result = calculate_matrix(
@@ -906,6 +950,7 @@ def run_monte_carlo(
             base_traffic=base_traffic_s,
             proj_traffic=proj_traffic_s,
             cost=cost_s,
+            base_costs=base_case_costs,
             annualisation=annualisation,
             safety_vkt_base=sv_base,
             safety_vkt_proj=sv_proj,
@@ -924,6 +969,7 @@ def run_monte_carlo(
         base_traffic=base_traffic_orig,
         proj_traffic=proj_traffic_orig,
         cost=cost_orig,
+        base_costs=base_case_costs,
         annualisation=annualisation,
         safety_vkt_base=sv_base_orig,
         safety_vkt_proj=sv_proj_orig,
@@ -940,11 +986,10 @@ def run_monte_carlo(
         _sv_p = {vt: (sv_proj_orig[vt] if sv_proj_orig else _p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
         _bt = _scale_traffic(base_traffic_orig, traffic_f)
         _pt = _scale_traffic(proj_traffic_orig, traffic_f)
-        _c = dict(cost_orig)
-        _c["cap_construction"] = cost_orig["cap_construction"] * cost_f
+        _c = _scale_capital(cost_f)
         return calculate_matrix(
             inputs=inputs, base_traffic=_bt, proj_traffic=_pt,
-            cost=_c, annualisation=annualisation,
+            cost=_c, base_costs=base_case_costs, annualisation=annualisation,
             safety_vkt_base=_sv_b, safety_vkt_proj=_sv_p, params=_p,
         )["npv"]
 
@@ -997,11 +1042,7 @@ def generate_csv(results: dict, project_name: str) -> str:
     w.writerow(["PV Costs ($M)", f"{r['pv_costs']:.2f}"])
     w.writerow([])
     w.writerow(["PV Benefits by Category"])
-    labels = {"tts": "Travel Time Savings", "reliability": "Reliability",
-              "voc": "Vehicle Operating Costs", "safety": "Safety",
-              "env": "Environmental", "active": "Active Transport",
-              "pavement": "Pavement Maintenance Savings"}
-    for k, lbl in labels.items():
+    for k, lbl in TYPE_LABELS.items():
         w.writerow([lbl, f"{r['pv_by_type'][k]:.2f}"])
     w.writerow([])
     w.writerow(["Year", "Undiscounted Cost ($M)", "Undiscounted Benefit ($M)",

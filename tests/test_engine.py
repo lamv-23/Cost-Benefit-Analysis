@@ -6,6 +6,7 @@ import pytest
 from cba_engine import (
     PARAMS, VTYPES, build_cost_schedule, calculate_matrix, clean_row, fit_cost_rows,
     interpolate_modelling_years, make_base_case_costs, make_cost_data,
+    validate_project_file,
 )
 from conftest import fixture_costs, make_case_traffic
 
@@ -29,7 +30,8 @@ def _run(base, proj, sv_proj=None, cost_overrides=None):
     if sv_proj:
         sv_p.update(sv_proj)
     return calculate_matrix(
-        INPUTS, base, proj, cost, ANNUALISATION, sv_base, sv_p, PARAMS,
+        INPUTS, base, proj, cost, make_base_case_costs(2, 30), ANNUALISATION,
+        sv_base, sv_p, PARAMS,
     )["first_year"]
 
 
@@ -159,3 +161,70 @@ def test_make_cost_data_no_shared_rows():
     assert data["project_2"]["generated_demand_pct_override"]["Car"] is None
     assert data["project_2"]["capex_base"]["land"][0] == 0.0
     assert make_base_case_costs(3, 10) == {"recurrent": [0.0] * 13}
+
+
+# ── Yearly costs in calculate_matrix ─────────────────────────────────────────
+
+COST_INPUTS = {
+    "context": "rural",
+    "evaluation_period": 3,
+    "construction_years": 2,
+    "discount_rate": 0,
+    "construction_start_year": 2026,
+    "discount_base_year": 2026,
+}
+
+
+def _run_costs(**cost_overrides):
+    cost, base = fixture_costs()
+    cost["construction_asset_life"] = 40
+    cost.update(cost_overrides)
+    traffic = make_case_traffic(YEARS)
+    return calculate_matrix(
+        COST_INPUTS, traffic, copy.deepcopy(traffic), cost, base, ANNUALISATION,
+        params=PARAMS,
+    )
+
+
+def test_central_costs_and_lines():
+    r = _run_costs()
+    assert r["pv_capital"] == pytest.approx(13.0)
+    assert r["pv_recurrent"] == pytest.approx(4.0)
+    assert r["pv_costs"] == pytest.approx(17.0)
+    assert r["pv_by_type"]["avoided_costs"] == pytest.approx(3.4)
+    assert r["pv_by_type"]["upfront_carbon"] == pytest.approx(-0.123)
+    assert r["pv_by_type"]["residual"] == pytest.approx(11.109091, abs=1e-6)
+    assert r["pv_benefits"] == pytest.approx(14.386091, abs=1e-6)
+    assert r["bcr"] == pytest.approx(0.846241, abs=1e-6)
+    assert r["capital_p50_total"] == pytest.approx(13.0)
+    assert r["capital_p90_total"] == pytest.approx(15.0)
+    assert "pavement" not in r["benefits_by_type"]
+
+
+def test_construction_disruption_is_disbenefit():
+    r = _run_costs(construction_disbenefit_annual=0.2)
+    assert r["pv_by_type"]["construction_disruption"] == pytest.approx(-0.4)
+    assert r["benefits_by_type"]["construction_disruption"] == pytest.approx(
+        [-0.2, -0.2, 0.0, 0.0, 0.0])
+    assert r["pv_costs"] == pytest.approx(17.0)
+
+
+def test_manual_residual_override():
+    r = _run_costs(residual=5.0)
+    assert r["pv_by_type"]["residual"] == pytest.approx(5.0)
+    assert r["residual"] == pytest.approx(5.0)
+
+
+def test_validate_project_file():
+    msg = ("This project file was saved in an older format and can't be opened. "
+           "Please re-enter the project.")
+    assert validate_project_file({}) == msg
+    assert validate_project_file({"type": "cba_project"}) == msg
+    assert validate_project_file({"type": "cba_project", "cost_format": 2}) is None
+
+
+def test_carbon_sensitivity_includes_upfront_carbon():
+    r = _run_costs()
+    high = r["sensitivity_carbon"]["High (2.0×, $246/t)"]
+    # upfront carbon -0.123 doubles to -0.246; no traffic, so no other carbon
+    assert high["pvb"] == pytest.approx(r["pv_benefits"] - 0.123)
