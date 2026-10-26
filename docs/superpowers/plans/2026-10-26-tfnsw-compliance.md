@@ -125,7 +125,7 @@
     - `capital_by_category: dict[str, float]`: each category's base total, plus the chosen contingency attributed pro rata to base category totals. If the base total is 0, all contingency goes to `"construction"`.
     - `capital_total: float`
 
-- [ ] **Step 1: Write the failing tests.** Fixture `fixture_costs()` in `conftest.py`, with C=2 and E=3:
+- [ ] **Step 1: Write the failing tests.** Fixture `fixture_costs() -> tuple[dict, dict]` in `conftest.py` returns `(cost, base_costs)` with C=2 and E=3:
   - `capex_base`: planning `[1,0]`, land `[2,0]`, construction `[4,4]`
   - `contingency_p50` `[1,1]`, `contingency_p90` `[2,2]`
   - `recurrent` `[0.5,0.5,1,1,1]`; base recurrent `[0.5,0.5,0.8,0.8,0.8]`
@@ -155,7 +155,7 @@
 
 - [ ] **Step 2: Run the tests.** `python3 -m pytest tests/test_engine.py -q`. Expected: the new tests FAIL with `ImportError`.
 
-- [ ] **Step 3: Implement the functions above** in `cba_engine.py`. `make_cost_data` changes signature in this task, so update its callers in `app.py` to pass the sidebar's `const_years` and `eval_period`. The UI still uses the old fields until Task 3, so keep the old keys in the returned dicts for now, alongside the new ones. Task 3 removes them.
+- [ ] **Step 3: Implement the functions above** in `cba_engine.py`. `make_cost_data` changes signature in this task, so update its callers in `app.py` to pass the sidebar's `const_years` and `eval_period`. The UI still uses the old fields until Task 3, so keep the old keys in the returned dicts for now, alongside the new ones. Task 3 removes them. Also update Task 1's regression tests to call `make_cost_data(1, 2, 30)`; their expected values do not change.
 
 - [ ] **Step 4: Run the tests.** `python3 -m pytest tests -q`. Expected: all PASS, and the smoke test is unchanged.
 
@@ -232,7 +232,7 @@ Monte Carlo:
       # {} and {"type": "cba_project"} -> exact error text;
       # {"type": "cba_project", "cost_format": 2} -> None
   ```
-  Update Task 1's regression tests to the new signature, passing `make_base_case_costs(2, 30)` as `base_costs` and the new `make_cost_data(1, 2, 30)`. Their expected values do not change.
+  Update Task 1's regression tests to the new `calculate_matrix` signature, passing `make_base_case_costs(2, 30)` as `base_costs`. Their expected values do not change.
 
 - [ ] **Step 2: Run the tests.** `python3 -m pytest tests/test_engine.py -q`. Expected: the new tests FAIL.
 
@@ -252,8 +252,8 @@ Monte Carlo:
 - [ ] **Step 5: Rewrite `_load_sample_data` costs** (3 construction years, 30-year appraisal period):
   - `capex_base`: planning `[10,3,2]`, land `[25,5,0]`, construction `[60,120,80]`
   - `contingency_p50` `[8,20,17]`, `contingency_p90` `[14,35,29]`
-  - `recurrent`: `1.2` in construction years, then `2.2`/yr, plus `6.0` in operating years 10, 20 and 30
-  - base `recurrent`: `1.2`/yr, plus `5.0` in timeline years 8, 18 and 28
+  - `recurrent`: `1.2` at timeline indexes 0–2 (construction), `2.2` from index 3 on, and `8.2` (2.2 + 6.0 resurfacing) at indexes 12, 22 and 32 (operating years 10, 20, 30)
+  - base `recurrent`: `1.2` at every index, and `6.2` (1.2 + 5.0) at indexes 8, 18 and 28 (0-based)
   - `upfront_carbon_t` 45000; outturn P50 `395.0`, P90 `432.0`
 
   Keep the existing traffic, walk/cycle and other sample values.
