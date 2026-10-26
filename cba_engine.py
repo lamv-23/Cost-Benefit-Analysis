@@ -406,6 +406,7 @@ def calculate_matrix(
     safety_vkt_base: dict = None,
     safety_vkt_proj: dict = None,
     params: dict = None,
+    scenario: dict | None = None,
 ) -> dict:
     """Compute CBA for one project case using the matrix traffic data model.
 
@@ -417,6 +418,11 @@ def calculate_matrix(
         cost:          cost_data entry for this project case (yearly cost rows).
         base_costs:    shared base case costs (``make_base_case_costs``).
         annualisation: annualisation factor and days_per_year per vehicle type.
+        scenario:      optional sensitivity-test options (defaults in brackets):
+                       ``capital`` ("p50"|"p90"), ``delay_years`` (0),
+                       ``growth`` ("forecast"|"none"|"half"), ``cost_factor`` (1.0),
+                       ``benefit_factor`` (1.0), ``discount_rate`` (None: use
+                       ``inputs["discount_rate"]``). ``None`` is the central case.
 
     Costs per year are P50 capital + project recurrent. Avoided base case
     recurrent costs, upfront carbon, construction disruption and residual value
@@ -430,10 +436,19 @@ def calculate_matrix(
     ctx = inputs["context"]
     eval_period = inputs["evaluation_period"]
     const_years = inputs["construction_years"]
-    dr = inputs["discount_rate"]
     discount_base_year = inputs.get("discount_base_year", 2026)
     construction_start_year = inputs.get("construction_start_year", discount_base_year)
     zero_growth_after_last_year = inputs.get("zero_growth_after_last_year", False)
+
+    scn = scenario or {}
+    scn_capital = scn.get("capital", "p50")
+    delay = int(scn.get("delay_years", 0) or 0)
+    growth_mode = scn.get("growth", "forecast")
+    cost_factor = scn.get("cost_factor", 1.0)
+    benefit_factor = scn.get("benefit_factor", 1.0)
+    dr = scn.get("discount_rate")
+    if dr is None:
+        dr = inputs["discount_rate"]
 
     # Annualisation: modelled-period VHT/VKT → annual (per vehicle type)
     ann_factors = {vt: annualisation[vt]["factor"] * annualisation[vt]["days"] for vt in VTYPES}
@@ -444,11 +459,17 @@ def calculate_matrix(
     occupancy_by_vtype = _p["occupancy"][ctx]
 
     # Yearly capital (P50) and recurrent cost schedule, real $M
-    schedule = build_cost_schedule(cost, base_costs, const_years, eval_period)
-    capital_p50_total = schedule["capital_total"]
-    capital_p90_total = build_cost_schedule(
-        cost, base_costs, const_years, eval_period, capital="p90",
-    )["capital_total"]
+    schedule = build_cost_schedule(
+        cost, base_costs, const_years, eval_period,
+        capital=scn_capital, delay_years=delay,
+    )
+    capital_p50_total, capital_p90_total = (
+        build_cost_schedule(cost, base_costs, const_years, eval_period, capital=k)["capital_total"]
+        * cost_factor
+        for k in ("p50", "p90")
+    )
+    schedule["capital"] = [v * cost_factor for v in schedule["capital"]]
+    schedule["project_recurrent"] = [v * cost_factor for v in schedule["project_recurrent"]]
     carbon_price = _p["carbon_per_tonne"]
     disruption_annual = cost.get("construction_disbenefit_annual", 0.0) or 0.0
     # Residual value: straight-line depreciation per ATAP T2 / TfNSW CBA Guidelines.
@@ -462,10 +483,31 @@ def calculate_matrix(
     )
     _by_cat = schedule["capital_by_category"]
     _auto_residual = _by_cat["land"] + _by_cat["construction"] * _remaining_frac
-    residual = cost["residual"] if (cost.get("residual", 0.0) or 0.0) > 0.0 else _auto_residual
+    # The manual override is the user's explicit value and is never scaled.
+    residual = (cost["residual"] if (cost.get("residual", 0.0) or 0.0) > 0.0
+                else _auto_residual * cost_factor)
 
     modelling_years = base_traffic["years"]
-    total_years = const_years + eval_period
+    total_years = delay + const_years + eval_period
+    open_idx = delay + const_years   # timeline index of the opening year (Y0)
+    opening_year = construction_start_year + open_idx
+
+    def _traffic(values: list, ey: int, eval_year: int) -> float:
+        """Traffic value for ``eval_year`` (``ey`` is its zero-growth-clamped year).
+
+        ``growth_mode`` "none" holds opening-year values; "half" halves the
+        forecast annual growth rate from the opening year.
+        """
+        v = interpolate_modelling_years(modelling_years, values, ey)
+        if growth_mode == "forecast":
+            return v
+        ey0 = min(opening_year, modelling_years[-1]) if zero_growth_after_last_year else opening_year
+        v0 = interpolate_modelling_years(modelling_years, values, ey0)
+        n = eval_year - opening_year
+        if growth_mode == "none" or v0 == 0 or n <= 0:
+            return v0
+        g = (v / v0) ** (1.0 / n) - 1.0
+        return v0 * (1.0 + g / 2.0) ** n
 
     annual_costs: list = []
     annual_capital: list = []
@@ -511,7 +553,7 @@ def calculate_matrix(
         b_disruption = 0.0 - disruption_annual if schedule["construction_years"][y] else 0.0
         b_residual = residual if y == total_years - 1 else 0.0
 
-        if y >= const_years:
+        if y >= open_idx:
 
             # ── TTS: per vehicle type ───────────────────────────────────────
             # Rule-of-Half: extract generated demand settings from cost dict
@@ -519,12 +561,8 @@ def calculate_matrix(
             gen_pct_override = cost.get("generated_demand_pct_override", {})
 
             for vt in VTYPES:
-                vht_base = interpolate_modelling_years(
-                    modelling_years, base_traffic[vt]["vht"], ey
-                )
-                vht_proj = interpolate_modelling_years(
-                    modelling_years, proj_traffic[vt]["vht"], ey
-                )
+                vht_base = _traffic(base_traffic[vt]["vht"], ey, eval_year)
+                vht_proj = _traffic(proj_traffic[vt]["vht"], ey, eval_year)
                 # Negative when the project is slower — a disbenefit, kept in the total
                 annual_vht_saving = (vht_base - vht_proj) * ann_factors[vt]
 
@@ -563,10 +601,10 @@ def calculate_matrix(
                 if not voc_table:
                     continue
 
-                vht_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vht"], ey)
-                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
-                vht_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vht"], ey)
-                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
+                vht_b = _traffic(base_traffic[vt]["vht"], ey, eval_year)
+                vkt_b = _traffic(base_traffic[vt]["vkt"], ey, eval_year)
+                vht_p = _traffic(proj_traffic[vt]["vht"], ey, eval_year)
+                vkt_p = _traffic(proj_traffic[vt]["vkt"], ey, eval_year)
 
                 spd_b = vkt_b / vht_b if vht_b > 0 else 0.0
                 spd_p = vkt_p / vht_p if vht_p > 0 else 0.0
@@ -594,8 +632,8 @@ def calculate_matrix(
             _sv_base = safety_vkt_base if safety_vkt_base is not None else _p["safety_vkt"]
             _sv_proj = safety_vkt_proj if safety_vkt_proj is not None else _p["safety_vkt"]
             for vt in VTYPES:
-                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
-                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
+                vkt_b = _traffic(base_traffic[vt]["vkt"], ey, eval_year)
+                vkt_p = _traffic(proj_traffic[vt]["vkt"], ey, eval_year)
                 # Base VKT × base rate − project VKT × project rate
                 b_safety += (vkt_b * _sv_base[vt] - vkt_p * _sv_proj[vt]) * ann_factors[vt] / 1e6
             # Fatal component: used for VSL sensitivity (scales this share ±, rest held fixed).
@@ -610,8 +648,8 @@ def calculate_matrix(
                 air_rate = _p["air_pollution"][ctx].get(air_noise_vt, 0.0)
                 noise_rate = _p["noise"][ctx].get(air_noise_vt, 0.0)
 
-                vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
-                vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
+                vkt_b = _traffic(base_traffic[vt]["vkt"], ey, eval_year)
+                vkt_p = _traffic(proj_traffic[vt]["vkt"], ey, eval_year)
                 vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
                 b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
                 b_env_emit += vkt_delta * emit_rate / 1e6
@@ -625,6 +663,20 @@ def calculate_matrix(
                 _walk * _p["health_benefits"]["walking"]
                 + _cycle * _p["health_benefits"]["cycling"]
             ) * 365 / 1e6
+
+        if benefit_factor != 1.0:
+            # Scale transport benefits only; avoided costs, upfront carbon,
+            # construction disruption and residual value are held fixed.
+            b_tts *= benefit_factor
+            b_rel *= benefit_factor
+            b_voc *= benefit_factor
+            b_safety *= benefit_factor
+            b_env *= benefit_factor
+            b_env_emit *= benefit_factor
+            b_active *= benefit_factor
+            b_safety_fatal *= benefit_factor
+            for vt in VTYPES:
+                b_tts_by_vt[vt] *= benefit_factor
 
         line_values = (b_tts, b_rel, b_voc, b_safety, b_env, b_active,
                        b_avoided, b_carbon, b_disruption, b_residual)
@@ -649,12 +701,12 @@ def calculate_matrix(
         pv_benefits += benefit_y * df_factor
         cum += net * df_factor
         cum_disc_net.append(cum)
-        if payback_year is None and cum >= 0 and y >= const_years:
+        if payback_year is None and cum >= 0 and y >= open_idx:
             payback_year = y + 1
 
     npv = pv_benefits - pv_costs
     bcr = pv_benefits / pv_costs if pv_costs > 0 else 0.0
-    first_op = const_years if const_years < total_years else 0
+    first_op = open_idx if open_idx < total_years else 0
     # FYRR (First Year Rate of Return): net benefit in first operational year
     # expressed as a percentage of total undiscounted P50 capital cost.
     # Net benefit = gross benefits minus recurrent costs; excludes construction-period costs.

@@ -228,3 +228,137 @@ def test_carbon_sensitivity_includes_upfront_carbon():
     high = r["sensitivity_carbon"]["High (2.0×, $246/t)"]
     # upfront carbon -0.123 doubles to -0.246; no traffic, so no other carbon
     assert high["pvb"] == pytest.approx(r["pv_benefits"] - 0.123)
+
+
+# ── Scenario options in calculate_matrix ─────────────────────────────────────
+
+def _run_scenario(scenario=None, traffic=None, **cost_overrides):
+    cost, base = fixture_costs()
+    cost["construction_asset_life"] = 40
+    cost.update(cost_overrides)
+    base_traffic, proj_traffic = traffic or (
+        make_case_traffic(YEARS), make_case_traffic(YEARS))
+    return calculate_matrix(
+        COST_INPUTS, base_traffic, proj_traffic, cost, base, ANNUALISATION,
+        params=PARAMS, scenario=scenario,
+    )
+
+
+def _saving_traffic():
+    """Car VHT/VKT that make a growing travel time saving (project is faster)."""
+    base = make_case_traffic(YEARS, Car={"vht": [1000, 2000], "vkt": [60000, 120000]})
+    proj = make_case_traffic(YEARS, Car={"vht": [800, 1200], "vkt": [60000, 120000]})
+    return base, proj
+
+
+def test_scenario_none_matches_empty_dict():
+    traffic = _saving_traffic()
+    central = _run_scenario(traffic=traffic)
+    explicit = _run_scenario({}, traffic=traffic)
+    assert explicit["pv_benefits"] == central["pv_benefits"]
+    assert explicit["pv_costs"] == central["pv_costs"]
+    assert explicit["benefits_by_type"] == central["benefits_by_type"]
+
+
+def test_scenario_p90():
+    r = _run_scenario({"capital": "p90"})
+    assert r["pv_costs"] == pytest.approx(19.0)
+    assert r["pv_by_type"]["residual"] == pytest.approx(12.818182, abs=1e-6)
+    assert r["capital_p50_total"] == pytest.approx(13.0)
+    assert r["capital_p90_total"] == pytest.approx(15.0)
+
+
+def test_scenario_cost_factor():
+    r = _run_scenario({"cost_factor": 1.2})
+    assert r["pv_costs"] == pytest.approx(20.4)
+    assert r["pv_by_type"]["residual"] == pytest.approx(13.330909, abs=1e-6)
+    assert r["pv_by_type"]["avoided_costs"] == pytest.approx(3.4)
+
+
+def test_scenario_cost_factor_keeps_manual_residual():
+    r = _run_scenario({"cost_factor": 1.4}, residual=5.0)
+    assert r["pv_by_type"]["residual"] == pytest.approx(5.0)
+    assert r["residual"] == pytest.approx(5.0)
+
+
+def test_scenario_benefit_factor():
+    traffic = _saving_traffic()
+    central = _run_scenario(traffic=traffic, walk_pkm_day=1000.0,
+                            construction_disbenefit_annual=0.2)
+    r = _run_scenario({"benefit_factor": 1.4}, traffic=traffic, walk_pkm_day=1000.0,
+                      construction_disbenefit_annual=0.2)
+    assert central["pv_by_type"]["tts"] > 0
+    for key in ("tts", "reliability", "voc", "safety", "env", "active", "tts_Car"):
+        assert r["pv_by_type"][key] == pytest.approx(1.4 * central["pv_by_type"][key])
+    for key in ("avoided_costs", "upfront_carbon", "construction_disruption", "residual"):
+        assert r["pv_by_type"][key] == pytest.approx(central["pv_by_type"][key])
+    assert r["pv_costs"] == pytest.approx(central["pv_costs"])
+
+
+def test_scenario_delay_1():
+    r = _run_scenario({"delay_years": 1})
+    assert r["pv_costs"] == pytest.approx(17.5)
+    assert r["pv_by_type"]["avoided_costs"] == pytest.approx(4.2)
+    assert r["pv_benefits"] == pytest.approx(15.186091, abs=1e-6)
+    assert r["total_years"] == 6
+
+
+def test_scenario_delay_uses_later_traffic():
+    traffic = _saving_traffic()
+    central = _run_scenario(traffic=traffic)
+    delayed = _run_scenario({"delay_years": 1}, traffic=traffic)
+    tts = delayed["benefits_by_type"]["tts"]
+    assert tts[:3] == [0.0, 0.0, 0.0]
+    assert tts[3] > 0
+    assert tts[3] == pytest.approx(central["benefits_by_type"]["tts"][3])
+    assert tts[3] != pytest.approx(central["benefits_by_type"]["tts"][2])
+    assert delayed["first_year"]["tts"] == pytest.approx(tts[3])
+
+
+def test_scenario_no_growth():
+    traffic = _saving_traffic()
+    central = _run_scenario(traffic=traffic)
+    r = _run_scenario({"growth": "none"}, traffic=traffic)
+    tts = r["benefits_by_type"]["tts"]
+    assert tts[2] > 0
+    assert tts[2:] == pytest.approx([tts[2]] * 3)
+    assert tts[2] == pytest.approx(central["benefits_by_type"]["tts"][2])
+    assert central["benefits_by_type"]["tts"][4] > central["benefits_by_type"]["tts"][2]
+
+
+def test_scenario_half_growth():
+    inputs = dict(COST_INPUTS, evaluation_period=30)
+    cost = make_cost_data(1, 2, 30)["project_1"]
+    base = make_case_traffic(YEARS, Car={"vht": [1000, 2000]})
+    proj = make_case_traffic(YEARS)  # zero VHT: the saving equals the base VHT
+    r = calculate_matrix(
+        inputs, base, proj, cost, make_base_case_costs(2, 30), ANNUALISATION,
+        params=PARAMS, scenario={"growth": "half"},
+    )
+    tts = r["benefits_by_type"]["tts_Car"]
+    v0 = tts[2]
+    n = 10
+    g = (interpolate_modelling_years(YEARS, [1000, 2000], 2038)
+         / interpolate_modelling_years(YEARS, [1000, 2000], 2028)) ** (1 / n) - 1
+    assert v0 > 0
+    assert tts[2 + n] == pytest.approx(v0 * (1 + g / 2) ** n, rel=1e-9)
+    full = calculate_matrix(
+        inputs, base, proj, cost, make_base_case_costs(2, 30), ANNUALISATION,
+        params=PARAMS,
+    )["benefits_by_type"]["tts_Car"]
+    assert tts[2 + n] < full[2 + n]
+
+
+def test_scenario_discount_rate():
+    traffic = _saving_traffic()
+    scenario = _run_scenario({"discount_rate": 7}, traffic=traffic)
+    cost, base = fixture_costs()
+    cost["construction_asset_life"] = 40
+    central = calculate_matrix(
+        dict(COST_INPUTS, discount_rate=7), traffic[0], traffic[1], cost, base,
+        ANNUALISATION, params=PARAMS,
+    )
+    assert scenario["npv"] == pytest.approx(central["npv"], rel=1e-9)
+    assert scenario["bcr"] == pytest.approx(central["bcr"], rel=1e-9)
+    assert scenario["dr"] == 7
+    assert _run_scenario(traffic=traffic)["dr"] == 0
