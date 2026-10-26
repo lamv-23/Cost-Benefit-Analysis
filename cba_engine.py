@@ -164,38 +164,161 @@ def make_traffic_data(years: list, n_project_cases: int = 1) -> dict:
     return data
 
 
-def make_cost_data(n_project_cases: int = 1) -> dict:
-    """Return cost_data dict keyed by project case (base has no costs).
+COST_FORMAT_VERSION = 2
+CAPEX_CATEGORIES = ("planning", "land", "construction")
 
-    Structure per project case:
-        {
-          "cap_planning": 0.0,   # $M
-          "cap_land": 0.0,       # $M
-          "cap_construction": 0.0,  # $M
-          "contingency_pct": 0.0,   # %
-          "opex_maint": 0.0,     # $M/year
-          "opex_op": 0.0,        # $M/year
-          "residual": 0.0,       # $M
-          "construction_disbenefit_annual": 0.0,  # $M/year
-          "construction_asset_life": 40,  # years
-          "walk_pkm_day": 0.0,   # pkm/day
-          "cycle_pkm_day": 0.0,  # pkm/day
-          "pavement_saving_annual": 0.0,  # $M/year
-          "generated_demand_pct_global": 0.0,  # % (Rule-of-Half global default)
-          "generated_demand_pct_override": {"Car": None, "LCV": None, "HCV": None, "Bus": None},  # % (per-vtype overrides)
-        }
+
+def clean_row(values: list) -> list:
+    """Return ``values`` as floats, treating ``None``, NaN and ``""`` as 0.0."""
+    out = []
+    for v in values:
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            out.append(0.0)
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            f = 0.0
+        out.append(0.0 if math.isnan(f) else f)
+    return out
+
+
+def make_cost_data(n_project_cases: int, const_years: int, eval_period: int) -> dict:
+    """Return cost_data dict keyed by project case (base has no cost entry here).
+
+    ``C`` = ``const_years`` and ``E`` = ``eval_period``. Per project case:
+        capex_base:   {"planning"|"land"|"construction": [$M per construction year] * C}
+        contingency_p50 / contingency_p90: [$M per construction year] * C
+        recurrent:    [$M per year] * (C + E)
+        upfront_carbon_t: tonnes CO2-e
+        outturn_p50_nominal / outturn_p90_nominal: reporting-only nominal $M (or None)
+        construction_disbenefit_annual, construction_asset_life, residual,
+        walk_pkm_day, cycle_pkm_day, generated_demand_pct_global,
+        generated_demand_pct_override: {vtype: None}
+
+    The legacy flat keys (cap_planning, opex_maint, ...) are kept alongside the
+    new ones until the UI moves over to the yearly tables.
     """
+    c, e = int(const_years), int(eval_period)
     template = {
-        "cap_planning": 0.0, "cap_land": 0.0, "cap_construction": 0.0,
-        "contingency_pct": 0.0, "opex_maint": 0.0, "opex_op": 0.0, "residual": 0.0,
+        "capex_base": {cat: [0.0] * c for cat in CAPEX_CATEGORIES},
+        "contingency_p50": [0.0] * c,
+        "contingency_p90": [0.0] * c,
+        "recurrent": [0.0] * (c + e),
+        "upfront_carbon_t": 0.0,
+        "outturn_p50_nominal": None,
+        "outturn_p90_nominal": None,
         "construction_disbenefit_annual": 0.0,
         "construction_asset_life": 40,   # years; drives auto-calculated residual value
+        "residual": 0.0,
         "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
-        "pavement_saving_annual": 0.0,
         "generated_demand_pct_global": 0.0,
-        "generated_demand_pct_override": {"Car": None, "LCV": None, "HCV": None, "Bus": None},
+        "generated_demand_pct_override": {vt: None for vt in VTYPES},
+        # Legacy flat fields (removed once the UI uses the yearly tables)
+        "cap_planning": 0.0, "cap_land": 0.0, "cap_construction": 0.0,
+        "contingency_pct": 0.0, "opex_maint": 0.0, "opex_op": 0.0,
+        "pavement_saving_annual": 0.0,
     }
     return {f"project_{i}": copy.deepcopy(template) for i in range(1, n_project_cases + 1)}
+
+
+def make_base_case_costs(const_years: int, eval_period: int) -> dict:
+    """Return the shared base-case cost dict: a recurrent row of C + E years."""
+    return {"recurrent": [0.0] * (int(const_years) + int(eval_period))}
+
+
+def _fit_row(row: list, n: int) -> list:
+    row = list(row)[:n]
+    return row + [0.0] * (n - len(row))
+
+
+def fit_cost_rows(costs: dict, const_years: int, eval_period: int) -> None:
+    """Resize cost rows in place: capex/contingency to C, recurrent to C + E.
+
+    Existing entries are kept; new years are padded with 0.0. Works on project
+    and base-case dicts; keys that are absent are ignored.
+    """
+    c = int(const_years)
+    if "capex_base" in costs:
+        for cat in list(costs["capex_base"]):
+            costs["capex_base"][cat] = _fit_row(costs["capex_base"][cat], c)
+    for key in ("contingency_p50", "contingency_p90"):
+        if key in costs:
+            costs[key] = _fit_row(costs[key], c)
+    if "recurrent" in costs:
+        costs["recurrent"] = _fit_row(costs["recurrent"], c + int(eval_period))
+
+
+def _row_at(row: list, i: int) -> float:
+    """Value of ``row`` at index ``i``, repeating the last value past the end."""
+    if not row:
+        return 0.0
+    return float(row[i] if i < len(row) else row[-1])
+
+
+def build_cost_schedule(
+    cost: dict, base_costs: dict, const_years: int, eval_period: int,
+    capital: str = "p50", delay_years: int = 0,
+) -> dict:
+    """Lay the yearly cost tables out on a timeline of N = D + C + E years.
+
+    ``capital`` selects the contingency row ("p50" or "p90"). Construction is
+    shifted by ``delay_years`` (D); recurrent costs follow the base case until
+    construction starts. Upfront carbon is spread pro rata to P50 capital.
+    """
+    c, e, d = int(const_years), int(eval_period), int(delay_years)
+    n = d + c + e
+    cont_key = "contingency_p90" if capital == "p90" else "contingency_p50"
+
+    def _cap_row(vals_list: list, i: int) -> float:
+        return float(vals_list[i]) if i < len(vals_list) else 0.0
+
+    base_by_cat = {
+        cat: [_cap_row(cost["capex_base"].get(cat, []), i) for i in range(c)]
+        for cat in CAPEX_CATEGORIES
+    }
+    base_year = [sum(base_by_cat[cat][i] for cat in CAPEX_CATEGORIES) for i in range(c)]
+    cont_year = [_cap_row(cost.get(cont_key, []), i) for i in range(c)]
+    p50_year = [base_year[i] + _cap_row(cost.get("contingency_p50", []), i) for i in range(c)]
+
+    capital_row = [0.0] * n
+    carbon_row = [0.0] * n
+    p50_total = sum(p50_year)
+    total_carbon = float(cost.get("upfront_carbon_t", 0.0) or 0.0)
+    for i in range(c):
+        capital_row[d + i] = base_year[i] + cont_year[i]
+        if p50_total > 0:
+            carbon_row[d + i] = total_carbon * p50_year[i] / p50_total
+    if p50_total <= 0:
+        carbon_row[d] = total_carbon
+
+    recurrent = cost.get("recurrent", [])
+    base_recurrent_row = base_costs.get("recurrent", [])
+    base_recurrent = [_row_at(base_recurrent_row, t) for t in range(n)]
+    project_recurrent = [
+        base_recurrent[t] if t < d else _row_at(recurrent, t - d) for t in range(n)
+    ]
+
+    cont_total = sum(cont_year)
+    cat_totals = {cat: sum(base_by_cat[cat]) for cat in CAPEX_CATEGORIES}
+    base_total = sum(cat_totals.values())
+    capital_by_category = {}
+    for cat in CAPEX_CATEGORIES:
+        if base_total > 0:
+            share = cont_total * cat_totals[cat] / base_total
+        else:
+            share = cont_total if cat == "construction" else 0.0
+        capital_by_category[cat] = cat_totals[cat] + share
+
+    return {
+        "capital": capital_row,
+        "project_recurrent": project_recurrent,
+        "base_recurrent": base_recurrent,
+        "upfront_carbon_t": carbon_row,
+        "construction_years": [d <= t < d + c for t in range(n)],
+        "capital_by_category": capital_by_category,
+        "capital_total": sum(capital_row),
+    }
 
 
 def discount_factor(rate: float, year: int) -> float:

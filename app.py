@@ -1197,7 +1197,11 @@ def _init_session_state() -> None:
     )
     if needs_reset:
         st.session_state["traffic_data"] = make_traffic_data(_years, _n)
-        st.session_state["cost_data"] = make_cost_data(_n)
+        st.session_state["cost_data"] = make_cost_data(
+            _n,
+            st.session_state.get("const_years", 3),
+            st.session_state.get("eval_period", 30),
+        )
 
     st.session_state.setdefault("show_advanced", False)
     st.session_state.setdefault("safety_mode", "General")
@@ -1327,14 +1331,14 @@ with st.sidebar:
     st.session_state["project_name"] = project_name
     col1, col2 = st.columns(2)
     with col1:
-        eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30,
+        eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30, key="eval_period",
             help="Total analysis period in years (typically 20–40). Includes construction and operating years.")
         discount_base_year = st.number_input("Discount Base Year", 2020, 2060, 2026,
             help="Calendar year used as Year 0 for discounting (PV anchor).")
         construction_start_year = st.number_input("Construction Start Year", 2020, 2060, 2026,
             help="Calendar year construction begins. Benefits start after the construction period.")
     with col2:
-        const_years = st.number_input("Construction Period (years)", 1, 10, 3,
+        const_years = st.number_input("Construction Period (years)", 1, 10, 3, key="const_years",
             help="Number of years over which capital costs are spread. Construction disbenefits apply during this period.")
         discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 5.0, step=0.5,
             help="TfNSW default: 5%. Used to discount future costs and benefits to present values. Higher rates reduce NPV.")

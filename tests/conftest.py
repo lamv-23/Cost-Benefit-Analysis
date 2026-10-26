@@ -24,3 +24,20 @@ def make_case_traffic(years, **by_vtype):
         for metric, values in by_vtype.get(vt, {}).items():
             case[vt][metric] = [float(v) for v in values]
     return case
+
+
+def fixture_costs():
+    """Return ``(cost, base_costs)`` for C=2 construction years, E=3 appraisal years."""
+    cost = {
+        "capex_base": {
+            "planning": [1.0, 0.0],
+            "land": [2.0, 0.0],
+            "construction": [4.0, 4.0],
+        },
+        "contingency_p50": [1.0, 1.0],
+        "contingency_p90": [2.0, 2.0],
+        "recurrent": [0.5, 0.5, 1.0, 1.0, 1.0],
+        "upfront_carbon_t": 1000.0,
+    }
+    base_costs = {"recurrent": [0.5, 0.5, 0.8, 0.8, 0.8]}
+    return cost, base_costs
