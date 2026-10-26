@@ -944,6 +944,39 @@ def _cached_required_sensitivities(_cache_key: str, inputs: dict,
     )
 
 
+def _required_rows_for(case_key: str) -> list:
+    """Required TfNSW sensitivity rows for one option, cached.
+
+    Single place that builds the cache key and calls the cache, so the
+    Sensitivity tab and the CSV download always share the same cached run.
+    Reads the current calculation globals (_matrix_inputs, _calc_safety_vkt,
+    _eff_params), which are set before any tab renders.
+    """
+    safety = _calc_safety_vkt or {}
+    base_safety = safety.get("base_case")
+    proj_safety = safety.get(case_key)
+    ss = st.session_state
+    key = _stable_hash(_matrix_inputs, case_key,
+                       ss.traffic_data["base_case"], ss.traffic_data[case_key],
+                       ss.cost_data[case_key], ss.base_case_costs, ss.annualisation,
+                       base_safety, proj_safety, _eff_params)
+    try:
+        return _cached_required_sensitivities(
+            key, _matrix_inputs,
+            base_traffic=ss.traffic_data["base_case"],
+            proj_traffic=ss.traffic_data[case_key],
+            cost=ss.cost_data[case_key],
+            base_costs=ss.base_case_costs,
+            annualisation=ss.annualisation,
+            safety_vkt_base=base_safety,
+            safety_vkt_proj=proj_safety,
+            params=_eff_params,
+        )
+    except Exception as err:
+        st.error(f"Sensitivity calculation error: {err}")
+        return []
+
+
 
 
 
@@ -2103,32 +2136,7 @@ with tab_cashflow:
         _full_export_r = matrix_results.get(_cf_sel, {})
         if _full_export_r:
             _csv_cost = st.session_state.cost_data[_cf_sel]
-            _csv_safety = _calc_safety_vkt or {}
-            _csv_base_safety = _csv_safety.get("base_case")
-            _csv_proj_safety = _csv_safety.get(_cf_sel)
-            _csv_key = _stable_hash(_matrix_inputs, _cf_sel,
-                                    st.session_state.traffic_data["base_case"],
-                                    st.session_state.traffic_data[_cf_sel],
-                                    _csv_cost,
-                                    st.session_state.base_case_costs,
-                                    st.session_state.annualisation,
-                                    _csv_base_safety, _csv_proj_safety, _eff_params)
-            try:
-                # Same cache key as the Sensitivity tab, so no extra runs if it was viewed
-                _csv_rows = _cached_required_sensitivities(
-                    _csv_key, _matrix_inputs,
-                    base_traffic=st.session_state.traffic_data["base_case"],
-                    proj_traffic=st.session_state.traffic_data[_cf_sel],
-                    cost=_csv_cost,
-                    base_costs=st.session_state.base_case_costs,
-                    annualisation=st.session_state.annualisation,
-                    safety_vkt_base=_csv_base_safety,
-                    safety_vkt_proj=_csv_proj_safety,
-                    params=_eff_params,
-                )
-            except Exception as _csv_err:
-                _csv_rows = []
-                st.error(f"Sensitivity calculation error: {_csv_err}")
+            _csv_rows = _required_rows_for(_cf_sel)
             _full_csv = generate_csv(
                 _full_export_r, project_name,
                 appraisal_summary(_full_export_r, _csv_cost), _csv_rows)
@@ -2167,31 +2175,7 @@ with tab_sensitivity:
 
     # --- TfNSW required sensitivity tests (one row per test) ---
     st.subheader("TfNSW required sensitivity tests")
-    _sens_safety = _calc_safety_vkt or {}
-    _sens_base_safety = _sens_safety.get("base_case")
-    _sens_proj_safety = _sens_safety.get(_sens_sel)
-    _req_key = _stable_hash(_matrix_inputs, _sens_sel,
-                            st.session_state.traffic_data["base_case"],
-                            st.session_state.traffic_data[_sens_sel],
-                            st.session_state.cost_data[_sens_sel],
-                            st.session_state.base_case_costs,
-                            st.session_state.annualisation,
-                            _sens_base_safety, _sens_proj_safety, _eff_params)
-    try:
-        _req_rows = _cached_required_sensitivities(
-            _req_key, _matrix_inputs,
-            base_traffic=st.session_state.traffic_data["base_case"],
-            proj_traffic=st.session_state.traffic_data[_sens_sel],
-            cost=st.session_state.cost_data[_sens_sel],
-            base_costs=st.session_state.base_case_costs,
-            annualisation=st.session_state.annualisation,
-            safety_vkt_base=_sens_base_safety,
-            safety_vkt_proj=_sens_proj_safety,
-            params=_eff_params,
-        )
-    except Exception as _req_err:
-        _req_rows = []
-        st.error(f"Sensitivity calculation error: {_req_err}")
+    _req_rows = _required_rows_for(_sens_sel)
 
     if _req_rows:
         df_req = pd.DataFrame([{
