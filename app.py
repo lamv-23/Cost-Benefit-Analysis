@@ -2282,22 +2282,7 @@ _matrix_inputs = {
     "zero_growth_after_last_year": zero_growth_after_last_year,
     "n_project_cases": st.session_state.n_project_cases,
 }
-try:
-    _eff_params = build_effective_params()
-    _cache_key = _stable_hash(_matrix_inputs, st.session_state.traffic_data,
-                              st.session_state.cost_data, st.session_state.annualisation,
-                              st.session_state.safety_vkt_data, _eff_params)
-    matrix_results = _cached_calculate_all_cases(
-        _cache_key, _matrix_inputs,
-        traffic_data=st.session_state.traffic_data,
-        cost_data=st.session_state.cost_data,
-        annualisation=st.session_state.annualisation,
-        safety_vkt_data=st.session_state.safety_vkt_data,
-        params=_eff_params,
-    )
-except Exception as _calc_err:
-    matrix_results = {}
-    st.error(f"Calculation error: {_calc_err}. Please check your input data for missing or invalid values.")
+# Calculation runs after the Data Input tab — see RUN CALCULATION below.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2319,66 +2304,8 @@ st.markdown(f"""
 # ─────────────────────────────────────────────────────────────────────────────
 # KPI METRICS — Step 10: multi-case aware
 # ─────────────────────────────────────────────────────────────────────────────
-_n_cases = st.session_state.n_project_cases
-
-if matrix_results and _n_cases > 1:
-    # Multi-case: one KPI column per project case
-    _case_cols = st.columns(min(_n_cases, 4))
-    for _i, _col in enumerate(_case_cols, 1):
-        _mr = matrix_results.get(f"project_{_i}", {})
-        _pb = f"{_mr['payback_year']} yrs" if _mr.get("payback_year") else "N/A"
-        _irr_str = f"{_mr['irr']:.1f}%" if _mr.get("irr") is not None else "N/A"
-        _deferral = _mr.get("fyrr_deferral_pass")
-        _deferral_delta = ("Proceed" if _deferral else "Consider deferral") if _deferral is not None else ""
-        with _col:
-            st.markdown(f"**Project {_i}**")
-            st.metric("NPV", format_m(_mr.get("npv", 0)),
-                      delta="Positive" if _mr.get("npv", 0) >= 0 else "Negative",
-                      delta_color="normal" if _mr.get("npv", 0) >= 0 else "inverse")
-            st.metric("BCR", f"{_mr.get('bcr', 0):.2f}",
-                      delta="≥ 1.0" if _mr.get("bcr", 0) >= 1 else "< 1.0",
-                      delta_color="normal" if _mr.get("bcr", 0) >= 1 else "inverse")
-            st.metric("IRR", _irr_str)
-            st.metric("FYRR", f"{_mr.get('fyrr', 0):.1f}%",
-                      delta=_deferral_delta,
-                      delta_color="normal" if _deferral else "inverse")
-            if show_advanced:
-                st.metric("Payback", _pb)
-elif matrix_results:
-    # Single project case
-    _r_kpi = matrix_results["project_1"]
-    _irr_val = _r_kpi.get("irr")
-    _irr_str = f"{_irr_val:.1f}%" if _irr_val is not None else "N/A"
-    _deferral = _r_kpi.get("fyrr_deferral_pass")
-    _deferral_delta = ("Proceed" if _deferral else "Consider deferral") if _deferral is not None else ""
-    _n_kpi_cols = 7 if show_advanced else 6
-    _kpi_cols = st.columns(_n_kpi_cols)
-    with _kpi_cols[0]:
-        st.metric("Net Present Value", format_m(_r_kpi["npv"]),
-                  delta="Positive" if _r_kpi["npv"] >= 0 else "Negative",
-                  delta_color="normal" if _r_kpi["npv"] >= 0 else "inverse")
-    with _kpi_cols[1]:
-        st.metric("Benefit-Cost Ratio", f"{_r_kpi['bcr']:.2f}",
-                  delta="Above 1.0" if _r_kpi["bcr"] >= 1 else "Below 1.0",
-                  delta_color="normal" if _r_kpi["bcr"] >= 1 else "inverse")
-    with _kpi_cols[2]:
-        st.metric("PV Benefits", format_m(_r_kpi["pv_benefits"]))
-    with _kpi_cols[3]:
-        st.metric("PV Costs", format_m(_r_kpi["pv_costs"]))
-    with _kpi_cols[4]:
-        # IRR: TfNSW CBA framework; ATAP T2 §5.3 (supplementary)
-        st.metric("Internal Rate of Return", _irr_str)
-    with _kpi_cols[5]:
-        # FYRR deferral test: TfNSW CBA Guidelines — proceed if FYRR ≥ discount rate
-        st.metric("First Year Rate of Return", f"{_r_kpi['fyrr']:.1f}%",
-                  delta=_deferral_delta,
-                  delta_color="normal" if _deferral else "inverse")
-    if show_advanced:
-        with _kpi_cols[6]:
-            pb = f"{_r_kpi['payback_year']} years" if _r_kpi["payback_year"] else "N/A"
-            st.metric("Payback Period", pb)
-else:
-    st.info("Enter traffic data in the **Data Input** tab to see results.")
+# Reserved here so KPIs render above the tabs; filled after the calculation.
+_kpi_slot = st.container()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TABBED LAYOUT
@@ -2559,6 +2486,90 @@ with tab_datainput:
             "evenly over the construction period defined in Project Details (sidebar)."
         )
         render_cost_entry(eval_period=eval_period)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN CALCULATION — after Data Input so edits made this run are included,
+# then fill the KPI slot reserved above the tabs
+# ─────────────────────────────────────────────────────────────────────────────
+with _kpi_slot:
+    try:
+        _eff_params = build_effective_params()
+        _cache_key = _stable_hash(_matrix_inputs, st.session_state.traffic_data,
+                                  st.session_state.cost_data, st.session_state.annualisation,
+                                  st.session_state.safety_vkt_data, _eff_params)
+        matrix_results = _cached_calculate_all_cases(
+            _cache_key, _matrix_inputs,
+            traffic_data=st.session_state.traffic_data,
+            cost_data=st.session_state.cost_data,
+            annualisation=st.session_state.annualisation,
+            safety_vkt_data=st.session_state.safety_vkt_data,
+            params=_eff_params,
+        )
+    except Exception as _calc_err:
+        matrix_results = {}
+        st.error(f"Calculation error: {_calc_err}. Please check your input data for missing or invalid values.")
+
+    _n_cases = st.session_state.n_project_cases
+
+    if matrix_results and _n_cases > 1:
+        # Multi-case: one KPI column per project case
+        _case_cols = st.columns(min(_n_cases, 4))
+        for _i, _col in enumerate(_case_cols, 1):
+            _mr = matrix_results.get(f"project_{_i}", {})
+            _pb = f"{_mr['payback_year']} yrs" if _mr.get("payback_year") else "N/A"
+            _irr_str = f"{_mr['irr']:.1f}%" if _mr.get("irr") is not None else "N/A"
+            _deferral = _mr.get("fyrr_deferral_pass")
+            _deferral_delta = ("Proceed" if _deferral else "Consider deferral") if _deferral is not None else ""
+            with _col:
+                st.markdown(f"**Project {_i}**")
+                st.metric("NPV", format_m(_mr.get("npv", 0)),
+                          delta="Positive" if _mr.get("npv", 0) >= 0 else "Negative",
+                          delta_color="normal" if _mr.get("npv", 0) >= 0 else "inverse")
+                st.metric("BCR", f"{_mr.get('bcr', 0):.2f}",
+                          delta="≥ 1.0" if _mr.get("bcr", 0) >= 1 else "< 1.0",
+                          delta_color="normal" if _mr.get("bcr", 0) >= 1 else "inverse")
+                st.metric("IRR", _irr_str)
+                st.metric("FYRR", f"{_mr.get('fyrr', 0):.1f}%",
+                          delta=_deferral_delta,
+                          delta_color="normal" if _deferral else "inverse")
+                if show_advanced:
+                    st.metric("Payback", _pb)
+    elif matrix_results:
+        # Single project case
+        _r_kpi = matrix_results["project_1"]
+        _irr_val = _r_kpi.get("irr")
+        _irr_str = f"{_irr_val:.1f}%" if _irr_val is not None else "N/A"
+        _deferral = _r_kpi.get("fyrr_deferral_pass")
+        _deferral_delta = ("Proceed" if _deferral else "Consider deferral") if _deferral is not None else ""
+        _n_kpi_cols = 7 if show_advanced else 6
+        _kpi_cols = st.columns(_n_kpi_cols)
+        with _kpi_cols[0]:
+            st.metric("Net Present Value", format_m(_r_kpi["npv"]),
+                      delta="Positive" if _r_kpi["npv"] >= 0 else "Negative",
+                      delta_color="normal" if _r_kpi["npv"] >= 0 else "inverse")
+        with _kpi_cols[1]:
+            st.metric("Benefit-Cost Ratio", f"{_r_kpi['bcr']:.2f}",
+                      delta="Above 1.0" if _r_kpi["bcr"] >= 1 else "Below 1.0",
+                      delta_color="normal" if _r_kpi["bcr"] >= 1 else "inverse")
+        with _kpi_cols[2]:
+            st.metric("PV Benefits", format_m(_r_kpi["pv_benefits"]))
+        with _kpi_cols[3]:
+            st.metric("PV Costs", format_m(_r_kpi["pv_costs"]))
+        with _kpi_cols[4]:
+            # IRR: TfNSW CBA framework; ATAP T2 §5.3 (supplementary)
+            st.metric("Internal Rate of Return", _irr_str)
+        with _kpi_cols[5]:
+            # FYRR deferral test: TfNSW CBA Guidelines — proceed if FYRR ≥ discount rate
+            st.metric("First Year Rate of Return", f"{_r_kpi['fyrr']:.1f}%",
+                      delta=_deferral_delta,
+                      delta_color="normal" if _deferral else "inverse")
+        if show_advanced:
+            with _kpi_cols[6]:
+                pb = f"{_r_kpi['payback_year']} years" if _r_kpi["payback_year"] else "N/A"
+                st.metric("Payback Period", pb)
+    else:
+        st.info("Enter traffic data in the **Data Input** tab to see results.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
