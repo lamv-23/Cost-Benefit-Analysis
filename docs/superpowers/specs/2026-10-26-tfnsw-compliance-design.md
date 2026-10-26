@@ -101,9 +101,11 @@ Per project option, yearly tables over the **construction years**:
   costs replace it. **(builder call)**
 - **Construction years:** the project recurrent row covers construction years too, and
   users enter the cost of maintaining the existing road during construction there. The
-  table's help text says so. Avoided base case costs are the base row minus the project
-  row in every year, so a project that keeps maintaining the existing road during
-  construction gets no credit for those years. The sample data follows this.
+  table's help text says so. The "Avoided base case costs" benefit is the base row in
+  every year and the project row is a cost in every year, so in construction years where
+  the two rows are equal the net effect is zero: a project that keeps maintaining the
+  existing road during construction gets no credit for those years. The sample data
+  follows this.
   **(builder call)**
 - **Construction-phase traffic disruption** moves from costs to a **disbenefit** line,
   "Construction disruption", per TfNSW Guide Table 6. The input itself is unchanged.
@@ -136,12 +138,12 @@ highlighted.
 | Costs +20% / −20% / +40% / −40% | Scale all project costs (capital at P50 and recurrent). The auto-calculated residual value scales with capital, since it is a share of capital. **(builder call)** |
 | Benefits +20% / −20% / +40% / −40% | Scale transport benefits. Residual value, avoided base case costs, upfront carbon and construction disruption are not scaled. **(builder call)** |
 | P90 capital cost | Capital = base + P90 contingency in every year; auto-calculated residual value recalculated. |
-
-A **manual residual override**, if set, is kept unchanged in every test: it is the
-user's explicit value. **(builder call)**
 | Opening delayed 1 year / 3 years | See below. |
 | No traffic growth | Base and project traffic held at opening-year values for every year. |
 | Half traffic growth | Base and project traffic grow from opening at half the forecast annual growth rate, per vehicle type, for VHT and VKT. |
+
+A **manual residual override**, if set, is kept unchanged in every test: it is the
+user's explicit value. **(builder call)**
 
 **Opening delay (user):** the construction period stays the same length; the project is
 delayed by N years before construction (development delay). The whole capital cashflow
