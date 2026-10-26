@@ -425,18 +425,14 @@ def _cagr_interpolate(v1: float, v2: float, y1: int, y2: int, eval_year: int) ->
 
     Edge cases:
     - y2 == y1: undefined interval, return v1.
-    - v1 == 0: no base to grow from; return 0 for all years.
-    - v2 == 0: traffic declines to zero; interpolate linearly to 0 then hold at 0
-      (CAGR is undefined when the end-value is 0).
+    - v1 == 0 or v2 == 0: CAGR is undefined, so interpolate linearly instead,
+      clamped at 0 for extrapolation (e.g. traffic starting from or declining to 0).
     """
     if y2 == y1:
         return float(v1)
-    if v1 == 0:
-        return 0.0
-    if v2 == 0:
-        # Linear decline to zero over [y1, y2]; clamp at 0 for extrapolation beyond y2.
+    if v1 == 0 or v2 == 0:
         frac = (eval_year - y1) / (y2 - y1)
-        return float(v1) * max(0.0, 1.0 - frac)
+        return max(0.0, float(v1) + (float(v2) - float(v1)) * frac)
     return float(v1) * (float(v2) / float(v1)) ** ((eval_year - y1) / (y2 - y1))
 
 
@@ -446,7 +442,7 @@ def interpolate_modelling_years(modelling_years: list, values: list, eval_year: 
     Uses compound-growth interpolation matching the Excel CAGR formula:
         rate = (v2/v1)^(1/(y2-y1)) - 1
         value = v1 * (1+rate)^(eval_year - y1)
-    Returns 0 when either bracketing value is 0.
+    Falls back to linear interpolation when either bracketing value is 0.
     """
     if len(modelling_years) == 0 or len(values) == 0:
         return 0.0
@@ -1173,7 +1169,8 @@ def calculate_matrix(
                 vht_proj = interpolate_modelling_years(
                     modelling_years, proj_traffic[vt]["vht"], ey
                 )
-                annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factors[vt]
+                # Negative when the project is slower — a disbenefit, kept in the total
+                annual_vht_saving = (vht_base - vht_proj) * ann_factors[vt]
 
                 # Resolve per-vehicle-type generated demand % (override or global)
                 gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
@@ -1227,18 +1224,13 @@ def calculate_matrix(
                 # Resolve per-vehicle-type generated demand % (override or global)
                 gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
 
-                # Split VKT delta: diverted vs generated
-                vkt_delta = (annual_vkt_b - annual_vkt_p)
-                diverted_vkt_delta = vkt_delta * (1.0 - gen_pct / 100.0)
-                generated_vkt_delta = vkt_delta * (gen_pct / 100.0)
+                # Total base VOC minus total project VOC; diverted share at 1.0x,
+                # generated share at 0.5x (same split as TTS)
+                voc_saving = annual_vkt_b * voc_b - annual_vkt_p * voc_p
+                diverted_voc = voc_saving * (1.0 - gen_pct / 100.0)
+                generated_voc = voc_saving * (gen_pct / 100.0) * 0.5
 
-                # VOC benefit for diverted: full cost difference
-                diverted_voc = diverted_vkt_delta * (voc_b - voc_p)
-                # VOC benefit for generated: 0.5× project VOC (Rule-of-Half)
-                generated_voc = generated_vkt_delta * voc_p * 0.5
-
-                voc_saving = diverted_voc + generated_voc
-                b_voc += max(0.0, voc_saving) / 1e6
+                b_voc += (diverted_voc + generated_voc) / 1e6
 
             # ── Safety: $/VKT per vehicle type (per-case rates) ─────────────
             # Rule-of-Half: split VKT delta into diverted and generated
@@ -1247,21 +1239,15 @@ def calculate_matrix(
             for vt in VTYPES:
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
-                annual_vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
+                # Base VKT × base rate − project VKT × project rate
+                safety_saving = (vkt_b * _sv_base[vt] - vkt_p * _sv_proj[vt]) * ann_factors[vt]
 
                 # Resolve per-vehicle-type generated demand % (override or global)
                 gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
 
-                # Split VKT delta: diverted vs generated
-                diverted_vkt_delta = annual_vkt_delta * (1.0 - gen_pct / 100.0)
-                generated_vkt_delta = annual_vkt_delta * (gen_pct / 100.0)
-
-                # Safety cost difference (per VKT)
-                safety_cost_diff = _sv_base[vt] - _sv_proj[vt]
-
-                # Apply Rule-of-Half: diverted uses full cost difference, generated uses 0.5x
-                diverted_safety = diverted_vkt_delta * safety_cost_diff
-                generated_safety = generated_vkt_delta * safety_cost_diff * 0.5
+                # Apply Rule-of-Half: diverted share at 1.0x, generated share at 0.5x
+                diverted_safety = safety_saving * (1.0 - gen_pct / 100.0)
+                generated_safety = safety_saving * (gen_pct / 100.0) * 0.5
 
                 b_safety += (diverted_safety + generated_safety) / 1e6
             # Fatal component: used for VSL sensitivity (scales this share ±, rest held fixed).
@@ -1564,7 +1550,8 @@ def run_monte_carlo(
     Each iteration independently samples:
       - VTTS (all contexts/vehicle types): Normal(1, vtts_cv)
       - Safety $/VKT: Lognormal with sigma = safety_cv
-      - Traffic VHT/VKT (base and project): Normal(1, traffic_cv), clamped > 0
+      - Traffic VHT/VKT: Normal(1, traffic_cv), clamped > 0; one factor applied
+        to both base and project so demand uncertainty moves them together
       - Capital construction cost: Triangular(min, mode, max)
 
     Args:
@@ -1600,7 +1587,7 @@ def run_monte_carlo(
     safety_sigmas   = np.sqrt(np.log(1 + safety_cv**2))
     safety_means    = -0.5 * safety_sigmas**2
     safety_factors  = rng.lognormal(safety_means, safety_sigmas, n_simulations)
-    traffic_factors = rng.normal(1.0, traffic_cv,  (n_simulations, 2)).clip(0.01)  # [base, proj]
+    traffic_factors = rng.normal(1.0, traffic_cv,  n_simulations).clip(0.01)
     cost_factors    = rng.triangular(cost_overrun_min, cost_overrun_mode, cost_overrun_max, n_simulations)
 
     base_traffic_orig = traffic_data["base_case"]
@@ -1620,9 +1607,8 @@ def run_monte_carlo(
         sv_base = {vt: (sv_base_orig[vt] if sv_base_orig else p["safety_vkt"][vt]) * sf for vt in VTYPES}
         sv_proj = {vt: (sv_proj_orig[vt] if sv_proj_orig else p["safety_vkt"][vt]) * sf for vt in VTYPES}
 
-        # ── Perturb traffic (multiplicative, independent for base vs project) ─
-        f_base = traffic_factors[i, 0]
-        f_proj = traffic_factors[i, 1]
+        # ── Perturb traffic (same factor for base and project) ───────────────
+        f_base = f_proj = traffic_factors[i]
 
         def _scale_traffic(orig: dict, factor: float) -> dict:
             tc = copy.deepcopy(orig)
@@ -1669,15 +1655,15 @@ def run_monte_carlo(
     )
     central_npv = _central["npv"]
 
-    def _npv_with(vtts_f=1.0, safety_f=1.0, traffic_base_f=1.0, traffic_proj_f=1.0, cost_f=1.0):
+    def _npv_with(vtts_f=1.0, safety_f=1.0, traffic_f=1.0, cost_f=1.0):
         _p = copy.deepcopy(_p_base)
         for _ctx in ("urban", "rural"):
             for _vt in VTYPES:
                 _p["vtts"][_ctx][_vt] *= vtts_f
-        _sv_b = {vt: (_p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
-        _sv_p = {vt: (_p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
-        _bt = _scale_traffic(base_traffic_orig, traffic_base_f)
-        _pt = _scale_traffic(proj_traffic_orig, traffic_proj_f)
+        _sv_b = {vt: (sv_base_orig[vt] if sv_base_orig else _p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
+        _sv_p = {vt: (sv_proj_orig[vt] if sv_proj_orig else _p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
+        _bt = _scale_traffic(base_traffic_orig, traffic_f)
+        _pt = _scale_traffic(proj_traffic_orig, traffic_f)
         _c = dict(cost_orig)
         _c["cap_construction"] = cost_orig["cap_construction"] * cost_f
         return calculate_matrix(
@@ -1690,15 +1676,15 @@ def run_monte_carlo(
     _vtts_p90_f   = float(np.percentile(vtts_factors, 90))
     _safety_p10_f = float(np.percentile(safety_factors, 10))
     _safety_p90_f = float(np.percentile(safety_factors, 90))
-    _traf_p10_f   = float(np.percentile(traffic_factors[:, 1], 10))
-    _traf_p90_f   = float(np.percentile(traffic_factors[:, 1], 90))
+    _traf_p10_f   = float(np.percentile(traffic_factors, 10))
+    _traf_p90_f   = float(np.percentile(traffic_factors, 90))
     _cost_p10_f   = float(np.percentile(cost_factors, 10))
     _cost_p90_f   = float(np.percentile(cost_factors, 90))
 
     tornado = {
         "VTTS":             (_npv_with(vtts_f=_vtts_p10_f),   _npv_with(vtts_f=_vtts_p90_f)),
         "Safety cost/VKT":  (_npv_with(safety_f=_safety_p10_f), _npv_with(safety_f=_safety_p90_f)),
-        "Traffic volumes":  (_npv_with(traffic_proj_f=_traf_p10_f), _npv_with(traffic_proj_f=_traf_p90_f)),
+        "Traffic volumes":  (_npv_with(traffic_f=_traf_p10_f), _npv_with(traffic_f=_traf_p90_f)),
         "Capital cost":     (_npv_with(cost_f=_cost_p90_f),   _npv_with(cost_f=_cost_p10_f)),
     }
 
@@ -2282,6 +2268,10 @@ _matrix_inputs = {
     "zero_growth_after_last_year": zero_growth_after_last_year,
     "n_project_cases": st.session_state.n_project_cases,
 }
+# Per-case safety rates apply only in Detailed mode (where they are editable);
+# in General mode the Parameters-tab rates are used via _eff_params.
+_calc_safety_vkt = (st.session_state.safety_vkt_data
+                    if st.session_state.get("safety_mode", "General") == "Detailed" else None)
 # Calculation runs after the Data Input tab — see RUN CALCULATION below.
 
 
@@ -2502,13 +2492,13 @@ with _kpi_slot:
         _eff_params = build_effective_params()
         _cache_key = _stable_hash(_matrix_inputs, st.session_state.traffic_data,
                                   st.session_state.cost_data, st.session_state.annualisation,
-                                  st.session_state.safety_vkt_data, _eff_params)
+                                  _calc_safety_vkt, _eff_params)
         matrix_results = _cached_calculate_all_cases(
             _cache_key, _matrix_inputs,
             traffic_data=st.session_state.traffic_data,
             cost_data=st.session_state.cost_data,
             annualisation=st.session_state.annualisation,
-            safety_vkt_data=st.session_state.safety_vkt_data,
+            safety_vkt_data=_calc_safety_vkt,
             params=_eff_params,
         )
     except Exception as _calc_err:
@@ -3241,7 +3231,7 @@ with tab_sensitivity:
                         traffic_data=st.session_state.traffic_data,
                         cost_data=st.session_state.cost_data,
                         annualisation=st.session_state.annualisation,
-                        safety_vkt_data=st.session_state.safety_vkt_data,
+                        safety_vkt_data=_calc_safety_vkt,
                         params=_eff_params,
                         n_simulations=_mc_n,
                         vtts_cv=_mc_vtts / 100,
