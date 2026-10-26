@@ -1,4 +1,5 @@
 """Headless smoke test of the Streamlit app."""
+import copy
 import io
 import os
 
@@ -18,6 +19,14 @@ def _metric(at, label):
 def _number_input(at, label):
     [widget] = [w for w in at.number_input if w.label == label]
     return widget
+
+
+class _FakeUpload(io.BytesIO):
+    """Stand-in for Streamlit's UploadedFile: bytes plus a stable file_id."""
+
+    def __init__(self, data, file_id):
+        super().__init__(data)
+        self.file_id = file_id
 
 
 def _app_with_sample():
@@ -61,6 +70,59 @@ def test_two_options_share_base_costs():
     assert len(at.session_state["cost_data"]["project_2"]["recurrent"]) == 33
 
 
+def test_adding_option_and_changing_years_keep_costs():
+    at = _app_with_sample()
+    before = copy.deepcopy(at.session_state["cost_data"]["project_1"])
+    _number_input(at, "Number of Project Cases").set_value(2).run()
+    assert not at.exception
+    costs = at.session_state["cost_data"]
+    assert costs["project_1"]["capex_base"] == before["capex_base"]
+    assert costs["project_1"]["recurrent"] == before["recurrent"]
+    assert costs["project_1"] == before
+    p2 = costs["project_2"]
+    assert all(len(row) == 3 for row in p2["capex_base"].values())
+    assert len(p2["contingency_p50"]) == 3 and len(p2["contingency_p90"]) == 3
+    assert len(p2["recurrent"]) == 33
+    traffic_p1 = copy.deepcopy(at.session_state["traffic_data"]["project_1"])
+    assert traffic_p1["Car"]["vht"] == [980.0, 1100.0, 1270.0, 1480.0]
+    assert "project_2" in at.session_state["traffic_data"]
+
+    at.text_input(key="modelling_years_widget").set_value("2026, 2031, 2041, 2061").run()
+    assert not at.exception
+    assert at.session_state["modelling_years"] == [2026, 2031, 2041, 2061]
+    assert at.session_state["cost_data"]["project_1"] == before
+    assert len(at.session_state["cost_data"]["project_2"]["recurrent"]) == 33
+
+
+def test_option_change_keeps_periods():
+    at = AppTest.from_file(APP_PATH, default_timeout=300).run()
+    _number_input(at, "Construction Period (years)").set_value(5).run()
+    _number_input(at, "Evaluation Period (years)").set_value(40).run()
+    _number_input(at, "Construction Start Year").set_value(2030).run()
+    _number_input(at, "Number of Project Cases").set_value(2).run()
+    assert not at.exception
+    assert at.session_state["const_years"] == 5
+    assert at.session_state["eval_period"] == 40
+    assert at.session_state["construction_start_year"] == 2030
+    assert len(at.session_state["cost_data"]["project_1"]["recurrent"]) == 45
+    assert len(at.session_state["cost_data"]["project_2"]["recurrent"]) == 45
+
+
+def test_sample_resets_periods():
+    at = AppTest.from_file(APP_PATH, default_timeout=300).run()
+    _number_input(at, "Construction Period (years)").set_value(5).run()
+    _number_input(at, "Evaluation Period (years)").set_value(40).run()
+    _number_input(at, "Construction Start Year").set_value(2030).run()
+    at.checkbox(key="confirm_load_sample").check().run()
+    [btn] = [b for b in at.button if b.label == "Load Sample Data"]
+    btn.click().run()
+    assert not at.exception
+    assert at.session_state["const_years"] == 3
+    assert at.session_state["eval_period"] == 30
+    assert at.session_state["construction_start_year"] == 2026
+    assert _metric(at, "Benefit-Cost Ratio") == "1.69"
+
+
 def test_empty_project_no_errors():
     at = AppTest.from_file(APP_PATH, default_timeout=300).run()
     assert not at.exception
@@ -72,7 +134,8 @@ def test_save_load_round_trip_keeps_periods(monkeypatch):
     """Save at a 4-year construction period, open in a fresh session (default 3).
 
     AppTest cannot drive file uploads, so the save button's data is captured
-    and handed back once through the project uploader.
+    and handed back through the project uploader on every run, as a real
+    uploader keeps returning the file until it is removed.
     """
     saved = {}
     real_download, real_uploader = streamlit.download_button, streamlit.file_uploader
@@ -93,17 +156,15 @@ def test_save_load_round_trip_keeps_periods(monkeypatch):
     assert not at.exception
     payload = saved["json"]
 
-    pending = [payload]
-
-    def upload_once(label, *args, **kwargs):
-        if kwargs.get("key") == "load_project_uploader" and pending:
+    def upload_always(label, *args, **kwargs):
+        if kwargs.get("key") == "load_project_uploader":
             real_uploader(label, *args, **kwargs)
-            return io.BytesIO(pending.pop().encode("utf-8"))
+            return _FakeUpload(payload.encode("utf-8"), file_id="saved-project-1")
         return real_uploader(label, *args, **kwargs)
 
-    monkeypatch.setattr(streamlit, "file_uploader", upload_once)
+    monkeypatch.setattr(streamlit, "file_uploader", upload_always)
     monkeypatch.setattr(policies, "_shown_default_value_warning", False)
-    fresh = AppTest.from_file(APP_PATH, default_timeout=300).run()
+    fresh = AppTest.from_file(APP_PATH, default_timeout=60).run()
     assert not fresh.exception
     assert not fresh.error
     assert not [w for w in fresh.warning if "default value" in w.value]
@@ -115,6 +176,14 @@ def test_save_load_round_trip_keeps_periods(monkeypatch):
     assert len(loaded["recurrent"]) == 34
     assert loaded["recurrent"][12] == 8.2 and loaded["recurrent"][33] == 0.0
     assert _metric(fresh, "P50 capital ($M, real)") == "$390.0M"
+
+    # The file is still in the uploader; later edits must not be reverted by it.
+    _number_input(fresh, "Construction Period (years)").set_value(5).run()
+    assert not fresh.exception
+    assert fresh.session_state["const_years"] == 5
+    loaded = fresh.session_state["cost_data"]["project_1"]
+    assert loaded["capex_base"]["construction"] == [60.0, 120.0, 80.0, 40.0, 0.0]
+    assert len(loaded["recurrent"]) == 35
 
 
 def test_sensitivity_table_present():

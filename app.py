@@ -117,6 +117,11 @@ def _load_sample_data() -> None:
     years = [2026, 2031, 2041, 2056]
     st.session_state["modelling_years"] = years
     st.session_state["n_project_cases"] = 1
+    # The sample cost rows assume these periods. Setting the widget keys is
+    # legal here: the sample button renders before the period widgets.
+    st.session_state["const_years"] = 3
+    st.session_state["eval_period"] = 30
+    st.session_state["construction_start_year"] = 2026
 
     td = make_traffic_data(years, 1)
 
@@ -224,7 +229,7 @@ def _serialise_project() -> dict:
     return data
 
 
-def _deserialise_project(data: dict) -> None:
+def _deserialise_project(data: dict) -> bool:
     """Restore project state from a JSON dict. Returns False if nothing was loaded."""
     _err = validate_project_file(data)
     if _err:
@@ -476,8 +481,8 @@ def render_cost_entry(const_years: int, eval_period: int, start_year: int) -> No
                     key=f"cost_upfront_carbon_{i}",
                     help=(
                         "Embodied carbon from construction. Spread over the construction years "
-                        "in proportion to P50 capital and valued at the carbon price "
-                        "(Parameters tab). Reported as a disbenefit."
+                        "in proportion to P50 capital and valued at $123/t (TfNSW EPV). "
+                        "Reported as a disbenefit."
                     ),
                 )
             with _u2:
@@ -1293,9 +1298,16 @@ def _init_session_state() -> None:
             if not isinstance(_ann.get(_vt), dict):
                 _f = float(_ann[_vt]) if _vt in _ann else (_old_factor or 6.29)
                 _ann[_vt] = {"factor": _f, "days": int(_old_days)}
+    # Period settings are sidebar widget keys. Store them as plain session
+    # values every run so an st.rerun() fired before those widgets render
+    # (option count, modelling years) does not clear them back to defaults.
+    for _k, _default in (("eval_period", 30), ("const_years", 3),
+                         ("construction_start_year", 2026)):
+        st.session_state[_k] = st.session_state.get(_k, _default)
     _years = st.session_state["modelling_years"]
     _n = st.session_state["n_project_cases"]
-    _case_keys = ["base_case"] + [f"project_{i}" for i in range(1, _n + 1)]
+    _project_keys = [f"project_{i}" for i in range(1, _n + 1)]
+    _case_keys = ["base_case"] + _project_keys
     # Safety $/VKT per case — initialise missing cases with PARAMS defaults
     if "safety_vkt_data" not in st.session_state:
         st.session_state["safety_vkt_data"] = {
@@ -1306,25 +1318,29 @@ def _init_session_state() -> None:
         for ck in _case_keys:
             if ck not in _svd:
                 _svd[ck] = dict(PARAMS["safety_vkt"])
-    # (Re-)initialise traffic / cost data when structure changes
+    # Traffic rows are indexed by modelling year: reset them when the years
+    # change; otherwise only add zeroed entries for new options.
     td = st.session_state.get("traffic_data")
-    needs_reset = (
-        td is None
-        or td.get("base_case", {}).get("years") != _years
-        or f"project_{_n}" not in td
-    )
-    if needs_reset:
+    if td is None or td.get("base_case", {}).get("years") != _years:
         st.session_state["traffic_data"] = make_traffic_data(_years, _n)
-        st.session_state["cost_data"] = make_cost_data(
-            _n,
-            st.session_state.get("const_years", 3),
-            st.session_state.get("eval_period", 30),
-        )
+    else:
+        for _ck in _project_keys:
+            if _ck not in td:
+                td[_ck] = make_traffic_case(_years)
+    # Cost rows are indexed by construction/appraisal year, not modelling year:
+    # keep every existing option's costs and add entries only for new options.
+    _cost_data = st.session_state.get("cost_data") or {}
+    _missing = [_ck for _ck in _project_keys if _ck not in _cost_data]
+    if _missing:
+        _fresh = make_cost_data(_n, st.session_state["const_years"],
+                                st.session_state["eval_period"])
+        for _ck in _missing:
+            _cost_data[_ck] = _fresh[_ck]
+    st.session_state["cost_data"] = _cost_data
     # Base case costs are shared by all options and survive option-count changes
     if "base_case_costs" not in st.session_state:
         st.session_state["base_case_costs"] = make_base_case_costs(
-            st.session_state.get("const_years", 3),
-            st.session_state.get("eval_period", 30),
+            st.session_state["const_years"], st.session_state["eval_period"],
         )
 
     st.session_state.setdefault("show_advanced", False)
@@ -1370,10 +1386,14 @@ with st.sidebar:
             "Load Project (.json)", type=["json"], key="load_project_uploader",
             label_visibility="collapsed",
         )
-        if _uploaded_project is not None:
+        # The uploader keeps returning the file on every run; apply each upload
+        # once so later edits are not overwritten and st.rerun() does not loop.
+        if (_uploaded_project is not None
+                and st.session_state.get("_loaded_project_id") != _uploaded_project.file_id):
             try:
                 _loaded = json.loads(_uploaded_project.read().decode("utf-8"))
                 if _deserialise_project(_loaded):
+                    st.session_state["_loaded_project_id"] = _uploaded_project.file_id
                     st.rerun()
             except Exception as e:
                 st.error(f"Error loading project: {e}")
@@ -1453,11 +1473,9 @@ with st.sidebar:
     project_name = st.text_input("Project Name", value="Sample Road Upgrade",
         help="A descriptive name for this cost-benefit analysis. Shown in the header and exported CSV.")
     st.session_state["project_name"] = project_name
-    # Period widgets take their defaults from session state (no value=) so a
-    # loaded project can set them without a duplicate-default warning.
-    for _k, _default in (("eval_period", 30), ("const_years", 3),
-                         ("construction_start_year", 2026)):
-        st.session_state.setdefault(_k, _default)
+    # Period widgets take their values from session state (no value=; set in
+    # _init_session_state) so a loaded project can set them without a
+    # duplicate-default warning.
     col1, col2 = st.columns(2)
     with col1:
         eval_period = st.number_input("Evaluation Period (years)", 1, 50, key="eval_period",
@@ -1468,7 +1486,7 @@ with st.sidebar:
             key="construction_start_year", help="Calendar year construction begins. Benefits start after the construction period.")
     with col2:
         const_years = st.number_input("Construction Period (years)", 1, 10, key="const_years",
-            help="Number of years over which capital costs are spread. Construction disbenefits apply during this period.")
+            help="Number of construction years; capital is entered by year. Construction disbenefits apply during this period.")
         discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 5.0, step=0.5,
             help="TfNSW default: 5%. Used to discount future costs and benefits to present values. Higher rates reduce NPV.")
     context = st.selectbox("Context", ["urban", "rural"], format_func=str.title,
@@ -2314,8 +2332,9 @@ with tab_sensitivity:
         })
         st.dataframe(_styled_c, use_container_width=True, hide_index=True)
         st.caption(
-            "Scales only the emission_cost (carbon) component of environmental benefits; "
-            "air pollution and noise costs are held at base values. "
+            "Scales the emission_cost (carbon) component of environmental benefits and the "
+            "upfront (construction) carbon disbenefit; air pollution and noise costs are "
+            "held at base values. "
             "Base: $123/tCO₂e (TfNSW EPV Jan 2025). "
             "Treasury: $135.74/tCO₂e (NSW Treasury TPG24-34). "
             "Highlighted row = Central (base case) carbon price."
