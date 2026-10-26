@@ -1,6 +1,7 @@
 """Headless smoke test of the Streamlit app."""
 import copy
 import io
+import json
 import os
 
 import streamlit
@@ -137,15 +138,7 @@ def test_save_load_round_trip_keeps_periods(monkeypatch):
     and handed back through the project uploader on every run, as a real
     uploader keeps returning the file until it is removed.
     """
-    saved = {}
-    real_download, real_uploader = streamlit.download_button, streamlit.file_uploader
-
-    def capture_download(label, data, *args, **kwargs):
-        if label == "Save Project (.json)":
-            saved["json"] = data
-        return real_download(label, data, *args, **kwargs)
-
-    monkeypatch.setattr(streamlit, "download_button", capture_download)
+    saved = _capture_saves(monkeypatch)
     at = _app_with_sample()
     _number_input(at, "Construction Period (years)").set_value(4).run()
     _number_input(at, "Construction Start Year").set_value(2027).run()
@@ -154,20 +147,7 @@ def test_save_load_round_trip_keeps_periods(monkeypatch):
     at.session_state["cost_data"] = at.session_state["cost_data"]
     at.run()  # the save button now holds the 4-year rows
     assert not at.exception
-    payload = saved["json"]
-
-    def upload_always(label, *args, **kwargs):
-        if kwargs.get("key") == "load_project_uploader":
-            real_uploader(label, *args, **kwargs)
-            return _FakeUpload(payload.encode("utf-8"), file_id="saved-project-1")
-        return real_uploader(label, *args, **kwargs)
-
-    monkeypatch.setattr(streamlit, "file_uploader", upload_always)
-    monkeypatch.setattr(policies, "_shown_default_value_warning", False)
-    fresh = AppTest.from_file(APP_PATH, default_timeout=60).run()
-    assert not fresh.exception
-    assert not fresh.error
-    assert not [w for w in fresh.warning if "default value" in w.value]
+    fresh = _open_in_fresh_app(monkeypatch, saved[-1], file_id="saved-project-1")
     assert fresh.session_state["const_years"] == 4
     assert fresh.session_state["eval_period"] == 30
     assert fresh.session_state["construction_start_year"] == 2027
@@ -184,6 +164,77 @@ def test_save_load_round_trip_keeps_periods(monkeypatch):
     loaded = fresh.session_state["cost_data"]["project_1"]
     assert loaded["capex_base"]["construction"] == [60.0, 120.0, 80.0, 40.0, 0.0]
     assert len(loaded["recurrent"]) == 35
+
+
+def _capture_saves(monkeypatch):
+    """Record every 'Save Project (.json)' payload the app renders."""
+    saved = []
+    real_download = streamlit.download_button
+
+    def capture_download(label, data, *args, **kwargs):
+        if label == "Save Project (.json)":
+            saved.append(data)
+        return real_download(label, data, *args, **kwargs)
+
+    monkeypatch.setattr(streamlit, "download_button", capture_download)
+    return saved
+
+
+def _open_in_fresh_app(monkeypatch, payload, file_id):
+    """Load a saved payload into a new session through the project uploader."""
+    real_uploader = streamlit.file_uploader
+
+    def upload_always(label, *args, **kwargs):
+        if kwargs.get("key") == "load_project_uploader":
+            real_uploader(label, *args, **kwargs)
+            return _FakeUpload(payload.encode("utf-8"), file_id=file_id)
+        return real_uploader(label, *args, **kwargs)
+
+    monkeypatch.setattr(streamlit, "file_uploader", upload_always)
+    monkeypatch.setattr(policies, "_shown_default_value_warning", False)
+    fresh = AppTest.from_file(APP_PATH, default_timeout=60).run()
+    assert not fresh.exception
+    assert not fresh.error
+    assert not [w for w in fresh.warning if "default value" in w.value]
+    return fresh
+
+
+def test_save_load_round_trip_keeps_settings(monkeypatch):
+    """Discount rate, context, base year, zero-growth flag and name survive a reload."""
+    saved = _capture_saves(monkeypatch)
+    at = _app_with_sample()
+    _number_input(at, "Discount Rate (%)").set_value(7.0).run()
+    _number_input(at, "Discount Base Year").set_value(2025).run()
+    [ctx] = [s for s in at.selectbox if s.label == "Context"]
+    ctx.set_value("rural").run()
+    [zg] = [c for c in at.checkbox if c.label == "Zero growth after last modelling year"]
+    zg.check().run()
+    [name] = [t for t in at.text_input if t.label == "Project Name"]
+    name.set_value("Picton Bypass").run()
+    assert not at.exception
+    payload = saved[-1]
+
+    fresh = _open_in_fresh_app(monkeypatch, payload, file_id="saved-settings-1")
+    assert _number_input(fresh, "Discount Rate (%)").value == 7.0
+    assert _number_input(fresh, "Discount Base Year").value == 2025
+    assert [s for s in fresh.selectbox if s.label == "Context"][0].value == "rural"
+    assert [c for c in fresh.checkbox
+            if c.label == "Zero growth after last modelling year"][0].value is True
+    assert [t for t in fresh.text_input if t.label == "Project Name"][0].value == "Picton Bypass"
+
+    # The file stays in the uploader; a later edit must stick.
+    _number_input(fresh, "Discount Rate (%)").set_value(4.0).run()
+    assert not fresh.exception
+    assert _number_input(fresh, "Discount Rate (%)").value == 4.0
+
+
+def test_save_includes_edit_made_this_run(monkeypatch):
+    """A cost edit is in the save file rendered on the same run, not one run later."""
+    saved = _capture_saves(monkeypatch)
+    at = _app_with_sample()
+    _number_input(at, "Upfront carbon (tCO₂e)").set_value(12345.0).run()
+    assert not at.exception
+    assert json.loads(saved[-1])["cost_data"]["project_1"]["upfront_carbon_t"] == 12345.0
 
 
 def test_sensitivity_table_present():

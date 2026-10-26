@@ -217,6 +217,7 @@ def _serialise_project() -> dict:
         "annualisation", "modelling_years", "n_project_cases",
         "safety_mode", "env_mode", "reliability_mode", "show_advanced",
         "project_name", "const_years", "eval_period", "construction_start_year",
+        "discount_rate", "discount_base_year", "context", "zero_growth_after_last_year",
     ]
     data = {"version": __version__, "type": "cba_project",
             "cost_format": COST_FORMAT_VERSION}
@@ -243,7 +244,10 @@ def _deserialise_project(data: dict) -> bool:
               # Period settings fix the meaning of the yearly cost rows. These are
               # sidebar widget keys; setting them is legal because the uploader
               # renders before those widgets.
-              "const_years", "eval_period", "construction_start_year"):
+              "const_years", "eval_period", "construction_start_year",
+              # Appraisal settings change every result, so they travel with the file.
+              "discount_rate", "discount_base_year", "context",
+              "zero_growth_after_last_year", "project_name"):
         if k in data:
             st.session_state[k] = data[k]
     for k in list(data.keys()):
@@ -1298,11 +1302,14 @@ def _init_session_state() -> None:
             if not isinstance(_ann.get(_vt), dict):
                 _f = float(_ann[_vt]) if _vt in _ann else (_old_factor or 6.29)
                 _ann[_vt] = {"factor": _f, "days": int(_old_days)}
-    # Period settings are sidebar widget keys. Store them as plain session
-    # values every run so an st.rerun() fired before those widgets render
+    # Period and appraisal settings are sidebar widget keys. Store them as plain
+    # session values every run so an st.rerun() fired before those widgets render
     # (option count, modelling years) does not clear them back to defaults.
     for _k, _default in (("eval_period", 30), ("const_years", 3),
-                         ("construction_start_year", 2026)):
+                         ("construction_start_year", 2026),
+                         ("discount_rate", 5.0), ("discount_base_year", 2026),
+                         ("context", "urban"), ("zero_growth_after_last_year", False),
+                         ("project_name", "Sample Road Upgrade")):
         st.session_state[_k] = st.session_state.get(_k, _default)
     _years = st.session_state["modelling_years"]
     _n = st.session_state["n_project_cases"]
@@ -1372,16 +1379,8 @@ with st.sidebar:
     # ── Save / Load Project ─────────────────────────────────────────────────
     with st.expander("Save / Load Project", expanded=False):
         st.caption("Download your project data as JSON or upload a previously saved file.")
-        _proj = _serialise_project()
-        _proj_json = json.dumps(_proj, default=str)
-        _safe_filename = re.sub(r'[^\w\s-]', '', st.session_state.get("project_name", "cba_project")).strip().replace(' ', '_') or "cba_project"
-        st.download_button(
-            "Save Project (.json)",
-            _proj_json,
-            file_name=f"{_safe_filename}.json",
-            mime="application/json",
-            use_container_width=True,
-        )
+        # Filled after the Data Input tab, so the file includes edits made this run.
+        _save_slot = st.container()
         _uploaded_project = st.file_uploader(
             "Load Project (.json)", type=["json"], key="load_project_uploader",
             label_visibility="collapsed",
@@ -1470,30 +1469,29 @@ with st.sidebar:
 
     # --- Project Details ---
     st.markdown("### Project Details")
-    project_name = st.text_input("Project Name", value="Sample Road Upgrade",
-        help="A descriptive name for this cost-benefit analysis. Shown in the header and exported CSV.")
-    st.session_state["project_name"] = project_name
-    # Period widgets take their values from session state (no value=; set in
+    # These widgets take their values from session state (no value=/index=; set in
     # _init_session_state) so a loaded project can set them without a
     # duplicate-default warning.
+    project_name = st.text_input("Project Name", key="project_name",
+        help="A descriptive name for this cost-benefit analysis. Shown in the header and exported CSV.")
     col1, col2 = st.columns(2)
     with col1:
         eval_period = st.number_input("Evaluation Period (years)", 1, 50, key="eval_period",
             help="Appraisal period in years, counted from opening (TfNSW default: 30 years; maximum 50). Construction years are added before it.")
-        discount_base_year = st.number_input("Discount Base Year", 2020, 2060, 2026,
-            help="Calendar year used as Year 0 for discounting (PV anchor).")
+        discount_base_year = st.number_input("Discount Base Year", 2020, 2060,
+            key="discount_base_year", help="Calendar year used as Year 0 for discounting (PV anchor).")
         construction_start_year = st.number_input("Construction Start Year", 2020, 2060,
             key="construction_start_year", help="Calendar year construction begins. Benefits start after the construction period.")
     with col2:
         const_years = st.number_input("Construction Period (years)", 1, 10, key="const_years",
             help="Number of construction years; capital is entered by year. Construction disbenefits apply during this period.")
-        discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 5.0, step=0.5,
-            help="TfNSW default: 5%. Used to discount future costs and benefits to present values. Higher rates reduce NPV.")
+        discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, step=0.5,
+            key="discount_rate", help="TfNSW default: 5%. Used to discount future costs and benefits to present values. Higher rates reduce NPV.")
     context = st.selectbox("Context", ["urban", "rural"], format_func=str.title,
-        help="Affects VTTS rates, VOC speed tables, emission costs, and air pollution rates. Urban uses higher rates.")
+        key="context", help="Affects VTTS rates, VOC speed tables, emission costs, and air pollution rates. Urban uses higher rates.")
     zero_growth_after_last_year = st.checkbox(
         "Zero growth after last modelling year",
-        value=False,
+        key="zero_growth_after_last_year",
         help="When checked, traffic volumes (and all benefits) are held flat at the last "
              "modelling year's values rather than extrapolating the trend.",
     )
@@ -1837,6 +1835,18 @@ with _kpi_slot:
                 st.metric("Payback Period", pb)
     else:
         st.info("Enter traffic data in the **Data Input** tab to see results.")
+
+# ── Save Project button (sidebar slot reserved above) ─────────────────────────
+with _save_slot:
+    _proj_json = json.dumps(_serialise_project(), default=str)
+    _safe_filename = re.sub(r'[^\w\s-]', '', st.session_state.get("project_name", "cba_project")).strip().replace(' ', '_') or "cba_project"
+    st.download_button(
+        "Save Project (.json)",
+        _proj_json,
+        file_name=f"{_safe_filename}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
