@@ -4,7 +4,8 @@ import copy
 import pytest
 
 from cba_engine import (
-    PARAMS, VTYPES, build_cost_schedule, calculate_matrix, clean_row, fit_cost_rows,
+    PARAMS, VTYPES, appraisal_summary, build_cost_schedule, calculate_matrix, clean_row,
+    fit_cost_rows, generate_csv,
     interpolate_modelling_years, make_base_case_costs, make_cost_data,
     run_required_sensitivities, validate_project_file,
 )
@@ -438,3 +439,55 @@ def test_calculate_matrix_drops_old_scenario_tables():
     _, central, _ = _required_rows()
     assert "sensitivity_dr" not in central
     assert "scenarios" not in central
+
+
+# ── Appraisal summary and CSV ────────────────────────────────────────────────
+
+SUMMARY_KEYS = [
+    "P50 outturn capital (nominal $M)", "P90 outturn capital (nominal $M)",
+    "PV capital ($M)", "PV recurrent costs ($M)", "PV costs ($M)",
+    "PV benefits ($M)", "NPV ($M)", "BCR",
+]
+
+
+def test_summary_outturn_not_entered():
+    r = _run_costs()
+    cost, _ = fixture_costs()
+    cost["outturn_p50_nominal"] = None
+    cost["outturn_p90_nominal"] = None
+    s = appraisal_summary(r, cost)
+    assert list(s) == SUMMARY_KEYS
+    assert s["P50 outturn capital (nominal $M)"] == "not entered"
+    assert s["P90 outturn capital (nominal $M)"] == "not entered"
+    assert s["PV capital ($M)"] == r["pv_capital"]
+    assert s["PV recurrent costs ($M)"] == r["pv_recurrent"]
+    assert s["PV costs ($M)"] == r["pv_costs"]
+    assert s["PV benefits ($M)"] == r["pv_benefits"]
+    assert s["NPV ($M)"] == r["npv"]
+    assert s["BCR"] == r["bcr"]
+
+
+def test_summary_outturn_copied():
+    r = _run_costs()
+    s = appraisal_summary(r, {"outturn_p50_nominal": 395.0, "outturn_p90_nominal": 430.5})
+    assert s["P50 outturn capital (nominal $M)"] == 395.0
+    assert s["P90 outturn capital (nominal $M)"] == 430.5
+
+
+def test_csv_sections():
+    rows, central, (inputs, bt, pt, cost, base) = _required_rows()
+    cost["outturn_p50_nominal"] = 395.0
+    summary = appraisal_summary(central, cost)
+    text = generate_csv(central, "Test project", summary, rows)
+    assert "TfNSW required sensitivity tests" in text
+    assert "Avoided Base Case Costs" in text
+    assert "P90 capital cost" in text
+    assert "P50 outturn capital (nominal $M)" in text
+    assert "395.0" in text
+    assert "P90 outturn capital (nominal $M),not entered" in text
+    assert "PV capital ($M)" in text and "PV recurrent costs ($M)" in text
+    assert "Discounted net" in text and "Cumulative" in text
+    assert text.index("Appraisal summary") < text.index("Itemised PV") \
+        < text.index("TfNSW required sensitivity tests") < text.index("Cashflow by year")
+    # one cashflow row per year
+    assert text.count("\n") >= central["total_years"] + len(rows)

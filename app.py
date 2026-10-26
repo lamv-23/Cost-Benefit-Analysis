@@ -28,7 +28,7 @@ from cba_engine import (  # noqa: E402,F401
     fit_cost_rows, build_cost_schedule, validate_project_file,
     discount_factor, interpolate_voc, _cagr_interpolate, interpolate_modelling_years,
     calculate_matrix, calculate_all_cases, run_required_sensitivities,
-    run_monte_carlo, generate_csv,
+    run_monte_carlo, generate_csv, appraisal_summary, format_summary_value,
 )
 
 # Optional: Excel template generation (Step 6) — requires openpyxl
@@ -504,7 +504,7 @@ def render_cost_entry(const_years: int, eval_period: int, start_year: int) -> No
                     "Useful life of the constructed asset — used to auto-calculate residual "
                     "value at end of evaluation period (straight-line depreciation). "
                     "Typical values: sealed rural road 40–60 yr · urban arterial 30–50 yr · "
-                    "bridge/major structure 80–100 yr · flexible pavement 25–35 yr · "
+                    "bridge/major structure 80–100 yr · flexible road surface 25–35 yr · "
                     "unsealed road 15–20 yr · ITS/signals 15–25 yr. "
                     "Land acquisition always retains full value regardless of this setting."
                 ),
@@ -1172,7 +1172,11 @@ COLORS = {
     "voc": "#fd7e14",
     "safety": "#dc3545",
     "env": "#198754",
-    "active": "#20c997",
+    "active": "#6f42c1",
+    "avoided_costs": "#20c997",
+    "upfront_carbon": "#6c757d",
+    "construction_disruption": "#adb5bd",
+    "residual": "#795548",
     "cost": "#6c757d",
     "positive": "#198754",
     "negative": "#dc3545",
@@ -1798,6 +1802,21 @@ with tab_dash:
         st.info("Enter traffic data in the **Data Input** tab to see charts.")
         st.stop()
 
+    # ── Appraisal summary: one column per option ─────────────────────────────
+    st.subheader("Appraisal summary")
+    _summ_cols: dict = {}
+    for _sk, _sr in matrix_results.items():
+        _summ = appraisal_summary(_sr, st.session_state.cost_data.get(_sk, {}))
+        _summ_cols[f"Project {_sk.split('_')[1]}"] = [
+            format_summary_value(_k, _v) for _k, _v in _summ.items()
+        ]
+    st.dataframe(pd.DataFrame(_summ_cols, index=list(_summ.keys())),
+                 use_container_width=True)
+    st.caption(
+        "Outturn capital is nominal $M, copied from the cost estimate and never used in "
+        "the calculation. All other figures are real June 2024 dollars."
+    )
+
     if _n_dash > 1:
         _dash_case = st.selectbox(
             "Project case to display in charts",
@@ -1827,7 +1846,8 @@ with tab_dash:
         if _reliability_mode == "General":
             _pv_display["tts"] = pv.get("tts", 0) + pv.get("reliability", 0)
             _pv_display["reliability"] = 0.0
-        _bar_types = ["tts", "voc", "safety", "env", "active"]
+        _bar_types = ["tts", "voc", "safety", "env", "active",
+                      "avoided_costs", "upfront_carbon", "construction_disruption", "residual"]
         if _reliability_mode != "General":
             _bar_types.insert(1, "reliability")
         _bar_labels = [TYPE_LABELS[t] for t in _bar_types]
@@ -2041,7 +2061,8 @@ with tab_cashflow:
             }
         df_cf = pd.DataFrame({
             "Year": years_list,
-            "Costs ($M)": [round(c, 3) for c in _r_cf["annual_costs"]],
+            "Capital ($M)": [round(c, 3) for c in _r_cf["annual_capital"]],
+            "Recurrent ($M)": [round(c, 3) for c in _r_cf["annual_recurrent"]],
             "Benefits ($M)": [round(b, 3) for b in _r_cf["annual_benefits"]],
             _tts_label: _tts_vals,
             **_tts_cols,
@@ -2050,6 +2071,10 @@ with tab_cashflow:
             "Safety ($M)": [round(v, 3) for v in _bbt["safety"]],
             **_env_cols,
             "Active Transport ($M)": [round(v, 3) for v in _bbt["active"]],
+            "Avoided base case costs ($M)": [round(v, 3) for v in _bbt["avoided_costs"]],
+            "Upfront carbon ($M)": [round(v, 3) for v in _bbt["upfront_carbon"]],
+            "Construction disruption ($M)": [round(v, 3) for v in _bbt["construction_disruption"]],
+            "Residual value ($M)": [round(v, 3) for v in _bbt["residual"]],
             "Net ($M)": [round(n, 3) for n in _r_cf["annual_net"]],
         })
     else:
@@ -2077,7 +2102,36 @@ with tab_cashflow:
     with _dl_col2:
         _full_export_r = matrix_results.get(_cf_sel, {})
         if _full_export_r:
-            _full_csv = generate_csv(_full_export_r, project_name)
+            _csv_cost = st.session_state.cost_data[_cf_sel]
+            _csv_safety = _calc_safety_vkt or {}
+            _csv_base_safety = _csv_safety.get("base_case")
+            _csv_proj_safety = _csv_safety.get(_cf_sel)
+            _csv_key = _stable_hash(_matrix_inputs, _cf_sel,
+                                    st.session_state.traffic_data["base_case"],
+                                    st.session_state.traffic_data[_cf_sel],
+                                    _csv_cost,
+                                    st.session_state.base_case_costs,
+                                    st.session_state.annualisation,
+                                    _csv_base_safety, _csv_proj_safety, _eff_params)
+            try:
+                # Same cache key as the Sensitivity tab, so no extra runs if it was viewed
+                _csv_rows = _cached_required_sensitivities(
+                    _csv_key, _matrix_inputs,
+                    base_traffic=st.session_state.traffic_data["base_case"],
+                    proj_traffic=st.session_state.traffic_data[_cf_sel],
+                    cost=_csv_cost,
+                    base_costs=st.session_state.base_case_costs,
+                    annualisation=st.session_state.annualisation,
+                    safety_vkt_base=_csv_base_safety,
+                    safety_vkt_proj=_csv_proj_safety,
+                    params=_eff_params,
+                )
+            except Exception as _csv_err:
+                _csv_rows = []
+                st.error(f"Sensitivity calculation error: {_csv_err}")
+            _full_csv = generate_csv(
+                _full_export_r, project_name,
+                appraisal_summary(_full_export_r, _csv_cost), _csv_rows)
             _case_label = f"project-{_cf_sel.split('_')[1]}" if "_" in _cf_sel else _cf_sel
             st.download_button(
                 "Download Full Results CSV",
@@ -2824,8 +2878,10 @@ with tab_about:
     # ── Benefit categories ───────────────────────────────────────────────────
     st.markdown("### Benefit Categories")
     st.markdown(
-        "The model quantifies five categories of economic benefit, all derived from changes in traffic "
-        "volumes, travel times, and speeds between the base case and each project case:"
+        "The model quantifies five categories of transport benefit, all derived from changes in traffic "
+        "volumes, travel times, and speeds between the base case and each project case. "
+        "Four further lines follow the TfNSW Guide: avoided base case costs, upfront carbon "
+        "and construction disruption (a disbenefit), and residual value:"
     )
 
     benefit_rows = [
@@ -2860,6 +2916,24 @@ with tab_about:
          "valued using health monetisation rates (Walking: $3.17/person-km; Cycling: $1.60/person-km). "
          "This component is zero unless demand data includes active mode trips. "
          "Source: TfNSW EPV Table 18."),
+        ("Avoided Base Case Costs", "avoided_costs", "teal",
+         "The base case recurrent cost (operations, maintenance and renewals) that the project "
+         "does not have to pay, counted as a Government benefit in every year of the timeline, "
+         "per TfNSW Guide Table 6. The project's own recurrent cost is a cost in every year, "
+         "so a project that keeps maintaining the existing road during construction gets no "
+         "credit for those years."),
+        ("Upfront Carbon Emissions", "upfront_carbon", "grey",
+         "Embodied carbon from construction (tonnes CO\u2082e) is spread across the construction "
+         "years in proportion to the P50 capital cashflow and valued at the carbon price "
+         "($123/tonne). Reported as a disbenefit (negative benefit)."),
+        ("Construction Disruption", "construction_disruption", "grey",
+         "The annual cost of traffic disruption during construction, reported as a disbenefit "
+         "in each construction year."),
+        ("Residual Value", "residual", "brown",
+         "Remaining value of the assets at the end of the appraisal period, credited in the "
+         "final year. Land keeps its full value; construction (including its share of "
+         "contingency) depreciates straight-line over the asset life; planning and design "
+         "have none. A manual residual value overrides the calculation."),
     ]
 
     for name, key, colour, explanation in benefit_rows:
@@ -2871,24 +2945,31 @@ with tab_about:
     # ── How costs are treated ────────────────────────────────────────────────
     st.markdown("### How Costs Are Treated")
     st.markdown(
-        "Project costs are entered in the **sidebar** and cover four categories:"
+        "Costs are entered as **yearly cashflows** in real June 2024 dollars, so the model "
+        "never spreads a total over the years for you. Paste a row from Excel into each table."
     )
     cost_data = {
-        "Cost Category": [
-            "Planning & design",
-            "Land acquisition",
-            "Construction",
-            "Contingency",
-            "Operating & maintenance (annual)",
-            "Residual value",
+        "Cost": [
+            "Capital (P50)",
+            "Capital (P90)",
+            "Project recurrent costs",
+            "Base case recurrent costs",
+            "Upfront carbon",
+            "Outturn capital (nominal)",
         ],
         "How it is used": [
-            "Treated as a lump-sum expenditure in the first year of the appraisal period.",
-            "Treated as a lump-sum expenditure in the first year of the appraisal period.",
-            "Spread evenly across the construction period and discounted.",
-            "Applied as a percentage uplift on the sum of planning, land, and construction costs.",
-            "Repeated each year over the appraisal period and discounted.",
-            "A negative cost (credit) applied in the final year, representing the remaining useful life of assets.",
+            "Planning and design, land and construction base estimates plus the yearly contingency "
+            "that takes the base to P50, entered over the construction years. This is the capital "
+            "cost in the core result.",
+            "The same base estimates plus the contingency that takes them to P90. Used only in the "
+            "'P90 capital cost' sensitivity test.",
+            "Operations, maintenance and periodic renewals by year for each option, over the whole "
+            "timeline including construction. Counted as a cost and discounted.",
+            "The same, for the do-minimum base case, shared by all options. Counted as the "
+            "'Avoided base case costs' benefit.",
+            "Tonnes CO\u2082e for each option, valued at the carbon price and reported as a disbenefit.",
+            "P50 and P90 outturn capital in nominal dollars, copied from the cost estimate. Shown in "
+            "the appraisal summary and CSV only; never used in a calculation.",
         ],
     }
     st.dataframe(pd.DataFrame(cost_data), hide_index=True, use_container_width=True)
@@ -2901,10 +2982,8 @@ with tab_about:
         "All future cash flows are converted to present-value terms using a **start-of-year** "
         "discount convention: a dollar in year *n* is worth `1 / (1 + r)^n` today, "
         "where *r* is the discount rate. "
-        "The default rate is **7%** per annum, consistent with NSW Treasury guidance for transport "
-        "infrastructure. Sensitivity analysis automatically re-runs the model at 4% and 10% "
-        "so you can report the standard three-rate range required by Infrastructure Australia "
-        "and NSW Treasury."
+        "The default rate is **5%** per annum. The required sensitivity table always re-runs "
+        "the model at 3%, 4% and 7% (4% for federal submissions), whatever the central rate is."
     )
 
     st.divider()
@@ -2929,12 +3008,16 @@ with tab_about:
     # ── Sensitivity analysis ─────────────────────────────────────────────────
     st.markdown("### Sensitivity Analysis")
     st.markdown(
-        "The **Sensitivity** tab reports three types of analysis automatically:"
+        "The **Sensitivity** tab opens with the **TfNSW required sensitivity tests** table, "
+        "with the central row highlighted, so a reviewer can see every required test was run:"
     )
     sens_rows = [
-        ("Discount rate sensitivity", "Re-runs NPV and BCR at 4%, 7%, and 10% to show how sensitive the result is to the choice of discount rate."),
-        ("Switching values", "Calculates how far key inputs (benefits, costs, demand) would have to move before the BCR falls below 1.0. This tells decision-makers the margin of safety in the result."),
-        ("Scenario analysis", "Applies demand scenarios that scale benefits by –20% (low) and +20% (high), holding costs and residual value fixed, to bound the likely range of outcomes."),
+        ("Discount rate", "3%, 4% and 7%, whatever the central rate is."),
+        ("Costs and benefits", "Project costs and transport benefits at +20%, \u221220%, +40% and \u221240%. Residual value follows capital; avoided base case costs, upfront carbon and construction disruption are not scaled."),
+        ("P90 capital cost", "Capital at base plus the P90 contingency in every year."),
+        ("Opening delayed", "Opening delayed by 1 year and by 3 years, with benefits recalculated for the delayed calendar years."),
+        ("Traffic growth", "No traffic growth, and half the forecast traffic growth, from the opening year."),
+        ("Other analyses", "Switching values, the discount rate chart, carbon price, VSL and WEBs sensitivity, and Monte Carlo risk analysis (advanced mode)."),
     ]
     sens_df = pd.DataFrame(sens_rows, columns=["Analysis", "What it shows"])
     st.dataframe(sens_df, hide_index=True, use_container_width=True)

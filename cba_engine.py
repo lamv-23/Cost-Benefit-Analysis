@@ -1107,7 +1107,45 @@ def run_monte_carlo(
 # CSV EXPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_csv(results: dict, project_name: str) -> str:
+NOT_ENTERED = "not entered"
+
+
+def appraisal_summary(result: dict, cost: dict) -> dict:
+    """Return the TfNSW-style appraisal summary for one option.
+
+    The two outturn figures are nominal $M copied from ``cost`` exactly as
+    entered (reporting only, never used in a calculation); a blank one shows
+    ``"not entered"``. Every other figure is real June 2024 dollars.
+    """
+    def _outturn(key: str):
+        v = cost.get(key)
+        return NOT_ENTERED if v is None else v
+
+    return {
+        "P50 outturn capital (nominal $M)": _outturn("outturn_p50_nominal"),
+        "P90 outturn capital (nominal $M)": _outturn("outturn_p90_nominal"),
+        "PV capital ($M)": result["pv_capital"],
+        "PV recurrent costs ($M)": result["pv_recurrent"],
+        "PV costs ($M)": result["pv_costs"],
+        "PV benefits ($M)": result["pv_benefits"],
+        "NPV ($M)": result["npv"],
+        "BCR": result["bcr"],
+    }
+
+
+def format_summary_value(key: str, value) -> str:
+    if isinstance(value, str):
+        return value
+    if key == "BCR":
+        return f"{value:.3f}"
+    if key.startswith(("P50 outturn", "P90 outturn")):
+        return str(value)
+    return f"{value:.2f}"
+
+
+def generate_csv(results: dict, project_name: str, summary: dict,
+                 sensitivity_rows: list) -> str:
+    """Build the results CSV: summary, itemised PV, required sensitivity tests, cashflow."""
     buf = io.StringIO()
     w = csv.writer(buf)
     r = results
@@ -1117,23 +1155,31 @@ def generate_csv(results: dict, project_name: str) -> str:
     w.writerow(["Transport CBA Dashboard Export"])
     w.writerow(["Project", safe_name])
     w.writerow(["Discount Rate", f"{r['dr']}%"])
-    w.writerow(["NPV ($M)", f"{r['npv']:.2f}"])
-    w.writerow(["BCR", f"{r['bcr']:.3f}"])
-    w.writerow(["PV Benefits ($M)", f"{r['pv_benefits']:.2f}"])
-    w.writerow(["PV Costs ($M)", f"{r['pv_costs']:.2f}"])
+    w.writerow(["All values are real June 2024 dollars, except the nominal outturn capital rows."])
     w.writerow([])
-    w.writerow(["PV Benefits by Category"])
+    w.writerow(["Appraisal summary"])
+    for k, v in summary.items():
+        w.writerow([k, format_summary_value(k, v)])
+    w.writerow([])
+    w.writerow(["Itemised PV ($M)"])
     for k, lbl in TYPE_LABELS.items():
         w.writerow([lbl, f"{r['pv_by_type'][k]:.2f}"])
+    w.writerow(["PV capital", f"{r['pv_capital']:.2f}"])
+    w.writerow(["PV recurrent costs", f"{r['pv_recurrent']:.2f}"])
     w.writerow([])
-    w.writerow(["Year", "Undiscounted Cost ($M)", "Undiscounted Benefit ($M)",
-                "Undiscounted Net ($M)", "Discounted Cost ($M)", "Discounted Benefit ($M)",
-                "Discounted Net ($M)", "Cumulative Disc Net ($M)"])
+    w.writerow(["TfNSW required sensitivity tests"])
+    w.writerow(["Test", "PV benefits ($M)", "PV costs ($M)", "NPV ($M)", "BCR"])
+    for row in sensitivity_rows:
+        w.writerow([row["test"], f"{row['pvb']:.2f}", f"{row['pvc']:.2f}",
+                    f"{row['npv']:.2f}", f"{row['bcr']:.3f}"])
+    w.writerow([])
+    w.writerow(["Cashflow by year ($M)"])
+    w.writerow(["Year", "Capital", "Recurrent", "Benefits", "Net",
+                "Discounted net", "Cumulative"])
     for y in range(r["total_years"]):
         w.writerow([
-            y + 1, f"{r['annual_costs'][y]:.3f}", f"{r['annual_benefits'][y]:.3f}",
-            f"{r['annual_net'][y]:.3f}", f"{r['disc_costs'][y]:.3f}",
-            f"{r['disc_benefits'][y]:.3f}", f"{r['disc_net'][y]:.3f}",
-            f"{r['cum_disc_net'][y]:.3f}",
+            y + 1, f"{r['annual_capital'][y]:.3f}", f"{r['annual_recurrent'][y]:.3f}",
+            f"{r['annual_benefits'][y]:.3f}", f"{r['annual_net'][y]:.3f}",
+            f"{r['disc_net'][y]:.3f}", f"{r['cum_disc_net'][y]:.3f}",
         ])
     return buf.getvalue()

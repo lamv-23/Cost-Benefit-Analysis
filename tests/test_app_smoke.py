@@ -155,3 +155,15 @@ def test_discount_rate_chart_has_no_duplicate_points():
     assert _dr_chart_labels(at) == ["3%", "4%", "7%"]
     frames = [d.value for d in at.dataframe if "Test" in d.value.columns]
     assert len(frames[0]) == 17
+
+
+def test_dashboard_summary():
+    at = _app_with_sample()
+    assert not at.exception
+    key = "P50 outturn capital (nominal $M)"
+    frames = [d.value for d in at.dataframe if key in list(d.value.index)]
+    assert frames, "appraisal summary table not found"
+    assert list(frames[0].columns) == ["Project 1"]
+    assert frames[0].loc[key, "Project 1"] == "395.0"
+    assert frames[0].loc["P90 outturn capital (nominal $M)", "Project 1"] == "432.0"
+
