@@ -6,7 +6,7 @@ import pytest
 from cba_engine import (
     PARAMS, VTYPES, build_cost_schedule, calculate_matrix, clean_row, fit_cost_rows,
     interpolate_modelling_years, make_base_case_costs, make_cost_data,
-    validate_project_file,
+    run_required_sensitivities, validate_project_file,
 )
 from conftest import fixture_costs, make_case_traffic
 
@@ -362,3 +362,79 @@ def test_scenario_discount_rate():
     assert scenario["bcr"] == pytest.approx(central["bcr"], rel=1e-9)
     assert scenario["dr"] == 7
     assert _run_scenario(traffic=traffic)["dr"] == 0
+
+
+# ── Required sensitivity table ───────────────────────────────────────────────
+
+REQUIRED_LABELS = [
+    "Central", "Discount rate 3%", "Discount rate 4%", "Discount rate 7%",
+    "Costs +20%", "Costs \u221220%", "Costs +40%", "Costs \u221240%",
+    "Benefits +20%", "Benefits \u221220%", "Benefits +40%", "Benefits \u221240%",
+    "P90 capital cost", "Opening delayed 1 year", "Opening delayed 3 years",
+    "No traffic growth", "Half traffic growth",
+]
+
+
+def _required_rows(discount_rate=0):
+    cost, base = fixture_costs()
+    cost["construction_asset_life"] = 40
+    base_traffic, proj_traffic = _saving_traffic()
+    inputs = dict(COST_INPUTS, discount_rate=discount_rate)
+    rows = run_required_sensitivities(
+        inputs, base_traffic, proj_traffic, cost, base, ANNUALISATION, params=PARAMS)
+    central = calculate_matrix(
+        inputs, base_traffic, proj_traffic, cost, base, ANNUALISATION, params=PARAMS)
+    return rows, central, (inputs, base_traffic, proj_traffic, cost, base)
+
+
+def test_required_rows_order_and_central():
+    rows, central, _ = _required_rows()
+    assert [r["test"] for r in rows] == REQUIRED_LABELS
+    assert [r["central"] for r in rows] == [True] + [False] * 16
+    assert rows[0]["npv"] == pytest.approx(central["npv"], rel=1e-9)
+    assert rows[0]["bcr"] == pytest.approx(central["bcr"], rel=1e-9)
+    for r in rows:
+        assert set(r) == {"test", "pvb", "pvc", "npv", "bcr", "central"}
+        assert r["npv"] == pytest.approx(r["pvb"] - r["pvc"])
+
+
+def test_required_rows_match_scenarios():
+    rows, _, (inputs, bt, pt, cost, base) = _required_rows()
+    by = {r["test"]: r for r in rows}
+
+    def run(scn):
+        return calculate_matrix(inputs, bt, pt, cost, base, ANNUALISATION,
+                                params=PARAMS, scenario=scn)
+
+    for label, scn in [
+        ("Costs +20%", {"cost_factor": 1.2}),
+        ("Costs \u221240%", {"cost_factor": 0.6}),
+        ("Benefits +40%", {"benefit_factor": 1.4}),
+        ("Benefits \u221220%", {"benefit_factor": 0.8}),
+        ("P90 capital cost", {"capital": "p90"}),
+        ("Opening delayed 3 years", {"delay_years": 3}),
+        ("No traffic growth", {"growth": "none"}),
+        ("Half traffic growth", {"growth": "half"}),
+        ("Discount rate 4%", {"discount_rate": 4}),
+    ]:
+        expected = run(scn)
+        assert by[label]["pvc"] == pytest.approx(expected["pv_costs"]), label
+        assert by[label]["pvb"] == pytest.approx(expected["pv_benefits"]), label
+        assert by[label]["bcr"] == pytest.approx(expected["bcr"]), label
+    assert by["Costs +20%"]["pvc"] != pytest.approx(by["Central"]["pvc"])
+    assert by["P90 capital cost"]["pvc"] > by["Central"]["pvc"]
+
+
+def test_required_rows_when_central_is_7():
+    rows, central, _ = _required_rows(discount_rate=7)
+    assert [r["test"] for r in rows] == REQUIRED_LABELS
+    by = {r["test"]: r for r in rows}
+    assert by["Discount rate 7%"]["npv"] == pytest.approx(by["Central"]["npv"], rel=1e-9)
+    assert by["Central"]["npv"] == pytest.approx(central["npv"], rel=1e-9)
+    assert sum(r["central"] for r in rows) == 1
+
+
+def test_calculate_matrix_drops_old_scenario_tables():
+    _, central, _ = _required_rows()
+    assert "sensitivity_dr" not in central
+    assert "scenarios" not in central

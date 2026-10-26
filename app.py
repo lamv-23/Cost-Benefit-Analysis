@@ -27,7 +27,8 @@ from cba_engine import (  # noqa: E402,F401
     COST_FORMAT_VERSION, CAPEX_CATEGORIES, clean_row, make_base_case_costs,
     fit_cost_rows, build_cost_schedule, validate_project_file,
     discount_factor, interpolate_voc, _cagr_interpolate, interpolate_modelling_years,
-    calculate_matrix, calculate_all_cases, run_monte_carlo, generate_csv,
+    calculate_matrix, calculate_all_cases, run_required_sensitivities,
+    run_monte_carlo, generate_csv,
 )
 
 # Optional: Excel template generation (Step 6) — requires openpyxl
@@ -925,6 +926,20 @@ def _cached_calculate_all_cases(_cache_key: str, inputs: dict,
         base_case_costs=base_case_costs,
         annualisation=annualisation,
         safety_vkt_data=safety_vkt_data,
+        params=params,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _cached_required_sensitivities(_cache_key: str, inputs: dict,
+                                   base_traffic: dict, proj_traffic: dict,
+                                   cost: dict, base_costs: dict,
+                                   annualisation: dict,
+                                   safety_vkt_base: dict, safety_vkt_proj: dict,
+                                   params: dict) -> list:
+    return run_required_sensitivities(
+        inputs, base_traffic, proj_traffic, cost, base_costs, annualisation,
+        safety_vkt_base=safety_vkt_base, safety_vkt_proj=safety_vkt_proj,
         params=params,
     )
 
@@ -2096,15 +2111,82 @@ with tab_sensitivity:
         _sens_sel = _sens_case_keys[0]
     _r_sens = matrix_results[_sens_sel]
 
+    # --- TfNSW required sensitivity tests (one row per test) ---
+    st.subheader("TfNSW required sensitivity tests")
+    _sens_safety = _calc_safety_vkt or {}
+    _sens_base_safety = _sens_safety.get("base_case")
+    _sens_proj_safety = _sens_safety.get(_sens_sel)
+    _req_key = _stable_hash(_matrix_inputs, _sens_sel,
+                            st.session_state.traffic_data["base_case"],
+                            st.session_state.traffic_data[_sens_sel],
+                            st.session_state.cost_data[_sens_sel],
+                            st.session_state.base_case_costs,
+                            st.session_state.annualisation,
+                            _sens_base_safety, _sens_proj_safety, _eff_params)
+    try:
+        _req_rows = _cached_required_sensitivities(
+            _req_key, _matrix_inputs,
+            base_traffic=st.session_state.traffic_data["base_case"],
+            proj_traffic=st.session_state.traffic_data[_sens_sel],
+            cost=st.session_state.cost_data[_sens_sel],
+            base_costs=st.session_state.base_case_costs,
+            annualisation=st.session_state.annualisation,
+            safety_vkt_base=_sens_base_safety,
+            safety_vkt_proj=_sens_proj_safety,
+            params=_eff_params,
+        )
+    except Exception as _req_err:
+        _req_rows = []
+        st.error(f"Sensitivity calculation error: {_req_err}")
+
+    if _req_rows:
+        df_req = pd.DataFrame([{
+            "Test": r["test"],
+            "PV Benefits ($M)": r["pvb"],
+            "PV Costs ($M)": r["pvc"],
+            "NPV ($M)": r["npv"],
+            "BCR": r["bcr"],
+        } for r in _req_rows])
+        _central_tests = {r["test"] for r in _req_rows if r["central"]}
+
+        def _highlight_required(row):
+            styles = [""] * len(row)
+            if row["Test"] in _central_tests:
+                styles = ["background-color: rgba(13, 110, 253, 0.1); font-weight: 700"] * len(row)
+            bcr_idx = df_req.columns.get_loc("BCR")
+            styles[bcr_idx] += ("; color: #198754; font-weight: 700" if row["BCR"] >= 1
+                                else "; color: #dc3545; font-weight: 700")
+            return styles
+
+        st.dataframe(
+            df_req.style.apply(_highlight_required, axis=1).format({
+                "PV Benefits ($M)": "{:.1f}", "PV Costs ($M)": "{:.1f}",
+                "NPV ($M)": "{:.1f}", "BCR": "{:.2f}",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+        st.caption("Highlighted row = central case (P50 capital, central discount rate). "
+                   "Discount rates 3%, 4% and 7% are always shown; 4% is for federal (PPR) "
+                   "submissions. Cost tests scale capital and recurrent costs; benefit tests "
+                   "scale transport benefits only. A manual residual value is kept in every test.")
+
     sen1, sen2 = st.columns(2)
 
     with sen1:
         st.subheader("Discount Rate Sensitivity (BCR)")
-        dr_rates = sorted(_r_sens["sensitivity_dr"].keys())
-        dr_bcrs = [_r_sens["sensitivity_dr"][r]["bcr"] for r in dr_rates]
+        # Central rate once, plus the required 3%, 4% and 7% rows
+        _dr_points = {}
+        for _row in _req_rows:
+            if _row["central"]:
+                _dr_points[_r_sens["dr"]] = _row["bcr"]
+        for _row in _req_rows:
+            if _row["test"].startswith("Discount rate "):
+                _dr_points.setdefault(float(_row["test"].split()[-1].rstrip("%")), _row["bcr"])
+        dr_rates = sorted(_dr_points)
+        dr_bcrs = [_dr_points[r] for r in dr_rates]
         bar_colors = [COLORS["positive"] if b >= 1 else COLORS["negative"] for b in dr_bcrs]
         fig_dr = go.Figure(go.Bar(
-            x=[f"{r}%" for r in dr_rates], y=dr_bcrs,
+            x=[f"{r:g}%" for r in dr_rates], y=dr_bcrs,
             marker_color=bar_colors,
             text=[f"{b:.2f}" for b in dr_bcrs], textposition="outside",
         ))
@@ -2138,57 +2220,6 @@ with tab_sensitivity:
             st.plotly_chart(fig_sw, use_container_width=True)
         else:
             st.info("Insufficient data for switching values.")
-
-    # --- Scenario Analysis Table ---
-    st.subheader("Scenario Analysis")
-    # TfNSW CBA / NSW Treasury TPG23-08 required sensitivity rates
-    _tfnsw_required_rates = {5, 7, 10}
-    rows = []
-    for r_val in sorted(_r_sens["sensitivity_dr"].keys()):
-        v = _r_sens["sensitivity_dr"][r_val]
-        _req_tag = " ✦" if r_val in _tfnsw_required_rates else ""
-        rows.append({
-            "Scenario": f"Discount Rate {r_val}%{_req_tag}",
-            "PV Benefits ($M)": round(v["pvb"], 1),
-            "PV Costs ($M)": round(v["pvc"], 1),
-            "NPV ($M)": round(v["npv"], 1),
-            "BCR": round(v["bcr"], 2),
-        })
-    for label, v in _r_sens["scenarios"].items():
-        rows.append({
-            "Scenario": f"Demand {label}",
-            "PV Benefits ($M)": round(v["pvb"], 1),
-            "PV Costs ($M)": round(v["pvc"], 1),
-            "NPV ($M)": round(v["npv"], 1),
-            "BCR": round(v["bcr"], 2),
-        })
-    df_sens = pd.DataFrame(rows)
-
-    def highlight_rows(row):
-        styles = [""] * len(row)
-        _is_base = (f"Discount Rate {discount_rate}%" in row["Scenario"]
-                    or f"Discount Rate {int(discount_rate)}%" in row["Scenario"]
-                    or row["Scenario"] == "Demand Central")
-        if _is_base:
-            styles = ["background-color: rgba(13, 110, 253, 0.1); font-weight: 700"] * len(row)
-        bcr_idx = df_sens.columns.get_loc("BCR")
-        if row["BCR"] >= 1:
-            styles[bcr_idx] += "; color: #198754; font-weight: 700"
-        else:
-            styles[bcr_idx] += "; color: #dc3545; font-weight: 700"
-        return styles
-
-    styled = df_sens.style.apply(highlight_rows, axis=1).format({
-        "PV Benefits ($M)": "{:.1f}",
-        "PV Costs ($M)": "{:.1f}",
-        "NPV ($M)": "{:.1f}",
-        "BCR": "{:.2f}",
-    })
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-    st.caption("✦ TfNSW CBA / NSW Treasury TPG23-08 required sensitivity rates: "
-               "4% (low), 7% (base), 10% (high). ATAP T2 (2022) specifies the same core rates. "
-               "3.5% = NSW Treasury long-run real risk-free rate (TPP20-07). "
-               "Highlighted row = project base case discount rate.")
 
     # --- Carbon Price Sensitivity ---
     st.subheader("Carbon Price Sensitivity")

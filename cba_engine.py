@@ -721,19 +721,6 @@ def calculate_matrix(
     pv_capital = _pv(annual_capital)
     pv_recurrent = _pv(annual_recurrent)
 
-    sensitivity_dr = {}
-    # TfNSW CBA Guidelines / NSW Treasury TPG23-08 sensitivity rates:
-    # 4% (low), 7% (base), 10% (high). ATAP T2 (2022) specifies the same core rates.
-    # 3.5% = NSW Treasury long-run real risk-free reference rate (TPP20-07).
-    for r in [3.5, 5, 7, 10]:
-        s_pvb = sum(annual_benefits[y] * discount_factor(r, base_offset + y) for y in range(total_years))
-        s_pvc = sum(annual_costs[y] * discount_factor(r, base_offset + y) for y in range(total_years))
-        sensitivity_dr[r] = {
-            "pvb": s_pvb, "pvc": s_pvc,
-            "npv": s_pvb - s_pvc,
-            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0.0,
-        }
-
     # Carbon price sensitivity: scale the emission_cost component of env benefits
     # and the upfront (construction) carbon line.
     # Base carbon price: $123/tCO₂e (TfNSW EPV Jan 2025, June 2024 prices).
@@ -819,20 +806,6 @@ def calculate_matrix(
     # proceed if FYRR >= discount rate; otherwise consider deferral.
     fyrr_deferral_pass = (fyrr >= dr) if capital_p50_total > 0 else None
 
-    # Benefit scenarios scale transport benefits only; residual value, avoided
-    # costs, upfront carbon and construction disruption are held fixed
-    _pv_fixed = sum(pv_by_type[k] for k in
-                    ("avoided_costs", "upfront_carbon", "construction_disruption", "residual"))
-    scenarios = {}
-    for label, factor in [("Low (-20%)", 0.8), ("Central", 1.0), ("High (+20%)", 1.2)]:
-        s_pvb = (pv_benefits - _pv_fixed) * factor + _pv_fixed
-        s_pvc = sum(annual_costs[y] * discount_factor(dr, base_offset + y) for y in range(total_years))
-        scenarios[label] = {
-            "pvb": s_pvb, "pvc": s_pvc,
-            "npv": s_pvb - s_pvc,
-            "bcr": s_pvb / s_pvc if s_pvc > 0 else 0.0,
-        }
-
     return {
         "npv": npv, "bcr": bcr, "pv_benefits": pv_benefits, "pv_costs": pv_costs,
         "fyrr": fyrr, "fyrr_deferral_pass": fyrr_deferral_pass,
@@ -846,10 +819,10 @@ def calculate_matrix(
         "annual_net": annual_net,
         "disc_costs": disc_costs, "disc_benefits": disc_benefits, "disc_net": disc_net,
         "cum_disc_net": cum_disc_net,
-        "pv_by_type": pv_by_type, "sensitivity_dr": sensitivity_dr,
+        "pv_by_type": pv_by_type,
         "sensitivity_carbon": sensitivity_carbon,
         "sensitivity_vsl": sensitivity_vsl,
-        "switching": switching, "scenarios": scenarios,
+        "switching": switching,
         "const_years": const_years, "eval_period": eval_period,
         "total_years": total_years, "dr": dr,
         "benefits_by_type": benefits_by_type,
@@ -858,6 +831,62 @@ def calculate_matrix(
             t: benefits_by_type[t][first_op] for t in benefits_by_type
         } | {"total": annual_benefits[first_op]},
     }
+
+
+# Required TfNSW sensitivity tests: (label, scenario options passed to calculate_matrix).
+# ``None`` is the central case; the cost/benefit factors use the true minus sign (U+2212).
+REQUIRED_SENSITIVITY_TESTS = [
+    ("Central", None),
+    ("Discount rate 3%", {"discount_rate": 3}),
+    ("Discount rate 4%", {"discount_rate": 4}),
+    ("Discount rate 7%", {"discount_rate": 7}),
+    ("Costs +20%", {"cost_factor": 1.2}),
+    ("Costs \u221220%", {"cost_factor": 0.8}),
+    ("Costs +40%", {"cost_factor": 1.4}),
+    ("Costs \u221240%", {"cost_factor": 0.6}),
+    ("Benefits +20%", {"benefit_factor": 1.2}),
+    ("Benefits \u221220%", {"benefit_factor": 0.8}),
+    ("Benefits +40%", {"benefit_factor": 1.4}),
+    ("Benefits \u221240%", {"benefit_factor": 0.6}),
+    ("P90 capital cost", {"capital": "p90"}),
+    ("Opening delayed 1 year", {"delay_years": 1}),
+    ("Opening delayed 3 years", {"delay_years": 3}),
+    ("No traffic growth", {"growth": "none"}),
+    ("Half traffic growth", {"growth": "half"}),
+]
+
+
+def run_required_sensitivities(
+    inputs: dict,
+    base_traffic: dict,
+    proj_traffic: dict,
+    cost: dict,
+    base_costs: dict,
+    annualisation: dict,
+    safety_vkt_base: dict = None,
+    safety_vkt_proj: dict = None,
+    params: dict = None,
+) -> list[dict]:
+    """Run the TfNSW required sensitivity tests for one project case.
+
+    Returns 17 rows, always in the same order, each
+    ``{"test", "pvb", "pvc", "npv", "bcr", "central"}``. The discount-rate rows
+    are always 3%, 4% and 7% whatever the central rate is.
+    """
+    rows = []
+    for label, scenario in REQUIRED_SENSITIVITY_TESTS:
+        r = calculate_matrix(
+            inputs, base_traffic, proj_traffic, cost, base_costs, annualisation,
+            safety_vkt_base=safety_vkt_base, safety_vkt_proj=safety_vkt_proj,
+            params=params, scenario=scenario,
+        )
+        rows.append({
+            "test": label,
+            "pvb": r["pv_benefits"], "pvc": r["pv_costs"],
+            "npv": r["npv"], "bcr": r["bcr"],
+            "central": scenario is None,
+        })
+    return rows
 
 
 def calculate_all_cases(

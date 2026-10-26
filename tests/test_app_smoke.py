@@ -115,3 +115,43 @@ def test_save_load_round_trip_keeps_periods(monkeypatch):
     assert len(loaded["recurrent"]) == 34
     assert loaded["recurrent"][12] == 8.2 and loaded["recurrent"][33] == 0.0
     assert _metric(fresh, "P50 capital ($M, real)") == "$390.0M"
+
+
+def test_sensitivity_table_present():
+    at = _app_with_sample()
+    assert not at.exception
+    labels = [
+        "Central", "Discount rate 3%", "Discount rate 4%", "Discount rate 7%",
+        "Costs +20%", "Costs \u221220%", "Costs +40%", "Costs \u221240%",
+        "Benefits +20%", "Benefits \u221220%", "Benefits +40%", "Benefits \u221240%",
+        "P90 capital cost", "Opening delayed 1 year", "Opening delayed 3 years",
+        "No traffic growth", "Half traffic growth",
+    ]
+    found = []
+    for df in at.dataframe:
+        frame = df.value
+        if "Test" in frame.columns:
+            found.append(list(frame["Test"]))
+        else:
+            found.append(list(frame.index))
+    assert any(all(label in names for label in labels) for names in found), found
+
+
+def _dr_chart_labels(at):
+    import json
+    for el in at.get("plotly_chart"):
+        for trace in json.loads(el.proto.spec)["data"]:
+            x = trace.get("x")
+            if trace.get("type") == "bar" and x is not None and str(x[0]).endswith("%"):
+                return list(x)
+    raise AssertionError("discount-rate chart not found")
+
+
+def test_discount_rate_chart_has_no_duplicate_points():
+    at = _app_with_sample()
+    assert _dr_chart_labels(at) == ["3%", "4%", "5%", "7%"]
+    _number_input(at, "Discount Rate (%)").set_value(7.0).run()
+    assert not at.exception
+    assert _dr_chart_labels(at) == ["3%", "4%", "7%"]
+    frames = [d.value for d in at.dataframe if "Test" in d.value.columns]
+    assert len(frames[0]) == 17
