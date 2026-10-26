@@ -1,6 +1,9 @@
 """Headless smoke test of the Streamlit app."""
+import io
 import os
 
+import streamlit
+from streamlit.elements.lib import policies
 from streamlit.testing.v1 import AppTest
 
 APP_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")
@@ -63,3 +66,52 @@ def test_empty_project_no_errors():
     assert not at.exception
     assert not at.error
     assert _metric(at, "P50 capital ($M, real)") == "$0.0M"
+
+
+def test_save_load_round_trip_keeps_periods(monkeypatch):
+    """Save at a 4-year construction period, open in a fresh session (default 3).
+
+    AppTest cannot drive file uploads, so the save button's data is captured
+    and handed back once through the project uploader.
+    """
+    saved = {}
+    real_download, real_uploader = streamlit.download_button, streamlit.file_uploader
+
+    def capture_download(label, data, *args, **kwargs):
+        if label == "Save Project (.json)":
+            saved["json"] = data
+        return real_download(label, data, *args, **kwargs)
+
+    monkeypatch.setattr(streamlit, "download_button", capture_download)
+    at = _app_with_sample()
+    _number_input(at, "Construction Period (years)").set_value(4).run()
+    _number_input(at, "Construction Start Year").set_value(2027).run()
+    cost = at.session_state["cost_data"]["project_1"]
+    cost["capex_base"]["construction"] = [60.0, 120.0, 80.0, 40.0]
+    at.session_state["cost_data"] = at.session_state["cost_data"]
+    at.run()  # the save button now holds the 4-year rows
+    assert not at.exception
+    payload = saved["json"]
+
+    pending = [payload]
+
+    def upload_once(label, *args, **kwargs):
+        if kwargs.get("key") == "load_project_uploader" and pending:
+            real_uploader(label, *args, **kwargs)
+            return io.BytesIO(pending.pop().encode("utf-8"))
+        return real_uploader(label, *args, **kwargs)
+
+    monkeypatch.setattr(streamlit, "file_uploader", upload_once)
+    monkeypatch.setattr(policies, "_shown_default_value_warning", False)
+    fresh = AppTest.from_file(APP_PATH, default_timeout=300).run()
+    assert not fresh.exception
+    assert not fresh.error
+    assert not [w for w in fresh.warning if "default value" in w.value]
+    assert fresh.session_state["const_years"] == 4
+    assert fresh.session_state["eval_period"] == 30
+    assert fresh.session_state["construction_start_year"] == 2027
+    loaded = fresh.session_state["cost_data"]["project_1"]
+    assert loaded["capex_base"]["construction"] == [60.0, 120.0, 80.0, 40.0]
+    assert len(loaded["recurrent"]) == 34
+    assert loaded["recurrent"][12] == 8.2 and loaded["recurrent"][33] == 0.0
+    assert _metric(fresh, "P50 capital ($M, real)") == "$390.0M"

@@ -210,7 +210,7 @@ def _serialise_project() -> dict:
         "traffic_data", "cost_data", "base_case_costs", "safety_vkt_data", "crash_data",
         "annualisation", "modelling_years", "n_project_cases",
         "safety_mode", "env_mode", "reliability_mode", "show_advanced",
-        "project_name",
+        "project_name", "const_years", "eval_period", "construction_start_year",
     ]
     data = {"version": __version__, "type": "cba_project",
             "cost_format": COST_FORMAT_VERSION}
@@ -233,7 +233,11 @@ def _deserialise_project(data: dict) -> None:
         st.warning(f"File version {data.get('version')} differs from app version {__version__}. Some data may not load correctly.")
     for k in ("traffic_data", "cost_data", "base_case_costs", "safety_vkt_data", "crash_data",
               "annualisation", "modelling_years", "n_project_cases",
-              "safety_mode", "env_mode", "reliability_mode", "show_advanced"):
+              "safety_mode", "env_mode", "reliability_mode", "show_advanced",
+              # Period settings fix the meaning of the yearly cost rows. These are
+              # sidebar widget keys; setting them is legal because the uploader
+              # renders before those widgets.
+              "const_years", "eval_period", "construction_start_year"):
         if k in data:
             st.session_state[k] = data[k]
     for k in list(data.keys()):
@@ -1397,16 +1401,21 @@ with st.sidebar:
     project_name = st.text_input("Project Name", value="Sample Road Upgrade",
         help="A descriptive name for this cost-benefit analysis. Shown in the header and exported CSV.")
     st.session_state["project_name"] = project_name
+    # Period widgets take their defaults from session state (no value=) so a
+    # loaded project can set them without a duplicate-default warning.
+    for _k, _default in (("eval_period", 30), ("const_years", 3),
+                         ("construction_start_year", 2026)):
+        st.session_state.setdefault(_k, _default)
     col1, col2 = st.columns(2)
     with col1:
-        eval_period = st.number_input("Evaluation Period (years)", 1, 50, 30, key="eval_period",
+        eval_period = st.number_input("Evaluation Period (years)", 1, 50, key="eval_period",
             help="Appraisal period in years, counted from opening (TfNSW default: 30 years; maximum 50). Construction years are added before it.")
         discount_base_year = st.number_input("Discount Base Year", 2020, 2060, 2026,
             help="Calendar year used as Year 0 for discounting (PV anchor).")
-        construction_start_year = st.number_input("Construction Start Year", 2020, 2060, 2026,
-            help="Calendar year construction begins. Benefits start after the construction period.")
+        construction_start_year = st.number_input("Construction Start Year", 2020, 2060,
+            key="construction_start_year", help="Calendar year construction begins. Benefits start after the construction period.")
     with col2:
-        const_years = st.number_input("Construction Period (years)", 1, 10, 3, key="const_years",
+        const_years = st.number_input("Construction Period (years)", 1, 10, key="const_years",
             help="Number of years over which capital costs are spread. Construction disbenefits apply during this period.")
         discount_rate = st.number_input("Discount Rate (%)", 0.0, 20.0, 5.0, step=0.5,
             help="TfNSW default: 5%. Used to discount future costs and benefits to present values. Higher rates reduce NPV.")
