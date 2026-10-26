@@ -143,12 +143,14 @@ user's explicit value. **(builder call)**
 | No traffic growth | Base and project traffic held at opening-year values for every year. |
 | Half traffic growth | Base and project traffic grow from opening at half the forecast annual growth rate, per vehicle type, for VHT and VKT. |
 
-**Opening delay (builder call):** the construction period is N years longer. The capital
-cashflow keeps its total but is stretched over the longer period, following the shape
-of the cumulative spend curve. Benefits and project recurrent costs start N years later.
-During the extra N years the existing road is still maintained, so the project option
-carries the base case recurrent cost for those years. The appraisal period stays 30
-years from the new opening date. Where a cost row needs values beyond the entered
+**Opening delay (user):** the construction period stays the same length; the project is
+delayed by N years before construction (development delay). The whole capital cashflow
+(base and contingency rows) and the upfront carbon move N years later, with the same
+shape and total. Opening, benefits and the project recurrent row (including its
+construction-year values) also move N years later. During the N delay years the existing
+road is still maintained, so the project option carries the base case recurrent cost
+for those years (no avoided-cost credit). The appraisal period stays 30 years from the
+new opening date. Where a cost row needs values beyond the entered
 years, the last entered year's value repeats. Benefits are **recalculated for the actual
 delayed calendar years** (traffic is entered by calendar year), not the central benefit
 profile shifted, because that is what re-running the appraisal with a later opening
@@ -194,8 +196,6 @@ would give. **(builder call)**
 ## Left to the builder
 
 - Table layout, labels and widget keys, following existing patterns.
-- How the cumulative spend curve is stretched for the delay test, provided the total is
-  unchanged and the shape is kept.
 - The exact half-growth formula, provided it halves the annual growth rate from the
   opening year.
 - Refactoring `calculate_matrix` so the sensitivity tests can re-run it with modified
