@@ -241,6 +241,13 @@ def make_cost_data(n_project_cases: int = 1) -> dict:
           "opex_maint": 0.0,     # $M/year
           "opex_op": 0.0,        # $M/year
           "residual": 0.0,       # $M
+          "construction_disbenefit_annual": 0.0,  # $M/year
+          "construction_asset_life": 40,  # years
+          "walk_pkm_day": 0.0,   # pkm/day
+          "cycle_pkm_day": 0.0,  # pkm/day
+          "pavement_saving_annual": 0.0,  # $M/year
+          "generated_demand_pct_global": 0.0,  # % (Rule-of-Half global default)
+          "generated_demand_pct_override": {"Car": None, "LCV": None, "HCV": None, "Bus": None},  # % (per-vtype overrides)
         }
     """
     template = {
@@ -250,8 +257,10 @@ def make_cost_data(n_project_cases: int = 1) -> dict:
         "construction_asset_life": 40,   # years; drives auto-calculated residual value
         "walk_pkm_day": 0.0, "cycle_pkm_day": 0.0,
         "pavement_saving_annual": 0.0,
+        "generated_demand_pct_global": 0.0,
+        "generated_demand_pct_override": {"Car": None, "LCV": None, "HCV": None, "Bus": None},
     }
-    return {f"project_{i}": dict(template) for i in range(1, n_project_cases + 1)}
+    return {f"project_{i}": copy.deepcopy(template) for i in range(1, n_project_cases + 1)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -326,6 +335,8 @@ def _load_sample_data() -> None:
             "construction_asset_life": 40,
             "walk_pkm_day": 800.0, "cycle_pkm_day": 400.0,
             "pavement_saving_annual": 0.3,
+            "generated_demand_pct_global": 0.0,
+            "generated_demand_pct_override": {"Car": None, "LCV": None, "HCV": None, "Bus": None},
         }
     }
 
@@ -702,6 +713,51 @@ def render_cost_entry(eval_period: int = 30) -> None:
                     "(remaining asset life / total asset life) × capital cost."
                 ),
             )
+
+            st.markdown("**Generated Demand Assumptions (Rule-of-Half)**")
+            st.caption(
+                "Specify what % of the project traffic benefit represents 'new' (generated) demand "
+                "vs. 'redistributed' demand. Used in demand sensitivity analysis. "
+                "Default: 0% (all demand is redistributed)."
+            )
+            cd["generated_demand_pct_global"] = st.slider(
+                "Global Generated Demand (%)",
+                min_value=0, max_value=100, step=5,
+                value=int(cd.get("generated_demand_pct_global", 0)),
+                key=f"gend_demand_global_{i}",
+                help=(
+                    "Apply this % globally to all vehicle types unless overridden below. "
+                    "Rule-of-Half: typically 50% of time benefit is 'generated' (new trips), "
+                    "50% is 'redistributed' (faster existing trips). "
+                    "Source: TfNSW CBA Guidelines."
+                ),
+            )
+
+            # Projects saved before Rule-of-Half was added lack this key
+            cd.setdefault("generated_demand_pct_override", {vt: None for vt in VTYPES})
+            with st.expander("Per-Vehicle-Type Overrides", expanded=False):
+                st.caption("Enable and set custom % for individual vehicle types (overrides global setting)")
+                for vtype in VTYPES:
+                    c_check, c_slider = st.columns([1, 3])
+                    with c_check:
+                        override_enabled = st.checkbox(
+                            f"{vtype} override",
+                            value=(cd["generated_demand_pct_override"].get(vtype) is not None),
+                            key=f"gend_demand_override_check_{i}_{vtype}",
+                        )
+                    with c_slider:
+                        if override_enabled:
+                            override_val = cd["generated_demand_pct_override"].get(vtype, 0)
+                            cd["generated_demand_pct_override"][vtype] = st.slider(
+                                f"{vtype} Generated Demand (%)",
+                                min_value=0, max_value=100, step=5,
+                                value=int(override_val if override_val is not None else 0),
+                                key=f"gend_demand_override_val_{i}_{vtype}",
+                                label_visibility="collapsed",
+                            )
+                        else:
+                            cd["generated_demand_pct_override"][vtype] = None
+                            st.caption(f"Using global setting ({cd['generated_demand_pct_global']}%)")
 
             st.markdown("**Active Transport — Incremental Health Benefits**")
             at1, at2 = st.columns(2)
@@ -1106,6 +1162,10 @@ def calculate_matrix(
             cost_y = opex
 
             # ── TTS: per vehicle type ───────────────────────────────────────
+            # Rule-of-Half: extract generated demand settings from cost dict
+            gen_pct_global = cost.get("generated_demand_pct_global", 0.0)
+            gen_pct_override = cost.get("generated_demand_pct_override", {})
+
             for vt in VTYPES:
                 vht_base = interpolate_modelling_years(
                     modelling_years, base_traffic[vt]["vht"], ey
@@ -1114,7 +1174,19 @@ def calculate_matrix(
                     modelling_years, proj_traffic[vt]["vht"], ey
                 )
                 annual_vht_saving = max(0.0, vht_base - vht_proj) * ann_factors[vt]
-                vt_tts = annual_vht_saving * occupancy_by_vtype[vt] * vtts_by_vtype[vt] / 1e6
+
+                # Resolve per-vehicle-type generated demand % (override or global)
+                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
+
+                # Split VHT delta: diverted vs generated
+                diverted_vht = annual_vht_saving * (1.0 - gen_pct / 100.0)
+                generated_vht = annual_vht_saving * (gen_pct / 100.0)
+
+                # Calculate TTS for diverted (1.0x VTTS) and generated (0.5x VTTS)
+                diverted_tts = diverted_vht * occupancy_by_vtype[vt] * vtts_by_vtype[vt] / 1e6
+                generated_tts = generated_vht * occupancy_by_vtype[vt] * vtts_by_vtype[vt] * 0.5 / 1e6
+
+                vt_tts = diverted_tts + generated_tts
                 b_tts_by_vt[vt] = vt_tts
                 b_tts += vt_tts
 
@@ -1131,6 +1203,7 @@ def calculate_matrix(
                 b_rel += b_tts_by_vt[vt] * _rr * 0.3
 
             # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
+            # Rule-of-Half: split VKT delta into diverted and generated
             for vt in VTYPES:
                 param_vt = VTYPE_MAP[vt]
                 voc_table = _p["voc"][ctx].get(param_vt, {})
@@ -1150,20 +1223,52 @@ def calculate_matrix(
 
                 annual_vkt_b = vkt_b * ann_factors[vt]
                 annual_vkt_p = vkt_p * ann_factors[vt]
-                voc_saving = annual_vkt_b * voc_b - annual_vkt_p * voc_p
+
+                # Resolve per-vehicle-type generated demand % (override or global)
+                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
+
+                # Split VKT delta: diverted vs generated
+                vkt_delta = (annual_vkt_b - annual_vkt_p)
+                diverted_vkt_delta = vkt_delta * (1.0 - gen_pct / 100.0)
+                generated_vkt_delta = vkt_delta * (gen_pct / 100.0)
+
+                # VOC benefit for diverted: full cost difference
+                diverted_voc = diverted_vkt_delta * (voc_b - voc_p)
+                # VOC benefit for generated: 0.5× project VOC (Rule-of-Half)
+                generated_voc = generated_vkt_delta * voc_p * 0.5
+
+                voc_saving = diverted_voc + generated_voc
                 b_voc += max(0.0, voc_saving) / 1e6
 
             # ── Safety: $/VKT per vehicle type (per-case rates) ─────────────
+            # Rule-of-Half: split VKT delta into diverted and generated
             _sv_base = safety_vkt_base if safety_vkt_base is not None else _p["safety_vkt"]
             _sv_proj = safety_vkt_proj if safety_vkt_proj is not None else _p["safety_vkt"]
             for vt in VTYPES:
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
-                b_safety += (vkt_b * _sv_base[vt] - vkt_p * _sv_proj[vt]) * ann_factors[vt] / 1e6
+                annual_vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
+
+                # Resolve per-vehicle-type generated demand % (override or global)
+                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
+
+                # Split VKT delta: diverted vs generated
+                diverted_vkt_delta = annual_vkt_delta * (1.0 - gen_pct / 100.0)
+                generated_vkt_delta = annual_vkt_delta * (gen_pct / 100.0)
+
+                # Safety cost difference (per VKT)
+                safety_cost_diff = _sv_base[vt] - _sv_proj[vt]
+
+                # Apply Rule-of-Half: diverted uses full cost difference, generated uses 0.5x
+                diverted_safety = diverted_vkt_delta * safety_cost_diff
+                generated_safety = generated_vkt_delta * safety_cost_diff * 0.5
+
+                b_safety += (diverted_safety + generated_safety) / 1e6
             # Fatal component: used for VSL sensitivity (scales this share ±, rest held fixed).
             b_safety_fatal = b_safety * _p["safety_severity_share"]["fatal"]
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
+            # Rule-of-Half: split VKT delta into diverted and generated
             for vt in VTYPES:
                 emit_vt = EMISSION_VTYPE_MAP[vt]
                 air_noise_vt = AIR_NOISE_VTYPE_MAP[vt]
@@ -1173,9 +1278,29 @@ def calculate_matrix(
 
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
-                vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
-                b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
-                b_env_emit += vkt_delta * emit_rate / 1e6
+                annual_vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
+
+                # Resolve per-vehicle-type generated demand % (override or global)
+                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
+
+                # Split VKT delta: diverted vs generated
+                diverted_vkt_delta = annual_vkt_delta * (1.0 - gen_pct / 100.0)
+                generated_vkt_delta = annual_vkt_delta * (gen_pct / 100.0)
+
+                # Calculate total environmental rate (emission + air + noise)
+                total_env_rate = emit_rate + air_rate + noise_rate
+
+                # Apply Rule-of-Half: diverted uses full rate, generated uses 0.5x
+                diverted_env = diverted_vkt_delta * total_env_rate
+                generated_env = generated_vkt_delta * total_env_rate * 0.5
+
+                b_env += (diverted_env + generated_env) / 1e6
+
+                # Track emission component separately (for carbon price sensitivity)
+                # Diverted at 1.0x, generated at 0.5x
+                diverted_emit = diverted_vkt_delta * emit_rate
+                generated_emit = generated_vkt_delta * emit_rate * 0.5
+                b_env_emit += (diverted_emit + generated_emit) / 1e6
 
             # ── Active Transport: incremental walking/cycling health benefits ─
             # Inputs are steady-state incremental person-km/day (project − base).
@@ -1740,6 +1865,36 @@ def build_effective_params() -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # INCREMENTAL BENEFITS SUMMARY HELPER — Step 11
 # ─────────────────────────────────────────────────────────────────────────────
+
+def render_rule_of_half_assumptions(cost_case: dict) -> None:
+    """Display Rule-of-Half assumptions from cost data for a project case.
+
+    Extracts and displays the generated demand percentage(s) and any per-vehicle-type
+    overrides to show users what appraisal methodology was applied.
+    """
+    gen_pct_global = cost_case.get("generated_demand_pct_global", 0.0)
+    gen_pct_override = cost_case.get("generated_demand_pct_override", {})
+
+    # Check if any settings are non-zero
+    has_overrides = any(v is not None for v in gen_pct_override.values())
+    has_global = gen_pct_global > 0
+
+    if has_global or has_overrides:
+        # Build info message with overrides if present
+        if has_overrides:
+            override_parts = []
+            for vt in VTYPES:
+                if gen_pct_override.get(vt) is not None:
+                    override_parts.append(f"{vt}: {gen_pct_override[vt]}%")
+            overrides_str = ", ".join(override_parts)
+            msg = f"**Rule-of-Half (Generated Demand):** {gen_pct_global}% global (overrides: {overrides_str})"
+        else:
+            msg = f"**Rule-of-Half (Generated Demand):** {gen_pct_global}% global"
+        st.info(msg)
+    else:
+        # No Rule-of-Half applied
+        st.info("**Rule-of-Half:** Not applied (0% generated demand — all traffic diverted)")
+
 
 def render_incremental_summary() -> None:
     """Step 11: Render the Incremental Benefits Summary table.
@@ -2430,6 +2585,12 @@ with tab_dash:
         _r = matrix_results[_dash_case]
     else:
         _r = matrix_results["project_1"]
+        _dash_case = "project_1"
+
+    # Display Rule-of-Half assumptions for transparency
+    _cost_data = st.session_state.get("cost_data", {})
+    _case_cost = _cost_data.get(_dash_case, {})
+    render_rule_of_half_assumptions(_case_cost)
 
     chart1, chart2 = st.columns(2)
 
