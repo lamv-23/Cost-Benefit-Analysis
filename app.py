@@ -713,8 +713,9 @@ def render_cost_entry(eval_period: int = 30) -> None:
             st.markdown("**Generated Demand Assumptions (Rule-of-Half)**")
             st.caption(
                 "Specify what % of the project traffic benefit represents 'new' (generated) demand "
-                "vs. 'redistributed' demand. Used in demand sensitivity analysis. "
-                "Default: 0% (all demand is redistributed)."
+                "vs. 'redistributed' demand. The generated share of travel time, reliability and "
+                "VOC benefits is counted at half value. Safety and environmental impacts are always "
+                "counted in full. Default: 0% (all demand is redistributed)."
             )
             cd["generated_demand_pct_global"] = st.slider(
                 "Global Generated Demand (%)",
@@ -723,9 +724,8 @@ def render_cost_entry(eval_period: int = 30) -> None:
                 key=f"gend_demand_global_{i}",
                 help=(
                     "Apply this % globally to all vehicle types unless overridden below. "
-                    "Rule-of-Half: typically 50% of time benefit is 'generated' (new trips), "
-                    "50% is 'redistributed' (faster existing trips). "
-                    "Source: TfNSW CBA Guidelines."
+                    "Rule-of-Half: new (generated) trips receive half the per-trip user benefit "
+                    "of existing trips. Source: ATAP T2; TfNSW CBA Guidelines."
                 ),
             )
 
@@ -1233,28 +1233,20 @@ def calculate_matrix(
                 b_voc += (diverted_voc + generated_voc) / 1e6
 
             # ── Safety: $/VKT per vehicle type (per-case rates) ─────────────
-            # Rule-of-Half: split VKT delta into diverted and generated
+            # No Rule-of-Half: crash costs are counted on the full change in VKT,
+            # including generated trips (ATAP T2 — Rule-of-Half applies to user benefits only)
             _sv_base = safety_vkt_base if safety_vkt_base is not None else _p["safety_vkt"]
             _sv_proj = safety_vkt_proj if safety_vkt_proj is not None else _p["safety_vkt"]
             for vt in VTYPES:
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
                 # Base VKT × base rate − project VKT × project rate
-                safety_saving = (vkt_b * _sv_base[vt] - vkt_p * _sv_proj[vt]) * ann_factors[vt]
-
-                # Resolve per-vehicle-type generated demand % (override or global)
-                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
-
-                # Apply Rule-of-Half: diverted share at 1.0x, generated share at 0.5x
-                diverted_safety = safety_saving * (1.0 - gen_pct / 100.0)
-                generated_safety = safety_saving * (gen_pct / 100.0) * 0.5
-
-                b_safety += (diverted_safety + generated_safety) / 1e6
+                b_safety += (vkt_b * _sv_base[vt] - vkt_p * _sv_proj[vt]) * ann_factors[vt] / 1e6
             # Fatal component: used for VSL sensitivity (scales this share ±, rest held fixed).
             b_safety_fatal = b_safety * _p["safety_severity_share"]["fatal"]
 
             # ── Environmental: emission + air + noise per vtype × VKT Δ ────
-            # Rule-of-Half: split VKT delta into diverted and generated
+            # No Rule-of-Half: externalities are counted on the full change in VKT
             for vt in VTYPES:
                 emit_vt = EMISSION_VTYPE_MAP[vt]
                 air_noise_vt = AIR_NOISE_VTYPE_MAP[vt]
@@ -1264,29 +1256,9 @@ def calculate_matrix(
 
                 vkt_b = interpolate_modelling_years(modelling_years, base_traffic[vt]["vkt"], ey)
                 vkt_p = interpolate_modelling_years(modelling_years, proj_traffic[vt]["vkt"], ey)
-                annual_vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
-
-                # Resolve per-vehicle-type generated demand % (override or global)
-                gen_pct = gen_pct_override.get(vt) if gen_pct_override.get(vt) is not None else gen_pct_global
-
-                # Split VKT delta: diverted vs generated
-                diverted_vkt_delta = annual_vkt_delta * (1.0 - gen_pct / 100.0)
-                generated_vkt_delta = annual_vkt_delta * (gen_pct / 100.0)
-
-                # Calculate total environmental rate (emission + air + noise)
-                total_env_rate = emit_rate + air_rate + noise_rate
-
-                # Apply Rule-of-Half: diverted uses full rate, generated uses 0.5x
-                diverted_env = diverted_vkt_delta * total_env_rate
-                generated_env = generated_vkt_delta * total_env_rate * 0.5
-
-                b_env += (diverted_env + generated_env) / 1e6
-
-                # Track emission component separately (for carbon price sensitivity)
-                # Diverted at 1.0x, generated at 0.5x
-                diverted_emit = diverted_vkt_delta * emit_rate
-                generated_emit = generated_vkt_delta * emit_rate * 0.5
-                b_env_emit += (diverted_emit + generated_emit) / 1e6
+                vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
+                b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
+                b_env_emit += vkt_delta * emit_rate / 1e6
 
             # ── Active Transport: incremental walking/cycling health benefits ─
             # Inputs are steady-state incremental person-km/day (project − base).
@@ -1439,9 +1411,11 @@ def calculate_matrix(
     # proceed if FYRR >= discount rate; otherwise consider deferral.
     fyrr_deferral_pass = (fyrr >= dr) if total_capital > 0 else None
 
+    # Benefit scenarios scale benefits only; residual value (an asset value) is held fixed
+    _pv_residual = residual * discount_factor(dr, base_offset + total_years - 1) if total_years > 0 else 0.0
     scenarios = {}
     for label, factor in [("Low (-20%)", 0.8), ("Central", 1.0), ("High (+20%)", 1.2)]:
-        s_pvb = sum(annual_benefits[y] * factor * discount_factor(dr, base_offset + y) for y in range(total_years))
+        s_pvb = (pv_benefits - _pv_residual) * factor + _pv_residual
         s_pvc = sum(annual_costs[y] * discount_factor(dr, base_offset + y) for y in range(total_years))
         scenarios[label] = {
             "pvb": s_pvb, "pvc": s_pvc,
@@ -1876,6 +1850,7 @@ def render_rule_of_half_assumptions(cost_case: dict) -> None:
             msg = f"**Rule-of-Half (Generated Demand):** {gen_pct_global}% global (overrides: {overrides_str})"
         else:
             msg = f"**Rule-of-Half (Generated Demand):** {gen_pct_global}% global"
+        msg += " — applied to travel time, reliability and VOC; safety and environment counted in full"
         st.info(msg)
     else:
         # No Rule-of-Half applied
@@ -3702,7 +3677,7 @@ with tab_about:
     sens_rows = [
         ("Discount rate sensitivity", "Re-runs NPV and BCR at 4%, 7%, and 10% to show how sensitive the result is to the choice of discount rate."),
         ("Switching values", "Calculates how far key inputs (benefits, costs, demand) would have to move before the BCR falls below 1.0. This tells decision-makers the margin of safety in the result."),
-        ("Scenario analysis", "Applies optimistic (+20% benefits, –10% costs) and pessimistic (–20% benefits, +20% costs) scenarios to bound the likely range of outcomes."),
+        ("Scenario analysis", "Applies demand scenarios that scale benefits by –20% (low) and +20% (high), holding costs and residual value fixed, to bound the likely range of outcomes."),
     ]
     sens_df = pd.DataFrame(sens_rows, columns=["Analysis", "What it shows"])
     st.dataframe(sens_df, hide_index=True, use_container_width=True)
