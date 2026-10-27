@@ -67,7 +67,7 @@ def test_change_construction_years_keeps_costs():
 def test_two_options_share_base_costs():
     at = _app_with_sample()
     base_before = list(at.session_state["base_case_costs"]["recurrent"])
-    _number_input(at, "Number of Project Cases").set_value(2).run()
+    _number_input(at, "Number of options").set_value(2).run()
     assert not at.exception
     assert at.session_state["base_case_costs"]["recurrent"] == base_before
     assert len(base_before) == 33
@@ -77,7 +77,7 @@ def test_two_options_share_base_costs():
 def test_adding_option_and_changing_years_keep_costs():
     at = _app_with_sample()
     before = copy.deepcopy(at.session_state["cost_data"]["project_1"])
-    _number_input(at, "Number of Project Cases").set_value(2).run()
+    _number_input(at, "Number of options").set_value(2).run()
     assert not at.exception
     costs = at.session_state["cost_data"]
     assert costs["project_1"]["capex_base"] == before["capex_base"]
@@ -103,7 +103,7 @@ def test_option_change_keeps_periods():
     _number_input(at, "Construction Period (years)").set_value(5).run()
     _number_input(at, "Evaluation Period (years)").set_value(40).run()
     _number_input(at, "Construction Start Year").set_value(2030).run()
-    _number_input(at, "Number of Project Cases").set_value(2).run()
+    _number_input(at, "Number of options").set_value(2).run()
     assert not at.exception
     assert at.session_state["const_years"] == 5
     assert at.session_state["eval_period"] == 40
@@ -298,7 +298,48 @@ def test_dashboard_summary():
     key = "P50 outturn capital (nominal $M)"
     frames = [d.value for d in at.dataframe if key in list(d.value.index)]
     assert frames, "appraisal summary table not found"
-    assert list(frames[0].columns) == ["Project 1"]
-    assert frames[0].loc[key, "Project 1"] == "395.0"
-    assert frames[0].loc["P90 outturn capital (nominal $M)", "Project 1"] == "432.0"
+    assert list(frames[0].columns) == ["Option 1"]
+    assert frames[0].loc[key, "Option 1"] == "395.0"
+    assert frames[0].loc["P90 outturn capital (nominal $M)", "Option 1"] == "432.0"
 
+
+
+def test_new_session_is_untitled_and_sample_sets_name():
+    at = AppTest.from_file(APP_PATH, default_timeout=300).run()
+    assert not at.exception
+    assert [t for t in at.text_input if t.label == "Project Name"][0].value == "Untitled project"
+    at.checkbox(key="confirm_load_sample").check().run()
+    [btn] = [b for b in at.button if b.label == "Load Sample Data"]
+    btn.click().run()
+    assert not at.exception
+    assert [t for t in at.text_input if t.label == "Project Name"][0].value == "Sample Road Upgrade"
+
+
+def test_parameter_override_changes_result_and_is_listed():
+    at = _app_with_sample()
+    central = _metric(at, "Benefit-Cost Ratio")
+    at.session_state["param_vtts_urban_Car"] = 30.0
+    at.run()
+    assert not at.exception
+    assert _metric(at, "Benefit-Cost Ratio") != central
+    assert any("Changed from default" in c.value and "Car Urban: 19.76 → 30" in c.value
+               for c in at.caption)
+
+
+def test_save_keeps_parameter_values_not_widget_keys(monkeypatch):
+    saved = _capture_saves(monkeypatch)
+    at = _app_with_sample()
+    at.session_state["param_vtts_urban_Car"] = 30.0
+    at.session_state["param_vtts_urban_Car_num"] = 30.0  # left by older versions
+    at.run()
+    data = json.loads(saved[-1])
+    assert data["param_vtts_urban_Car"] == 30.0
+    assert "param_vtts_urban_Car_num" not in data
+
+
+def test_benefit_assumptions_on_traffic_tab():
+    at = _app_with_sample()
+    [walk] = [w for w in at.number_input if w.label == "Additional walking (person-km/day)"]
+    walk.set_value(500.0).run()
+    assert not at.exception
+    assert at.session_state["cost_data"]["project_1"]["walk_pkm_day"] == 500.0
