@@ -22,7 +22,7 @@ import os
 
 from cba_engine import (  # noqa: E402,F401
     PARAMS, VTYPE_MAP, EMISSION_VTYPE_MAP, AIR_NOISE_VTYPE_MAP, VTYPES,
-    DEFAULT_MODELLING_YEARS, TYPE_LABELS,
+    DEFAULT_MODELLING_YEARS, TYPE_LABELS, CARBON_VALUES,
     make_traffic_case, make_traffic_data, make_cost_data,
     COST_FORMAT_VERSION, CAPEX_CATEGORIES, clean_row, make_base_case_costs,
     fit_cost_rows, build_cost_schedule, validate_project_file,
@@ -106,6 +106,12 @@ def _auto_match_cases(detected: list, n: int) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # SAMPLE DATA LOADER
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _clear_safety_inputs() -> None:
+    """Drop the per-case safety rate inputs so they redraw from safety_vkt_data."""
+    for k in [k for k in st.session_state.keys() if str(k).startswith("sv_")]:
+        del st.session_state[k]
+
 
 def _request_sample() -> None:
     """Button callback: load the sample at the top of the next run, before any widget renders."""
@@ -213,6 +219,7 @@ def _load_sample_data() -> None:
     st.session_state["safety_vkt_data"] = {
         ck: dict(PARAMS["safety_vkt"]) for ck in _case_keys
     }
+    _clear_safety_inputs()
 
     st.rerun()
 
@@ -226,9 +233,10 @@ def _serialise_project() -> dict:
     keys_to_save = [
         "traffic_data", "cost_data", "base_case_costs", "safety_vkt_data", "crash_data",
         "annualisation", "modelling_years", "n_project_cases",
-        "safety_mode", "env_mode", "reliability_mode", "show_advanced",
+        "env_mode", "reliability_mode", "show_advanced",
         "project_name", "const_years", "eval_period", "construction_start_year",
         "discount_rate", "discount_base_year", "context", "zero_growth_after_last_year",
+        "include_reliability", "include_road_damage",
     ]
     data = {"version": __version__, "type": "cba_project",
             "cost_format": COST_FORMAT_VERSION}
@@ -251,7 +259,7 @@ def _deserialise_project(data: dict) -> bool:
         st.warning(f"File version {data.get('version')} differs from app version {__version__}. Some data may not load correctly.")
     for k in ("traffic_data", "cost_data", "base_case_costs", "safety_vkt_data", "crash_data",
               "annualisation", "modelling_years", "n_project_cases",
-              "safety_mode", "env_mode", "reliability_mode", "show_advanced",
+              "env_mode", "reliability_mode", "show_advanced",
               # Period settings fix the meaning of the yearly cost rows. These are
               # widget keys; setting them is legal because the uploader renders
               # before those widgets (the name box is filled after it).
@@ -261,6 +269,18 @@ def _deserialise_project(data: dict) -> bool:
               "zero_growth_after_last_year", "project_name"):
         if k in data:
             st.session_state[k] = data[k]
+    _clear_safety_inputs()
+    # Files from before these switches existed include both benefit lines
+    for k in ("include_reliability", "include_road_damage"):
+        st.session_state[k] = data.get(k, True)
+    # Files saved in the old General safety mode used one set of rates (the
+    # Parameters tab's) for every case; copy them so results are unchanged.
+    if data.get("safety_mode", "Detailed") == "General":
+        _general = {vt: float(data.get(f"param_safety_vkt_{vt}", PARAMS["safety_vkt"][vt]))
+                    for vt in VTYPES}
+        st.session_state["safety_vkt_data"] = {
+            ck: dict(_general) for ck in st.session_state.get("safety_vkt_data", {})
+        } or {"base_case": dict(_general)}
     # Saves hold only changed parameters, so clear every override first: the
     # file alone decides which values differ from the TfNSW defaults.
     for k in [k for k in st.session_state.keys() if k.startswith("param_")]:
@@ -284,6 +304,11 @@ def format_m(value: float) -> str:
     if abs(value) >= 1000:
         return f"${value / 1000:.1f}B"
     return f"${value:.1f}M"
+
+
+def fmt_bcr(bcr, dp: int = 2) -> str:
+    """BCR to ``dp`` places, or "–" when it is not defined (PV costs zero or negative)."""
+    return "–" if bcr is None else f"{bcr:.{dp}f}"
 
 
 def signed_m(value: float) -> str:
@@ -470,9 +495,10 @@ def render_cost_entry(const_years: int, eval_period: int, start_year: int) -> No
     with _t_recurrent:
         st.caption(
             "Operations, maintenance and periodic renewals by year ($M, real). The base case "
-            "column is the existing road if no option goes ahead — shared by all options and "
-            "counted as an avoided cost. In construction years, enter each option's cost of "
-            "maintaining the existing road. Paste a column from Excel."
+            "column is the existing road if no option goes ahead, shared by all options. Only "
+            "each option's difference from it counts: a net increase is a cost, a net saving a "
+            "benefit. In construction years, enter each option's cost of maintaining the "
+            "existing road. Paste a column from Excel."
         )
         _rec_keys = ["base_case"] + [f"project_{i}" for i in range(1, n + 1)]
         _rec_rows = {k: (base if k == "base_case" else st.session_state.cost_data[k])["recurrent"]
@@ -531,8 +557,8 @@ def render_cost_entry(const_years: int, eval_period: int, start_year: int) -> No
                     key=f"cost_upfront_carbon_{i}",
                     help=(
                         "Embodied carbon from construction. Spread over the construction years "
-                        "in proportion to P50 capital and valued at $123/t (TfNSW EPV). "
-                        "Reported as a disbenefit."
+                        "in proportion to P50 capital and valued at the NSW Carbon Value for "
+                        "each year (TPG24-34). Reported as a disbenefit."
                     ),
                 )
             with _u2:
@@ -548,6 +574,13 @@ def render_cost_entry(const_years: int, eval_period: int, start_year: int) -> No
                     value=cd.get("outturn_p90_nominal"), step=1.0,
                     key=f"cost_outturn_p90_{i}",
                     help="Copied from the cost estimate. Reporting only; never used in the calculation.",
+                )
+            _nominal_p50 = cd.get("outturn_p50_nominal")
+            if _nominal_p50 and _sched_p50["capital_total"] >= 0.98 * _nominal_p50:
+                st.warning(
+                    f"Real P50 capital ({format_m(_sched_p50['capital_total'])}) is close to or "
+                    f"above the nominal outturn ({format_m(_nominal_p50)}). The yearly rows must "
+                    "be real June 2024 dollars; an escalated (outturn) estimate overstates costs."
                 )
 
             # ── Residual value ───────────────────────────────────────────────
@@ -649,7 +682,9 @@ def render_benefit_assumptions() -> None:
             st.caption(
                 "Share of the option's traffic that is new (generated) rather than redistributed. "
                 "The generated share of travel time, reliability and VOC benefits counts at half "
-                "value; safety and environment count in full. Default 0%."
+                "value; safety and environment count in full. Default 0%. This approximates the "
+                "rule-of-half on network totals; with a variable-demand model the VHT change "
+                "already includes new trips, so leave it at 0% unless the model is fixed-demand."
             )
             cd["generated_demand_pct_global"] = st.slider(
                 "Generated demand, all vehicle types (%)",
@@ -1142,10 +1177,17 @@ def build_effective_params() -> dict:
         p["reliability_ratio"] = float(ss["param_reliability_ratio"])
     if "param_reliability_ratio_freight" in ss:
         p["reliability_ratio_freight"] = float(ss["param_reliability_ratio_freight"])
-    for _vt in VTYPES:
-        _k = f"param_safety_vkt_{_vt}"
+    # Scalar parameters: session key → PARAMS key
+    for _k, _pk in (("param_reliability_share", "reliability_share_of_tts"),
+                    ("param_emission_change_pct", "emission_factor_change_pct"),
+                    ("param_road_damage_share", "road_damage_maintenance_share")):
         if _k in ss:
-            p["safety_vkt"][_vt] = float(ss[_k])
+            p[_pk] = float(ss[_k])
+    for _vt in VTYPES:
+        _k = f"param_road_damage_{_vt}"
+        if _k in ss:
+            p["road_damage_cents_vkt"][_vt] = float(ss[_k])
+    # Safety rates are set per case on Inputs → Traffic → Safety rates
     for _ctx in ("urban", "rural"):
         for _vt in ("car", "lgv", "rigid", "bus"):
             _k = f"param_emission_{_ctx}_{_vt}"
@@ -1200,6 +1242,53 @@ def render_rule_of_half_assumptions(cost_case: dict) -> None:
         st.caption("**Rule-of-half:** not applied (0% generated demand — all traffic is redistributed)")
 
 
+ANNUALISATION_DEFAULT = {"factor": 6.29, "days": 336}
+
+
+def _annualisation_is_default() -> bool:
+    """True while every vehicle type still has the generic annualisation default."""
+    ann = st.session_state.get("annualisation", {})
+    return all(
+        float(ann.get(vt, {}).get("factor", 0)) == ANNUALISATION_DEFAULT["factor"]
+        and int(ann.get(vt, {}).get("days", 0)) == ANNUALISATION_DEFAULT["days"]
+        for vt in VTYPES
+    )
+
+
+def _bcr_metric(container, label: str, bcr, above: str, below: str) -> None:
+    """NPV-style card for a BCR; "–" with a note when the BCR is not defined."""
+    if bcr is None:
+        container.metric(label, fmt_bcr(bcr), delta="Not defined", delta_color="off",
+                         help="PV costs are zero or negative, so the BCR is not defined. Use NPV.")
+        return
+    container.metric(label, fmt_bcr(bcr), delta=above if bcr >= 1 else below,
+                     delta_color="normal" if bcr >= 1 else "inverse")
+
+
+def _result_checks(results: dict) -> list:
+    """Plain-language checks on inputs and results that a reviewer would raise."""
+    checks = []
+    if _annualisation_is_default():
+        checks.append("Annualisation is still the generic default (6.29 × 336 days); use "
+                      "factors from your traffic model or counts (Inputs → Setup).")
+    ss = st.session_state
+    if ss["discount_base_year"] > ss["construction_start_year"]:
+        checks.append("The discount base year is after construction starts, so earlier costs "
+                      "are grown forward rather than treated as sunk.")
+    for key, r in results.items():
+        name = case_label(key)
+        for vt, (lo, hi) in r.get("voc_speed_out_of_range", {}).items():
+            checks.append(f"{name}: {vt} average speed {lo:.0f}–{hi:.0f} km/h is outside the "
+                          "VOC table, so VOC uses the table's end value.")
+        nominal = ss.cost_data.get(key, {}).get("outturn_p50_nominal")
+        real = r.get("capital_p50_total", 0.0)
+        if nominal and real >= 0.98 * nominal:
+            checks.append(f"{name}: real P50 capital ({format_m(real)}) is close to or above the "
+                          f"nominal outturn ({format_m(nominal)}). Check the cost rows are real "
+                          "June 2024 dollars, not escalated.")
+    return checks
+
+
 def _has_inputs() -> bool:
     """True once any traffic or cost figure has been entered (is non-zero)."""
     for _case in st.session_state.traffic_data.values():
@@ -1224,7 +1313,7 @@ COLORS = {
     "safety": "#dc3545",
     "env": "#198754",
     "active": "#6f42c1",
-    "avoided_costs": "#20c997",
+    "recurrent_savings": "#20c997",
     "upfront_carbon": "#6c757d",
     "construction_disruption": "#adb5bd",
     "residual": "#795548",
@@ -1358,9 +1447,8 @@ def _init_session_state() -> None:
         st.session_state["modelling_years"] = list(DEFAULT_MODELLING_YEARS)
     if "n_project_cases" not in st.session_state:
         st.session_state["n_project_cases"] = 1
-    _ANN_DEFAULT = {"factor": 6.29, "days": 336}
     if "annualisation" not in st.session_state:
-        st.session_state["annualisation"] = {vt: dict(_ANN_DEFAULT) for vt in ("Car", "LCV", "HCV", "Bus")}
+        st.session_state["annualisation"] = {vt: dict(ANNUALISATION_DEFAULT) for vt in ("Car", "LCV", "HCV", "Bus")}
     else:
         # Migrate older flat structures
         _ann = st.session_state["annualisation"]
@@ -1376,7 +1464,8 @@ def _init_session_state() -> None:
     for _k, _default in (("eval_period", 30), ("const_years", 3),
                          ("construction_start_year", 2026),
                          ("discount_rate", 5.0), ("discount_base_year", 2026),
-                         ("context", "urban"), ("zero_growth_after_last_year", False),
+                         ("context", "urban"), ("zero_growth_after_last_year", True),
+                         ("include_reliability", True), ("include_road_damage", True),
                          ("project_name", "Untitled project")):
         st.session_state[_k] = st.session_state.get(_k, _default)
     _years = st.session_state["modelling_years"]
@@ -1419,7 +1508,6 @@ def _init_session_state() -> None:
         )
 
     st.session_state.setdefault("show_advanced", False)
-    st.session_state.setdefault("safety_mode", "General")
     st.session_state.setdefault("env_mode", "General")
     st.session_state.setdefault("reliability_mode", "General")
     st.session_state.setdefault("mc_results", None)
@@ -1534,6 +1622,12 @@ with tab_inputs:
         with _p4:
             discount_base_year = st.number_input("Discount base year", 2020, 2060,
                 key="discount_base_year", help="Calendar year used as Year 0 for discounting (PV anchor).")
+        if discount_base_year > construction_start_year:
+            st.warning(
+                f"The discount base year ({discount_base_year}) is after construction starts "
+                f"({construction_start_year}). Costs in earlier years are grown forward to "
+                "the base year rather than treated as sunk; leave out costs already spent."
+            )
 
         st.markdown('<div class="section-header">Economic settings</div>', unsafe_allow_html=True)
         _e1, _e2, _e3 = st.columns(3)
@@ -1548,8 +1642,9 @@ with tab_inputs:
             zero_growth_after_last_year = st.checkbox(
                 "Zero growth after last modelling year",
                 key="zero_growth_after_last_year",
-                help="When checked, traffic volumes (and all benefits) are held flat at the last "
-                     "modelling year's values rather than extrapolating the trend.",
+                help="On by default: traffic (and the benefits it drives) is held at the last "
+                     "modelling year rather than extrapolating the growth trend for the rest of "
+                     "the appraisal. Untick only if continued growth is evidenced.",
             )
 
         st.markdown('<div class="section-header">Options and modelling years</div>', unsafe_allow_html=True)
@@ -1618,17 +1713,33 @@ with tab_inputs:
                 )
                 _col.caption(f"= **{_ann[_vt]['factor'] * _ann[_vt]['days']:.0f}**")
             st.session_state["annualisation"] = _ann
+        if _annualisation_is_default():
+            st.warning(
+                "Annualisation is still the generic default (6.29 × 336 days for every vehicle "
+                "type). It scales every traffic benefit, so use factors from your traffic model "
+                "or counts before reporting."
+            )
 
-        with st.expander("Benefit estimation methods", expanded=False):
-            st.caption("Choose how much detail to enter and report for safety, environment and reliability.")
-            _m1, _m2, _m3 = st.columns(3)
-            with _m1:
-                st.radio(
-                    "Safety costs", ["General", "Detailed"],
-                    key="safety_mode",
-                    help="General: default TfNSW $/VKT rates applied to all cases. "
-                         "Detailed: edit per-case safety cost rates in the Traffic tab.",
-                )
+        st.markdown('<div class="section-header">Benefits included</div>', unsafe_allow_html=True)
+        _b1, _b2 = st.columns(2)
+        with _b1:
+            st.checkbox(
+                "Reliability benefits", key="include_reliability",
+                help="A proxy: travel time savings × reliability ratio × a share (0.3 by default, "
+                     "set in Parameters). No published source for the share has been verified, "
+                     "so the BCR without reliability is always reported too.",
+            )
+        with _b2:
+            st.checkbox(
+                "Road damage savings", key="include_road_damage",
+                help="Change in VKT × TfNSW EPV road maintenance cost per vkt (Table 8.1), "
+                     "maintenance share only. Don't also enter the same network-wide wear in "
+                     "the recurrent costs, or it is counted twice.",
+            )
+
+        with st.expander("How benefits are reported", expanded=False):
+            st.caption("Choose how much detail to show for environment and reliability.")
+            _m2, _m3 = st.columns(2)
             with _m2:
                 st.radio(
                     "Environmental breakdown", ["General", "Detailed"],
@@ -1724,14 +1835,8 @@ with tab_inputs:
                     st.caption("Install openpyxl for the full Excel template.")
 
         # One metric at a time, so the page stays short as options are added
-        _detailed_safety = st.session_state.get("safety_mode", "General") == "Detailed"
-        _metric_tabs = st.tabs(
-            ["VHT", "VKT", "Demand", "Crashes"]
-            + (["Safety rates"] if _detailed_safety else [])
-            + ["Benefit assumptions"]
-        )
-        _t_vht, _t_vkt, _t_demand, _t_crash = _metric_tabs[:4]
-        _t_benefit = _metric_tabs[-1]
+        _t_vht, _t_vkt, _t_demand, _t_crash, _t_safety, _t_benefit = st.tabs(
+            ["VHT", "VKT", "Demand", "Crashes", "Safety rates", "Benefit assumptions"])
 
         # ── VHT ───────────────────────────────────────────────────────────────
         with _t_vht:
@@ -1797,27 +1902,32 @@ with tab_inputs:
                         _cd[_ck][sev][_yi] = float(_edited.iloc[_si][str(y)])
             st.session_state["crash_data"] = _cd
 
-        # ── Safety $/VKT (Detailed safety mode only) ──────────────────────────
-        if _detailed_safety:
-            with _metric_tabs[4]:
-                st.caption(
-                    "Safety cost rate ($/VKT) per vehicle type for each case. "
-                    "Benefit = Base VKT × Base rate − Option VKT × Option rate."
-                )
-                _svd = st.session_state["safety_vkt_data"]
-                _sv_case_keys = ["base_case"] + [f"project_{i}" for i in range(1, st.session_state.n_project_cases + 1)]
-                _sv_case_labels = case_labels(st.session_state.n_project_cases)
-                for _ck, _cl in zip(_sv_case_keys, _sv_case_labels):
-                    st.markdown(f"**{_cl}**")
-                    _cols = st.columns(4)
-                    for _vt, _col in zip(VTYPES, _cols):
-                        _svd[_ck][_vt] = _col.number_input(
-                            _vt, min_value=0.0, max_value=10.0,
-                            value=float(_svd[_ck].get(_vt, PARAMS["safety_vkt"][_vt])),
-                            step=0.001, format="%.3f",
-                            key=f"sv_{_ck}_{_vt}",
-                        )
-                st.session_state["safety_vkt_data"] = _svd
+        # ── Safety $/VKT per case ─────────────────────────────────────────────
+        with _t_safety:
+            st.caption(
+                "Crash cost rate ($/VKT) by vehicle type for each case, starting at the "
+                "TfNSW blended rates. Benefit = base VKT × base rate − option VKT × option "
+                "rate, so give an option a lower rate when its design is safer (e.g. a "
+                "divided road), with evidence."
+            )
+            _svd = st.session_state["safety_vkt_data"]
+            _sv_case_keys = ["base_case"] + [f"project_{i}" for i in range(1, st.session_state.n_project_cases + 1)]
+            _sv_case_labels = case_labels(st.session_state.n_project_cases)
+            for _ck, _cl in zip(_sv_case_keys, _sv_case_labels):
+                st.markdown(f"**{_cl}**")
+                _cols = st.columns(4)
+                for _vt, _col in zip(VTYPES, _cols):
+                    _svd[_ck][_vt] = _col.number_input(
+                        _vt, min_value=0.0, max_value=10.0,
+                        value=float(_svd[_ck].get(_vt, PARAMS["safety_vkt"][_vt])),
+                        step=0.001, format="%.3f",
+                        key=f"sv_{_ck}_{_vt}",
+                    )
+            st.session_state["safety_vkt_data"] = _svd
+
+            if all(_svd[_ck] == _svd["base_case"] for _ck in _sv_case_keys):
+                st.info("Every case uses the same rates, so the safety benefit comes only "
+                        "from the change in VKT.")
 
         # ── Benefit assumptions (stored with each option's cost data) ─────────
         with _t_benefit:
@@ -1852,12 +1962,13 @@ _matrix_inputs = {
     "discount_base_year": discount_base_year,
     "construction_start_year": construction_start_year,
     "zero_growth_after_last_year": zero_growth_after_last_year,
+    "include_reliability": st.session_state["include_reliability"],
+    "include_road_damage": st.session_state["include_road_damage"],
+    "carbon_basis": "nsw",
     "n_project_cases": st.session_state.n_project_cases,
 }
-# Per-case safety rates apply only in Detailed mode (where they are editable);
-# in General mode the Parameters-tab rates are used via _eff_params.
-_calc_safety_vkt = (st.session_state.safety_vkt_data
-                    if st.session_state.get("safety_mode", "General") == "Detailed" else None)
+# Each case's safety rates (Inputs → Traffic → Safety rates)
+_calc_safety_vkt = st.session_state.safety_vkt_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1957,14 +2068,19 @@ with tab_params:
             ("Freight — LCV / HCV", "Ratio of VTTS"):
                 ("param_reliability_ratio_freight", PARAMS["reliability_ratio_freight"]),
         }, unit="ratio", source="TfNSW EPV Jan 2025, §4.3", max_val=2.0)
+        st.caption("Reliability benefit = travel time savings × ratio × share. The share is a "
+                   "proxy with no published source verified; the BCR without reliability is "
+                   "always reported, and Setup can leave reliability out.")
+        param_table("reliability_share", {
+            ("Share of travel time savings", "Share"):
+                ("param_reliability_share", PARAMS["reliability_share_of_tts"]),
+        }, unit="share", source="Tool default (unverified proxy)", max_val=1.0)
 
     # ── Safety Cost ($/VKT) ───────────────────────────────────────────────────
     with st.expander("Safety cost ($/VKT by vehicle type)"):
-        st.caption("Safety benefit = (Base VKT − Option VKT) × rate × annualisation factor.")
-        param_table("safety", {
-            (_vt, "$/VKT"): (f"param_safety_vkt_{_vt}", PARAMS["safety_vkt"][_vt])
-            for _vt in VTYPES
-        }, unit="$/VKT", source="Agency default", fmt="%.3f", max_val=5.0)
+        st.caption("TfNSW blended rates that each case starts from. Each case's rates are "
+                   "set on Inputs → Traffic → Safety rates.")
+        st.dataframe(pd.DataFrame({"$/VKT": PARAMS["safety_vkt"]}).T, use_container_width=True)
         st.markdown("**Crash severity shares** *(informational — used for VSL sensitivity only)*")
         _sev = PARAMS["safety_severity_share"]
         _sev_cols = st.columns(4)
@@ -1982,11 +2098,32 @@ with tab_params:
 
     # ── Emission Costs (CO₂) ─────────────────────────────────────────────────
     with st.expander("Emission costs — CO₂ ($/veh-km)"):
+        st.caption(f"EPV costs at ${PARAMS['carbon_per_tonne']}/t. The tool divides by that "
+                   "price to get tonnes per veh-km, then values the tonnes at the carbon value "
+                   "for each year (see Carbon values).")
         param_table("emission", {
             (_label, _ctx_label): (f"param_emission_{_ctx}_{_vt}", PARAMS["emission_cost"][_ctx][_vt])
             for _vt, _label in [("car", "Car"), ("lgv", "LGV"), ("rigid", "Rigid truck"), ("bus", "Bus")]
             for _ctx, _ctx_label in _CTX
         }, unit="$/veh-km", source="TfNSW EPV Jan 2025, Table 14", fmt="%.3f", max_val=1.0)
+        param_table("emission_change", {
+            ("Emissions per veh-km", "% change a year"):
+                ("param_emission_change_pct", PARAMS["emission_factor_change_pct"]),
+        }, unit="% a year from 2024 (negative = falling)", min_val=-20.0, max_val=20.0,
+            source="Tool default 0% (enter a sourced fleet projection)")
+
+    # ── Carbon values (read-only) ────────────────────────────────────────────
+    with st.expander("Carbon values ($/tCO₂-e by year)"):
+        st.caption("The core result uses NSW Carbon Values (NSW Treasury TPG24-34, $2024); the "
+                   "BCR with National Carbon Values ($2023, as published) is reported alongside. "
+                   "Source: TfNSW CBA requirements, October 2025, Appendix. Years after 2050 "
+                   "hold the 2050 value.")
+        _cy = sorted(set(CARBON_VALUES["nsw"]["central"]) | set(CARBON_VALUES["national"]["central"]))
+        st.dataframe(pd.DataFrame({
+            f"{_b.upper() if _b == 'nsw' else 'National'} {_c}":
+                [CARBON_VALUES[_b][_c].get(_y) for _y in _cy]
+            for _b in ("nsw", "national") for _c in ("low", "central", "high")
+        }, index=pd.Index(_cy, name="Financial year")), use_container_width=True, height=300)
 
     # ── Air Pollution ────────────────────────────────────────────────────────
     with st.expander("Air pollution costs ($/veh-km)"):
@@ -2005,6 +2142,21 @@ with tab_params:
                                 ("artic", "Articulated truck")]
             for _ctx, _ctx_label in _CTX
         }, unit="$/veh-km", source="TfNSW EPV Jan 2025, Table 16", fmt="%.3f", max_val=1.0)
+
+    # ── Road damage ──────────────────────────────────────────────────────────
+    with st.expander("Road damage (cents/veh-km)"):
+        st.caption("Road damage savings = change in VKT × rate × maintenance share. Rates are "
+                   "TfNSW EPV 2026.1 Table 8.1 (June 2026) deflated to June 2024 with CPI Sydney "
+                   "(137.25 / 145.82). HCV uses the heavy-vehicle sub-total; Bus the bus average.")
+        param_table("road_damage", {
+            (_vt, "c/veh-km"): (f"param_road_damage_{_vt}", PARAMS["road_damage_cents_vkt"][_vt])
+            for _vt in VTYPES
+        }, unit="cents/veh-km, June 2024", source="TfNSW EPV 2026.1, Table 8.1", max_val=100.0)
+        param_table("road_damage_share", {
+            ("Maintenance share counted", "Share"):
+                ("param_road_damage_share", PARAMS["road_damage_maintenance_share"]),
+        }, unit="share", max_val=1.0,
+            source="EPV Table 8.1 note: 46% repair and maintenance, 54% road provision")
 
     # ── Active Transport Health Benefits ─────────────────────────────────────
     with st.expander("Active transport health benefits ($/person-km)"):
@@ -2079,8 +2231,9 @@ with tab_about:
     st.markdown(
         "The model quantifies five categories of transport benefit, all derived from changes in traffic "
         "volumes, travel times, and speeds between the base case and each option. "
-        "Four further lines follow the TfNSW Guide: avoided base case costs, upfront carbon "
-        "and construction disruption (a disbenefit), and residual value:"
+        "Further lines follow the TfNSW Guide: reliability (a proxy), road damage savings, "
+        "recurrent cost savings, upfront carbon and construction disruption (disbenefits), "
+        "and residual value:"
     )
 
     benefit_rows = [
@@ -2096,16 +2249,25 @@ with tab_about:
          "Rates depend on speed (km/h) and are interpolated from TfNSW lookup tables "
          "(different tables for urban and rural contexts). "
          "Faster travel on a new bypass, for example, typically reduces VOC per kilometre. "
+         "Speeds outside a table use its end value (flagged on Results), and buses use the "
+         "articulated-truck rates because the tables used have no bus rates. "
          "Source: TfNSW EPV Tables 5–8."),
+        ("Reliability", "reliability", "indigo",
+         "A proxy: travel time savings × reliability ratio (0.9 passenger, 0.6 freight) × a "
+         "share of 0.3. No published source for the 0.3 share has been verified, so the BCR "
+         "without reliability is always reported and Setup can leave reliability out. The "
+         "TfNSW Guide values reliability from the change in travel-time variability."),
         ("Safety", "safety", "red",
-         "Reduction in crash costs when vehicle-kilometres travelled (VKT) change. "
-         "Rates are expressed in dollars per vehicle-kilometre by vehicle type "
-         "(e.g. Car: $0.153/veh-km). These already incorporate the Value of a Statistical Life "
-         "(VSL: $8.1 million) blended across crash severity distributions. "
+         "Base VKT × base crash rate − option VKT × option crash rate, in dollars per "
+         "vehicle-kilometre by vehicle type (TfNSW blended default e.g. Car: $0.153/veh-km, "
+         "including the Value of a Statistical Life, $8.1 million). Each case has its own rates "
+         "(Inputs → Traffic → Safety rates), so a safer design needs a lower rate to get credit. "
          "Source: TfNSW EPV Table 11."),
         ("Environmental", "env", "green",
          "Three components, all calculated per change in VKT: "
-         "(1) **Carbon emissions** — fleet-average CO₂ factors × carbon price ($123/tonne); "
+         "(1) **Carbon emissions** — fleet-average CO₂ tonnes per km (from the EPV costs at "
+         "$123/t) valued at the NSW Carbon Value for each year (TPG24-34, $2024, rising from "
+         "$130/t in 2025 to $350/t from 2039); "
          "(2) **Air pollution** — local pollutants (NOx, PM2.5) priced at health damage costs; "
          "(3) **Noise** — annoyance and health impacts on surrounding residents. "
          "Urban rates are higher than rural for all three. "
@@ -2115,22 +2277,27 @@ with tab_about:
          "valued using health monetisation rates (Walking: $3.17/person-km; Cycling: $1.60/person-km). "
          "This component is zero unless demand data includes active mode trips. "
          "Source: TfNSW EPV Table 18."),
-        ("Avoided base case costs", "avoided_costs", "teal",
-         "The base case recurrent cost (operations, maintenance and renewals) that the project "
-         "does not have to pay, counted as a Government benefit in every year of the timeline, "
-         "per TfNSW Guide Table 6. The project's own recurrent cost is a cost in every year, "
-         "so a project that keeps maintaining the existing road during construction gets no "
-         "credit for those years."),
+        ("Road damage savings", "road_damage", "brown",
+         "Change in VKT × TfNSW road maintenance cost per vehicle-km (EPV 2026.1 Table 8.1, "
+         "deflated to June 2024: Car and LCV 5.28c, heavy vehicles 18.15c, buses 9.93c) × the "
+         "46% maintenance share. Can be switched off in Setup; don't also put the same "
+         "network-wide wear in the recurrent costs."),
+        ("Recurrent cost savings", "recurrent_savings", "teal",
+         "Recurrent costs are net of the base case. When the option is cheaper to run and "
+         "maintain than the base case (in PV terms), the saving is this benefit; when it costs "
+         "more, the increase is a cost. TfNSW CBA Guide (2024) §6.8 prefers cost savings as a "
+         "benefit."),
         ("Upfront carbon emissions", "upfront_carbon", "grey",
          "Embodied carbon from construction (tonnes CO\u2082e) is spread across the construction "
-         "years in proportion to the P50 capital cashflow and valued at the carbon price "
-         "($123/tonne). Reported as a disbenefit (negative benefit)."),
+         "years in proportion to the P50 capital cashflow and valued at the NSW Carbon Value "
+         "for each year. Reported as a disbenefit (negative benefit)."),
         ("Construction disruption", "construction_disruption", "grey",
          "The annual cost of traffic disruption during construction, reported as a disbenefit "
          "in each construction year."),
         ("Residual value", "residual", "brown",
-         "Remaining value of the assets at the end of the appraisal period, credited in the "
-         "final year. Land keeps its full value; construction (including its share of "
+         "Remaining value of the assets at the end of the appraisal period, credited at the "
+         "end of the final year (discounted one year further than that year's other flows). "
+         "Land keeps its full value; construction (including its share of "
          "contingency) depreciates straight-line over the asset life; planning and design "
          "have none. A manual residual value overrides the calculation."),
     ]
@@ -2163,10 +2330,12 @@ with tab_about:
             "The same base estimates plus the contingency that takes them to P90. Used only in the "
             "'P90 capital cost' sensitivity test.",
             "Operations, maintenance and periodic renewals by year for each option, over the whole "
-            "timeline including construction. Counted as a cost and discounted.",
-            "The same, for the do-minimum base case, shared by all options. Counted as the "
-            "'Avoided base case costs' benefit.",
-            "Tonnes CO\u2082e for each option, valued at the carbon price and reported as a disbenefit.",
+            "timeline including construction. Only the difference from the base case counts: a net "
+            "increase is a cost, a net saving the 'Recurrent cost savings' benefit.",
+            "The same, for the do-minimum base case, shared by all options. Each option's recurrent "
+            "costs are compared with it.",
+            "Tonnes CO\u2082e for each option, valued at the NSW Carbon Value for each year and "
+            "reported as a disbenefit.",
             "P50 and P90 outturn capital in nominal dollars, copied from the cost estimate. Shown in "
             "the appraisal summary and CSV only; never used in a calculation.",
         ],
@@ -2182,7 +2351,9 @@ with tab_about:
         "discount convention: a dollar in year *n* is worth `1 / (1 + r)^n` today, "
         "where *r* is the discount rate. "
         "The default rate is **5%** per annum. The required sensitivity table always re-runs "
-        "the model at 3%, 4% and 7% (4% for federal submissions), whatever the central rate is."
+        "the model at 3%, 4% and 7% (4% for federal submissions), whatever the central rate is. "
+        "Residual value is discounted from the end of the final year. Costs before the discount "
+        "base year are grown forward, so leave out costs already spent (sunk)."
     )
 
     st.divider()
@@ -2198,8 +2369,9 @@ with tab_about:
     st.markdown(
         "Peak-period model outputs are converted to annual totals using an "
         "**annualisation factor** and **days per year** for each vehicle type. "
-        "These defaults reflect typical NSW peak-period survey expansion factors "
-        "and can be adjusted in **Inputs → Setup**."
+        "The defaults are generic, so replace them with factors from your traffic model or "
+        "counts in **Inputs → Setup** (Results warns while they are unchanged). After the last "
+        "modelling year traffic is held flat by default rather than extrapolated."
     )
 
     st.divider()
@@ -2212,11 +2384,11 @@ with tab_about:
     )
     sens_rows = [
         ("Discount rate", "3%, 4% and 7%, whatever the central rate is."),
-        ("Costs and benefits", "Project costs and transport benefits at +20%, \u221220%, +40% and \u221240%. Residual value follows capital; avoided base case costs, upfront carbon and construction disruption are not scaled."),
+        ("Costs and benefits", "Project costs and transport benefits at +20%, \u221220%, +40% and \u221240%. Residual value follows capital; recurrent cost savings, upfront carbon and construction disruption are not scaled."),
         ("P90 capital cost", "Capital at base plus the P90 contingency in every year."),
         ("Opening delayed", "Opening delayed by 1 year and by 3 years, with benefits recalculated for the delayed calendar years."),
         ("Traffic growth", "No traffic growth, and half the forecast traffic growth, from the opening year."),
-        ("Other analyses", "Switching values, the discount rate chart, carbon price, VSL and WEBs sensitivity, and Monte Carlo risk analysis (advanced mode)."),
+        ("Other analyses", "Switching values, the discount rate chart, carbon values (NSW and National, low/central/high), VSL and WEBs sensitivity, and Monte Carlo risk analysis (advanced mode)."),
     ]
     sens_df = pd.DataFrame(sens_rows, columns=["Analysis", "What it shows"])
     st.table(sens_df.set_index("Analysis"))
@@ -2320,9 +2492,7 @@ with tab_results:
                     _c_npv.metric("NPV", format_m(_mr.get("npv", 0)),
                                   delta="Positive" if _mr.get("npv", 0) >= 0 else "Negative",
                                   delta_color="normal" if _mr.get("npv", 0) >= 0 else "inverse")
-                    _c_bcr.metric("BCR", f"{_mr.get('bcr', 0):.2f}",
-                                  delta="≥ 1.0" if _mr.get("bcr", 0) >= 1 else "< 1.0",
-                                  delta_color="normal" if _mr.get("bcr", 0) >= 1 else "inverse")
+                    _bcr_metric(_c_bcr, "BCR", _mr.get("bcr"), "≥ 1.0", "< 1.0")
     else:
         _r_kpi = matrix_results["project_1"]
         _k1, _k2, _k3 = st.columns([1, 1, 1.4])
@@ -2331,15 +2501,20 @@ with tab_results:
                       delta="Positive" if _r_kpi["npv"] >= 0 else "Negative",
                       delta_color="normal" if _r_kpi["npv"] >= 0 else "inverse")
         with _k2:
-            st.metric("Benefit-cost ratio", f"{_r_kpi['bcr']:.2f}",
-                      delta="Above 1.0" if _r_kpi["bcr"] >= 1 else "Below 1.0",
-                      delta_color="normal" if _r_kpi["bcr"] >= 1 else "inverse")
+            _bcr_metric(st, "Benefit-cost ratio", _r_kpi["bcr"], "Above 1.0", "Below 1.0")
         with _k3:
             # Escape $ so Markdown does not read the amounts as LaTeX
             _pvb_md = format_m(_r_kpi["pv_benefits"]).replace("$", "\\$")
             _pvc_md = format_m(_r_kpi["pv_costs"]).replace("$", "\\$")
             st.caption(f"PV benefits **{_pvb_md}** · PV costs **{_pvc_md}**")
             st.caption("NPV is PV benefits minus PV costs. A BCR above 1.0 means benefits exceed costs.")
+            st.caption(f"BCR without reliability **{fmt_bcr(_r_kpi['bcr_without_reliability'])}** · "
+                       f"with National carbon values **{fmt_bcr(_r_kpi['bcr_national_carbon'])}**")
+
+    # Checks a reviewer would ask about, for every option
+    _checks = _result_checks(matrix_results)
+    if _checks:
+        st.warning("**Check before reporting**\n\n" + "\n".join(f"- {c}" for c in _checks))
 
     # ── Case selector (Step 10): pick which option drives the charts & waterfall ─
     _n_dash = st.session_state.n_project_cases
@@ -2354,7 +2529,8 @@ with tab_results:
             format_summary_value(_k, _v, screen=True) for _k, _v in _summ.items()
         ]
     st.dataframe(pd.DataFrame(_summ_cols, index=list(_summ.keys())),
-                 use_container_width=True)
+                 use_container_width=True,
+                 height=35 * (len(_summ) + 1) + 3)  # every row, no inner scroll
     st.caption(
         "Outturn capital is nominal $M, copied from the cost estimate and never used in "
         "the calculation. All other figures are real June 2024 dollars."
@@ -2391,8 +2567,9 @@ with tab_results:
         st.markdown("**Benefits, costs and NPV (PV $M)**")
         # Build waterfall series respecting reliability mode
         if _reliability_mode == "General":
-            _wf_types = ["tts", "voc", "safety", "env", "active",
-                         "avoided_costs", "upfront_carbon", "construction_disruption", "residual"]
+            _wf_types = ["tts", "voc", "safety", "env", "road_damage", "active",
+                         "recurrent_savings", "upfront_carbon", "construction_disruption",
+                         "residual"]
             _wf_labels_benefit = ["Travel time and reliability"] + [
                 TYPE_LABELS[t] for t in _wf_types[1:]
             ]
@@ -2584,7 +2761,7 @@ with tab_cashflow:
         df_cf = pd.DataFrame({
             "Year": years_list,
             "Capital ($M)": [round(c, 3) for c in _r_cf["annual_capital"]],
-            "Recurrent ($M)": [round(c, 3) for c in _r_cf["annual_recurrent"]],
+            "Net recurrent ($M)": [round(c, 3) for c in _r_cf["annual_recurrent"]],
             "Benefits ($M)": [round(b, 3) for b in _r_cf["annual_benefits"]],
             # Net sits beside the totals so it is visible without scrolling
             "Net ($M)": [round(n, 3) for n in _r_cf["annual_net"]],
@@ -2594,8 +2771,9 @@ with tab_cashflow:
             "VOC ($M)": [round(v, 3) for v in _bbt["voc"]],
             "Safety ($M)": [round(v, 3) for v in _bbt["safety"]],
             **_env_cols,
+            "Road damage savings ($M)": [round(v, 3) for v in _bbt["road_damage"]],
             "Active transport ($M)": [round(v, 3) for v in _bbt["active"]],
-            "Avoided base case costs ($M)": [round(v, 3) for v in _bbt["avoided_costs"]],
+            "Recurrent cost savings ($M)": [round(v, 3) for v in _bbt["recurrent_savings"]],
             "Upfront carbon ($M)": [round(v, 3) for v in _bbt["upfront_carbon"]],
             "Construction disruption ($M)": [round(v, 3) for v in _bbt["construction_disruption"]],
             "Residual value ($M)": [round(v, 3) for v in _bbt["residual"]],
@@ -2687,14 +2865,16 @@ with tab_sensitivity:
             if row["Test"] in _central_tests:
                 styles = ["background-color: rgba(13, 110, 253, 0.1); font-weight: 700"] * len(row)
             bcr_idx = df_req.columns.get_loc("BCR")
-            styles[bcr_idx] += ("; color: #198754; font-weight: 700" if row["BCR"] >= 1
-                                else "; color: #dc3545; font-weight: 700")
+            if pd.notna(row["BCR"]):
+                styles[bcr_idx] += ("; color: #198754; font-weight: 700" if row["BCR"] >= 1
+                                    else "; color: #dc3545; font-weight: 700")
             return styles
 
         st.dataframe(
             df_req.style.apply(_highlight_required, axis=1).format({
                 "PV benefits ($M)": "{:.1f}", "PV costs ($M)": "{:.1f}",
-                "NPV ($M)": "{:.1f}", "BCR": "{:.2f}",
+                "NPV ($M)": "{:.1f}",
+                "BCR": lambda b: fmt_bcr(None if pd.isna(b) else b),
             }),
             use_container_width=True, hide_index=True,
             height=35 * (len(df_req) + 1) + 3,  # all 17 rows, no inner scroll
@@ -2718,7 +2898,8 @@ with tab_sensitivity:
             for _row in _req_rows:
                 if _row["test"].startswith("Discount rate "):
                     _dr_points.setdefault(float(_row["test"].split()[-1].rstrip("%")), _row["bcr"])
-            dr_rates = sorted(_dr_points)
+            # A BCR that is not defined (PV costs <= 0) has no bar
+            dr_rates = sorted(r for r in _dr_points if _dr_points[r] is not None)
             dr_bcrs = [_dr_points[r] for r in dr_rates]
             bar_colors = [COLORS["positive"] if b >= 1 else COLORS["negative"] for b in dr_bcrs]
             fig_dr = go.Figure(go.Bar(
@@ -2757,67 +2938,53 @@ with tab_sensitivity:
             else:
                 st.info("Insufficient data for switching values.")
 
-    # --- Carbon price sensitivity ---
-    with st.expander("Carbon price — BCR under alternative carbon values", expanded=False):
+    # --- Carbon value sensitivity ---
+    with st.expander("Carbon values — BCR under each carbon value schedule", expanded=False):
         _carbon_sens = _r_sens.get("sensitivity_carbon", {})
         if _carbon_sens:
             _c_labels = list(_carbon_sens.keys())
             _c_bcrs = [_carbon_sens[l]["bcr"] for l in _c_labels]
-            _c_npvs = [_carbon_sens[l]["npv"] for l in _c_labels]
-            _c_prices = [_carbon_sens[l]["carbon_price"] for l in _c_labels]
-            _c_fig = go.Figure()
-            _c_fig.add_trace(go.Bar(
-                x=_c_labels, y=_c_bcrs,
-                marker_color="#198754",
-                text=[f"{v:.2f}" for v in _c_bcrs],
-                textposition="outside",
+            _c_fig = go.Figure(go.Bar(
+                x=_c_labels, y=[b if b is not None else 0 for b in _c_bcrs],
+                marker_color=["#0066CC" if _carbon_sens[l]["core"] else "#198754"
+                              for l in _c_labels],
+                text=[fmt_bcr(b) for b in _c_bcrs], textposition="outside",
             ))
-            _c_fig.add_hline(y=1.0, line_dash="dash", line_color="red",
+            _c_fig.add_hline(y=1.0, line_dash="dash", line_color="#6c757d",
                              annotation_text="BCR = 1.0", annotation_position="top right")
             _c_fig.update_layout(
-                yaxis_title="BCR", xaxis_title="Carbon price scenario",
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(t=30, b=10), height=320,
+                yaxis_title="BCR", xaxis_title="Carbon value schedule",
+                margin=dict(t=30, b=10), height=320, **PLOTLY_TRANSPARENT,
             )
             st.plotly_chart(_c_fig, use_container_width=True)
 
-            _c_rows = []
-            for _lbl in _c_labels:
-                _cv = _carbon_sens[_lbl]
-                _c_rows.append({
-                    "Carbon price scenario": _lbl,
-                    "Carbon price ($/tCO₂e)": _cv["carbon_price"],
-                    "PV benefits ($M)": round(_cv["pvb"], 1),
-                    "NPV ($M)": round(_cv["npv"], 1),
-                    "BCR": round(_cv["bcr"], 2),
-                })
-            _df_c = pd.DataFrame(_c_rows)
+            _df_c = pd.DataFrame([{
+                "Carbon values": _lbl,
+                "PV benefits ($M)": _carbon_sens[_lbl]["pvb"],
+                "NPV ($M)": _carbon_sens[_lbl]["npv"],
+                "BCR": _carbon_sens[_lbl]["bcr"],
+                "Core": _carbon_sens[_lbl]["core"],
+            } for _lbl in _c_labels])
 
             def _highlight_carbon(row):
                 styles = [""] * len(row)
-                if "Central" in row["Carbon price scenario"]:
-                    styles = ["background-color: rgba(25, 135, 84, 0.1); font-weight: 700"] * len(row)
-                _bcr_idx = _df_c.columns.get_loc("BCR")
-                if row["BCR"] >= 1:
-                    styles[_bcr_idx] += "; color: #198754; font-weight: 700"
-                else:
-                    styles[_bcr_idx] += "; color: #dc3545; font-weight: 700"
+                if row["Core"]:
+                    styles = ["background-color: rgba(13, 110, 253, 0.1); font-weight: 700"] * len(row)
                 return styles
 
-            _styled_c = _df_c.style.apply(_highlight_carbon, axis=1).format({
-                "Carbon price ($/tCO₂e)": "{:.2f}",
-                "PV benefits ($M)": "{:.1f}",
-                "NPV ($M)": "{:.1f}",
-                "BCR": "{:.2f}",
-            })
-            st.dataframe(_styled_c, use_container_width=True, hide_index=True)
+            st.dataframe(
+                _df_c.style.apply(_highlight_carbon, axis=1).format({
+                    "PV benefits ($M)": "{:,.1f}", "NPV ($M)": "{:,.1f}", "BCR": fmt_bcr,
+                }),
+                use_container_width=True, hide_index=True,
+                column_config={"Core": None},
+            )
             st.caption(
-                "Scales the emission_cost (carbon) component of environmental benefits and the "
-                "upfront (construction) carbon disbenefit; air pollution and noise costs are "
-                "held at base values. "
-                "Base: $123/tCO₂e (TfNSW EPV Jan 2025). "
-                "Treasury: $135.74/tCO₂e (NSW Treasury TPG24-34). "
-                "Highlighted row = Central (base case) carbon price."
+                "Operating carbon (from the change in VKT) and upfront carbon are revalued at "
+                "each schedule; air pollution and noise are unchanged. Highlighted row = core "
+                "result (NSW Carbon Values, central, $2024). National Carbon Values are in "
+                "$2023 as published; for joint NSW–federal projects of $100m or more report the "
+                "National central BCR too. EPV flat = the old single $123/t value."
             )
         else:
             st.info("No carbon sensitivity data available.")
@@ -2898,9 +3065,9 @@ with tab_sensitivity:
             _vsl_bcrs = [_vsl_sens[l]["bcr"] for l in _vsl_labels]
             _vsl_fig = go.Figure()
             _vsl_fig.add_trace(go.Bar(
-                x=_vsl_labels, y=_vsl_bcrs,
+                x=_vsl_labels, y=[v if v is not None else 0 for v in _vsl_bcrs],
                 marker_color=COLORS["safety"],
-                text=[f"{v:.2f}" for v in _vsl_bcrs],
+                text=[fmt_bcr(v) for v in _vsl_bcrs],
                 textposition="outside",
             ))
             _vsl_fig.add_hline(y=1.0, line_dash="dash", line_color="red",
@@ -2920,7 +3087,7 @@ with tab_sensitivity:
                     "VSL ($M)": _vv["vsl"],
                     "PV benefits ($M)": round(_vv["pvb"], 1),
                     "NPV ($M)": round(_vv["npv"], 1),
-                    "BCR": round(_vv["bcr"], 2),
+                    "BCR": _vv["bcr"],
                 })
             _df_vsl = pd.DataFrame(_vsl_rows)
 
@@ -2929,17 +3096,16 @@ with tab_sensitivity:
                 if "Central" in row["VSL Scenario"]:
                     styles = ["background-color: rgba(220, 53, 69, 0.08); font-weight: 700"] * len(row)
                 _bcr_idx = _df_vsl.columns.get_loc("BCR")
-                if row["BCR"] >= 1:
-                    styles[_bcr_idx] += "; color: #198754; font-weight: 700"
-                else:
-                    styles[_bcr_idx] += "; color: #dc3545; font-weight: 700"
+                if pd.notna(row["BCR"]):
+                    styles[_bcr_idx] += ("; color: #198754; font-weight: 700" if row["BCR"] >= 1
+                                         else "; color: #dc3545; font-weight: 700")
                 return styles
 
             _styled_vsl = _df_vsl.style.apply(_highlight_vsl, axis=1).format({
                 "VSL ($M)": "{:.2f}",
                 "PV benefits ($M)": "{:.1f}",
                 "NPV ($M)": "{:.1f}",
-                "BCR": "{:.2f}",
+                "BCR": lambda b: fmt_bcr(None if pd.isna(b) else b),
             })
             st.dataframe(_styled_vsl, use_container_width=True, hide_index=True)
             st.caption(

@@ -43,7 +43,7 @@ def _app_with_sample():
 def test_sample_data_runs():
     at = _app_with_sample()
     assert _metric(at, "Net present value")
-    assert _metric(at, "Benefit-cost ratio") == "1.69"
+    assert _metric(at, "Benefit-cost ratio") == "1.82"
     labels = [m.label for m in at.metric]
     assert "Internal Rate of Return" not in labels
     assert "First Year Rate of Return" not in labels
@@ -124,7 +124,7 @@ def test_sample_resets_periods():
     assert at.session_state["const_years"] == 3
     assert at.session_state["eval_period"] == 30
     assert at.session_state["construction_start_year"] == 2026
-    assert _metric(at, "Benefit-cost ratio") == "1.69"
+    assert _metric(at, "Benefit-cost ratio") == "1.82"
 
 
 def test_empty_project_no_errors():
@@ -142,7 +142,7 @@ def test_empty_state_loads_sample():
     btn.click().run()
     assert not at.exception
     assert at.session_state["const_years"] == 3
-    assert _metric(at, "Benefit-cost ratio") == "1.69"
+    assert _metric(at, "Benefit-cost ratio") == "1.82"
     assert not [b for b in at.button if b.key == "empty_load_sample"]
 
 
@@ -367,4 +367,44 @@ def test_opening_project_clears_earlier_parameter_changes(monkeypatch):
     at.run()
     assert not at.exception
     assert "param_vtts_urban_Car" not in at.session_state
-    assert _metric(at, "Benefit-cost ratio") == "1.69" != changed
+    assert _metric(at, "Benefit-cost ratio") == "1.82" != changed
+
+
+def test_new_session_defaults_for_growth_and_benefit_lines():
+    at = AppTest.from_file(APP_PATH, default_timeout=300).run()
+    assert at.session_state["zero_growth_after_last_year"] is True
+    assert at.session_state["include_reliability"] is True
+    assert at.session_state["include_road_damage"] is True
+
+
+def test_reliability_switch_changes_result():
+    at = _app_with_sample()
+    [rel] = [c for c in at.checkbox if c.label == "Reliability benefits"]
+    rel.uncheck().run()
+    assert not at.exception
+    assert _metric(at, "Benefit-cost ratio") == "1.60"
+
+
+def test_bcr_shows_dash_without_costs():
+    at = _app_with_sample()
+    cost = at.session_state["cost_data"]["project_1"]
+    for cat in cost["capex_base"]:
+        cost["capex_base"][cat] = [0.0] * len(cost["capex_base"][cat])
+    cost["contingency_p50"] = [0.0] * len(cost["contingency_p50"])
+    cost["contingency_p90"] = [0.0] * len(cost["contingency_p90"])
+    cost["recurrent"] = list(at.session_state["base_case_costs"]["recurrent"])
+    at.run()
+    assert not at.exception
+    assert _metric(at, "Benefit-cost ratio") == "–"
+
+
+def test_old_general_safety_file_keeps_its_rates(monkeypatch):
+    """A file saved in General safety mode used the Parameters rates for every case."""
+    saved = _capture_saves(monkeypatch)
+    _app_with_sample()
+    data = json.loads(saved[-1])
+    data["safety_mode"] = "General"
+    data["param_safety_vkt_Car"] = 0.2
+    fresh = _open_in_fresh_app(monkeypatch, json.dumps(data), file_id="old-general-1")
+    svd = fresh.session_state["safety_vkt_data"]
+    assert svd["base_case"]["Car"] == 0.2 and svd["project_1"]["Car"] == 0.2
