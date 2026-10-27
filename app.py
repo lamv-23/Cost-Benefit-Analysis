@@ -1746,7 +1746,7 @@ with tab_inputs:
                 "Funding", ["nsw", "joint"], key="funding", horizontal=True,
                 format_func={"nsw": "NSW-funded", "joint": "NSW and federal"}.get,
                 help="Sets the cost per crash (EPV Table 3.18) and the value of a statistical "
-                     "life for the VSL test (NSW $7.3M; ATAP $9.7M for joint funding). Jointly "
+                     "life for the VSL test (NSW \\$7.3M; ATAP \\$9.7M for joint funding). Jointly "
                      "funded projects of $100m or more also report the National carbon BCR.",
             )
         with _f2:
@@ -2243,7 +2243,7 @@ with tab_params:
         }, unit="$ per crash", source="EPV 2026.1 Table 3.18", fmt="%.0f", max_val=1e7)
         _vsl = PARAMS["vsl"]
         st.caption(f"Value of a statistical life (VSL sensitivity only): NSW "
-                   f"${_vsl['nsw'] / 1e6:.2f}M, ATAP-based ${_vsl['atap'] / 1e6:.2f}M (EPV Table "
+                   f"\\${_vsl['nsw'] / 1e6:.2f}M, ATAP-based \\${_vsl['atap'] / 1e6:.2f}M (EPV Table "
                    "5.1). The fatal share of crash costs used for that test is a tool "
                    f"assumption ({PARAMS['safety_severity_share']['fatal']:.0%}).")
 
@@ -2379,87 +2379,142 @@ with tab_about:
     # ── Benefit categories ───────────────────────────────────────────────────
     st.markdown("### Benefit categories")
     st.markdown(
-        "The model quantifies five categories of transport benefit, all derived from changes in traffic "
-        "volumes, travel times, and speeds between the base case and each option. "
-        "Further lines follow the TfNSW Guide: reliability (a proxy), road damage savings, "
-        "recurrent cost savings, upfront carbon and construction disruption (disbenefits), "
-        "and residual value:"
+        "Every benefit is the difference between the base case and an option, valued with "
+        "TfNSW Economic Parameter Values 2026.1. The lines follow the TfNSW CBA Guide's "
+        "groups (Table 6). Open a line for how it is valued."
     )
 
-    benefit_rows = [
-        ("Travel time savings (TTS)", "tts", "blue",
-         "The most significant benefit in most road projects. "
-         "The reduction in vehicle-hours travelled (VHT) × the average value of travel time per "
-         "vehicle-hour, which already includes occupancy, the private/business car split, "
-         "freight value for trucks and bus passengers (urban: car $37.75, LCV $46.29, HCV "
-         "$76.71, bus $498.05 per vehicle-hour). Source: TfNSW EPV 2026.1 Tables 2.2 and 2.3."),
-        ("Vehicle operating costs (VOC)", "voc", "orange",
-         "Savings in fuel, tyres, maintenance, and depreciation when a project changes vehicle speeds. "
-         "Rates depend on average speed (VKT ÷ VHT) and come from the TfNSW depreciation-"
-         "adjusted resource-cost models: stop-start (arterial) or freeway for urban roads, set in "
-         "Setup. Rural roads use the freeway model with the regional vehicle mix, an "
-         "approximation because the EPV gives rural VOC only as REVS model parameters. Car is a "
-         "medium car; LCV, HCV and bus use their EPV vehicle classes weighted by the EPV vehicle "
-         "mix. Speeds outside 20–110 km/h use the table's end value (flagged on Results). "
-         "Optionally (Setup, off by default), the change in stops × EPV VOC per stop (Table "
-         "3.14) is added — only where stops change without a matching change in speed, as the "
-         "speed-based models already reflect typical stopping. "
-         "Source: TfNSW EPV 2026.1 Tables 3.9, 3.10 and 3.19."),
-        ("Reliability", "reliability", "indigo",
-         "A proxy: travel time savings × reliability ratio (1.0, TfNSW recommended, EPV "
-         "Table 11.8) × a share of 0.3. No published source for the 0.3 share has been verified, so the BCR "
-         "without reliability is always reported and Setup can leave reliability out. The "
-         "TfNSW Guide values reliability from the change in travel-time variability."),
-        ("Safety", "safety", "red",
-         "Base VKT × base crash cost per vkt − option VKT × option crash cost per vkt. Each "
-         "case picks its road type (urban or rural, divided or single carriageway) for the EPV "
-         "default = crash rate (Table 5.5) × average cost per crash (Table 3.18, NSW-funded or "
-         "jointly funded), or enters custom rates (Inputs → Traffic → Safety rates). A safer "
-         "design (e.g. divided road) therefore gets credit through a lower rate."),
-        ("Environmental", "env", "green",
-         "Calculated per change in VKT: (1) **Operating carbon** — kg CO₂-e per vehicle-km "
-         "(EPV Tables 6.2, 6.3) valued at the NSW Carbon Value for each year (TPG24-34, June "
-         "2026 $: $139.66/t in 2026 rising to $373.13/t from 2039); (2) **other externalities** "
-         "— air pollution, well-to-tank emissions, noise, soil and water, nature and landscape, "
-         "urban effects and biodiversity (EPV Tables 6.5–6.8, urban and rural)."),
-        ("Active transport health benefits", "active", "purple",
-         "Benefits from additional walking or cycling induced by the project, "
-         f"valued at the NSW Health rates (walking ${PARAMS['health_benefits']['walking']:.2f}/km; "
-         f"cycling ${PARAMS['health_benefits']['cycling']:.2f}/km). "
-         "The share of those km that replaces car trips also earns the EPV savings for "
-         "former car users (decongestion, VOC, crashes, externalities, road provision, "
-         "parking; walking $1.15/km, cycling $1.25/km) — leave it at 0% if the traffic model "
-         "already removes those car trips. No travel time value, per TfNSW. "
-         "Source: TfNSW EPV 2026.1 Table 7.1."),
-        ("Road damage savings", "road_damage", "brown",
-         "Change in VKT × TfNSW road maintenance cost per vehicle-km (EPV 2026.1 Table 8.1: "
-         "Car and LCV 5.61c, heavy vehicles 19.28c, buses 10.55c) × the 46% maintenance share. Can be switched off in Setup; don't also put the same "
-         "network-wide wear in the recurrent costs."),
-        ("Recurrent cost savings", "recurrent_savings", "teal",
-         "Recurrent costs are net of the base case. When the option is cheaper to run and "
-         "maintain than the base case (in PV terms), the saving is this benefit; when it costs "
-         "more, the increase is a cost. TfNSW CBA Guide (2024) §6.8 prefers cost savings as a "
-         "benefit."),
-        ("Upfront carbon emissions", "upfront_carbon", "grey",
-         "Embodied carbon from construction (tonnes CO\u2082e) is spread across the construction "
-         "years in proportion to the P50 capital cashflow and valued at the NSW Carbon Value "
-         "for each year. Reported as a disbenefit (negative benefit)."),
-        ("Construction disruption", "construction_disruption", "grey",
-         "The annual cost of traffic disruption during construction, reported as a disbenefit "
-         "in each construction year."),
-        ("Residual value", "residual", "brown",
-         "Remaining value of the assets at the end of the appraisal period, credited at the "
-         "end of the final year (discounted one year further than that year's other flows). "
-         "The asset life can be filled from EPV Table 12.1 (e.g. asphalt pavement 30–40 "
-         "years, concrete bridges 120). "
-         "Land keeps its full value; construction (including its share of "
-         "contingency) depreciates straight-line over the asset life; planning and design "
-         "have none. A manual residual value overrides the calculation."),
+    def _usd(value: float, dp: int = 2) -> str:
+        """Dollar amount for Markdown; the $ is escaped so it is not read as maths."""
+        return f"\\${value:,.{dp}f}"
+
+    _vtt_u = PARAMS["vtt_vehicle_hr"]["urban"]
+    _vtt_r = PARAMS["vtt_vehicle_hr"]["rural"]
+    _walk_car = sum(PARAMS["active_car_savings"]["walking"].values())
+    _cycle_car = sum(PARAMS["active_car_savings"]["cycling"].values())
+    _rd = PARAMS["road_damage_cents_vkt"]
+    _nsw_carbon = CARBON_VALUES["nsw"]["central"]
+
+    benefit_groups = [
+        ("User benefits", [
+            {"name": "Travel time savings",
+             "what": "Time saved by road users, including freight and bus passengers.",
+             "how": "Change in vehicle-hours travelled (VHT) × value of travel time per vehicle-hour.",
+             "points": [
+                 f"Urban per vehicle-hour: car {_usd(_vtt_u['Car'])}, LCV {_usd(_vtt_u['LCV'])}, "
+                 f"HCV {_usd(_vtt_u['HCV'])}, bus {_usd(_vtt_u['Bus'])}",
+                 f"Rural per vehicle-hour: car {_usd(_vtt_r['Car'])}, LCV {_usd(_vtt_r['LCV'])}, "
+                 f"HCV {_usd(_vtt_r['HCV'])}, bus {_usd(_vtt_r['Bus'])}",
+                 "Values already include occupancy, the private/business car split, freight "
+                 "and 20 bus passengers",
+             ],
+             "source": "TfNSW EPV 2026.1 Tables 2.2 (urban) and 2.3 (rural)"},
+            {"name": "Reliability",
+             "what": "Less variable journey times.",
+             "how": "Travel time savings × reliability ratio (1.0) × share (0.3).",
+             "points": [
+                 "A proxy: the 0.3 share has no verified published source",
+                 "The BCR without reliability is always reported; Setup can leave it out",
+                 "The TfNSW Guide values reliability from the change in travel-time variability",
+             ],
+             "source": "Reliability ratio: TfNSW EPV 2026.1 Table 11.8"},
+            {"name": "Vehicle operating costs",
+             "what": "Fuel, tyres, maintenance and depreciation saved.",
+             "how": "Vehicle-km × cost per km at the average speed (VKT ÷ VHT), base minus option.",
+             "points": [
+                 "Urban roads: stop-start (arterial) or freeway model, chosen in Setup",
+                 "Rural roads: freeway model with the regional vehicle mix (an approximation; "
+                 "the EPV gives rural VOC only as REVS parameters)",
+                 "Speeds outside 20–110 km/h use the table's end value and are flagged on Results",
+                 "Optional (Setup, off by default): change in stops × VOC per stop",
+             ],
+             "source": "TfNSW EPV 2026.1 Tables 3.9, 3.10, 3.14 and 3.19"},
+        ]),
+        ("Safety and externalities", [
+            {"name": "Safety",
+             "what": "Fewer and less severe crashes.",
+             "how": "Base VKT × base crash cost per vkt − option VKT × option crash cost per vkt.",
+             "points": [
+                 "Each case picks its road type (urban or rural, divided or single carriageway) "
+                 "or enters custom rates on Inputs → Traffic → Safety rates",
+                 "Default rate = crash rate × average cost per crash, for the funding basis in Setup",
+                 "A safer design (e.g. a divided road) gets credit through a lower rate",
+             ],
+             "source": "TfNSW EPV 2026.1 Tables 5.5 and 3.18"},
+            {"name": "Environmental",
+             "what": "Less carbon, air pollution, noise and other environmental damage.",
+             "how": "Change in VKT × (carbon per vkt × carbon value + other externalities per vkt).",
+             "points": [
+                 f"Carbon valued at the NSW Carbon Value for each year: {_usd(_nsw_carbon[2026])}/t in "
+                 f"2026, rising to {_usd(_nsw_carbon[2039])}/t from 2039",
+                 "Other externalities: air pollution, well-to-tank emissions, noise, soil and "
+                 "water, nature and landscape, urban effects, biodiversity",
+             ],
+             "source": "TfNSW EPV 2026.1 Tables 6.1–6.8; NSW Treasury TPG24-34"},
+            {"name": "Road damage savings",
+             "what": "Less road wear and maintenance from fewer vehicle-km.",
+             "how": "Change in VKT × road maintenance cost per vkt × 46% maintenance share.",
+             "points": [
+                 f"Per vkt: car and LCV {_rd['Car']:.2f}c, heavy vehicles {_rd['HCV']:.2f}c, "
+                 f"buses {_rd['Bus']:.2f}c",
+                 "Can be switched off in Setup; don't also enter the same wear in recurrent costs",
+             ],
+             "source": "TfNSW EPV 2026.1 Table 8.1"},
+            {"name": "Active transport",
+             "what": "Health benefits of new walking and cycling, and savings when it replaces car trips.",
+             "how": "Walking or cycling km × health value, plus the car-trip share × savings per km.",
+             "points": [
+                 f"Health: walking {_usd(PARAMS['health_benefits']['walking'])}/km, "
+                 f"cycling {_usd(PARAMS['health_benefits']['cycling'])}/km",
+                 f"Replaced car trips: walking {_usd(_walk_car)}/km, cycling {_usd(_cycle_car)}/km "
+                 "(decongestion, VOC, crashes, externalities, road provision, parking)",
+                 "Leave the car-trip share at 0% if the traffic model already removes those trips",
+                 "No travel time value, as TfNSW recommends",
+             ],
+             "source": "TfNSW EPV 2026.1 Table 7.1"},
+        ]),
+        ("Government benefits", [
+            {"name": "Recurrent cost savings",
+             "what": "Lower operating and maintenance costs than the base case.",
+             "how": "Option recurrent costs − base case recurrent costs, when that is a saving in PV terms.",
+             "points": [
+                 "When the option costs more to run, the increase is a cost instead",
+                 "TfNSW CBA Guide §6.8 treats cost savings as a benefit",
+             ],
+             "source": "TfNSW CBA Guide (2024) §6.8"},
+            {"name": "Residual value",
+             "what": "Asset value left at the end of the appraisal period.",
+             "how": "Land at full value + construction × remaining life ÷ asset life.",
+             "points": [
+                 "Credited at the end of the final year",
+                 "Asset life can be filled from the EPV (e.g. asphalt pavement 30–40 years, "
+                 "concrete bridges 120)",
+                 "Planning and design have no residual value; a manual value overrides the calculation",
+             ],
+             "source": "TfNSW EPV 2026.1 Table 12.1; ATAP T2"},
+        ]),
+        ("Disbenefits", [
+            {"name": "Upfront carbon",
+             "what": "Embodied carbon from building the option.",
+             "how": "Tonnes CO₂-e spread over construction by P50 capital × carbon value for each year.",
+             "points": ["Reported as a negative benefit"],
+             "source": "NSW Treasury TPG24-34; TfNSW EPV 2026.1 Table 6.1"},
+            {"name": "Construction disruption",
+             "what": "Delays to road users while the option is built.",
+             "how": "Annual disruption cost entered on Inputs → Costs, in each construction year.",
+             "points": ["Reported as a negative benefit"],
+             "source": "TfNSW CBA Guide (2024) Table 6"},
+        ]),
     ]
 
-    for name, key, colour, explanation in benefit_rows:
-        with st.expander(f"**{name}**"):
-            st.markdown(explanation)
+    for _group, _items in benefit_groups:
+        st.markdown(f"#### {_group}")
+        for _item in _items:
+            with st.expander(_item["name"]):
+                st.markdown(_item["what"])
+                st.markdown(f"**How it's valued:** {_item['how']}")
+                st.markdown("\n".join(f"- {_p}" for _p in _item["points"]))
+                st.caption(f"Source: {_item['source']}")
 
     st.divider()
 
@@ -3140,7 +3195,7 @@ with tab_sensitivity:
                 "Operating carbon (from the change in VKT) and upfront carbon are revalued at "
                 "each schedule; other externalities are unchanged. Highlighted row = core "
                 "result (NSW Carbon Values, central). All schedules are EPV 2026.1 Table 6.1 × "
-                "Table 6.4, June 2026 $. For jointly funded projects of $100m or more report "
+                "Table 6.4, June 2026 dollars. For jointly funded projects of \\$100m or more report "
                 "the National central BCR too."
             )
         else:
