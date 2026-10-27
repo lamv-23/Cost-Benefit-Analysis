@@ -301,4 +301,7 @@ refactor: extract calculate_matrix into standalone function
 - **Residual value** is discounted from the end of the final year (exponent + 1); any PV of the benefit rows must treat the residual row that way
 - **Defaults** — `zero_growth_after_last_year` True; `include_reliability` and `include_road_damage` True; safety rates are always per case (`safety_vkt_data`), set from each case's road type (`sv_road_<case>`: urban/rural × divided/single → `crash_cost_per_vkt`, or `custom`) and the Setup `funding` basis (`nsw`/`joint`, also picks the VSL); old files keep their rates as `custom`
 - **Road damage** — `road_damage_cents_vkt` is EPV 2026.1 Table 8.1 × `road_damage_maintenance_share` (0.46)
+- **Stop VOC** — `include_stop_voc` (default False) adds change in stops × `voc_per_stop` (Table 3.14) to the VOC line; off by default because the speed-based VOC models already reflect typical stopping
+- **Active transport** — health rate on all new km, plus `active_car_savings` (Table 7.1, former car users) on each option's `active_car_share_pct`; no travel time value (TfNSW)
+- **Asset lives** — `ASSET_LIVES` (Table 12.1); the Costs picker sets `construction_asset_life` to the midpoint via a callback that drops the `cost_asset_life_<i>` widget key
 - **Tests** — run `python3 -m pytest tests -q` before committing; keep `cba_engine.py` free of `streamlit` imports

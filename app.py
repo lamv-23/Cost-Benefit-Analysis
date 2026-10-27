@@ -22,7 +22,7 @@ import os
 
 from cba_engine import (  # noqa: E402,F401
     PARAMS, VTYPES, PRICE_YEAR, PRICE_LABEL, CPI_JUNE_2024_TO_2026,
-    crash_cost_per_vkt, project_price_year, index_costs,
+    crash_cost_per_vkt, project_price_year, index_costs, ASSET_LIVES,
     DEFAULT_MODELLING_YEARS, TYPE_LABELS, CARBON_VALUES,
     make_traffic_case, make_traffic_data, make_cost_data,
     COST_FORMAT_VERSION, CAPEX_CATEGORIES, clean_row, make_base_case_costs,
@@ -112,6 +112,16 @@ def _clear_safety_inputs() -> None:
     """Drop the per-case safety rate inputs so they redraw from safety_vkt_data."""
     for k in [k for k in st.session_state.keys() if str(k).startswith("sv_")]:
         del st.session_state[k]
+
+
+def _apply_asset_life(i: int) -> None:
+    """Selectbox callback: set option ``i``'s asset life from EPV Table 12.1."""
+    label = st.session_state.get(f"cost_asset_type_{i}")
+    for name, low, high in ASSET_LIVES:
+        if name == label:
+            st.session_state.cost_data[f"project_{i}"]["construction_asset_life"] = round((low + high) / 2)
+            # The life input redraws from the new value
+            st.session_state.pop(f"cost_asset_life_{i}", None)
 
 
 def _index_pending_costs() -> None:
@@ -279,6 +289,7 @@ def _serialise_project() -> dict:
         "project_name", "const_years", "eval_period", "construction_start_year",
         "discount_rate", "discount_base_year", "context", "zero_growth_after_last_year",
         "include_reliability", "include_road_damage", "funding", "voc_road_type",
+        "include_stop_voc",
     ]
     data = {"version": __version__, "type": "cba_project",
             "cost_format": COST_FORMAT_VERSION, "price_year": PRICE_YEAR}
@@ -314,7 +325,8 @@ def _deserialise_project(data: dict) -> bool:
     _clear_safety_inputs()
     # Settings added later: files without them get the defaults
     for k, default in (("include_reliability", True), ("include_road_damage", True),
-                       ("funding", "nsw"), ("voc_road_type", "stop_start")):
+                       ("funding", "nsw"), ("voc_road_type", "stop_start"),
+                       ("include_stop_voc", False)):
         st.session_state[k] = data.get(k, default)
     # Each case's safety road type. Older files have none: their per-case rates
     # are kept as custom values, except files in the old General mode, which used
@@ -401,7 +413,7 @@ def case_labels(n: int) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Traffic metrics where a fall (project below base) is an improvement
-_REDUCTION_IS_GOOD = ("vht", "vkt")
+_REDUCTION_IS_GOOD = ("vht", "vkt", "stops")
 
 
 def _style_change(val):
@@ -653,7 +665,14 @@ def render_cost_entry(const_years: int, eval_period: int, start_year: int) -> No
 
             # ── Residual value ───────────────────────────────────────────────
             st.markdown("**Residual value**")
-            _a1, _a2 = st.columns(2)
+            _a0, _a1, _a2 = st.columns(3)
+            with _a0:
+                st.selectbox(
+                    "Asset type (EPV Table 12.1)", ["—"] + [a[0] for a in ASSET_LIVES],
+                    key=f"cost_asset_type_{i}", on_change=_apply_asset_life, args=(i,),
+                    help="Fills the asset life with the EPV economic life (the midpoint where "
+                         "the EPV gives a range). Edit the life if the project differs.",
+                )
             with _a1:
                 cd["construction_asset_life"] = st.number_input(
                     "Construction asset life (years)",
@@ -816,6 +835,18 @@ def render_benefit_assumptions() -> None:
                         "Source: TfNSW EPV 2026.1, Table 7.1."
                     ),
                 )
+            _car_sav = {m: sum(PARAMS["active_car_savings"][m].values()) for m in ("walking", "cycling")}
+            cd["active_car_share_pct"] = st.number_input(
+                "Share of these km that replace car trips (%)", min_value=0.0, max_value=100.0,
+                value=float(cd.get("active_car_share_pct", 0.0) or 0.0), step=5.0,
+                key=f"cost_active_car_share_{i}",
+                help=(
+                    "Former car trips also save decongestion, VOC, crash, externality, road "
+                    f"provision and parking costs: walking ${_car_sav['walking']:.2f}/km, cycling "
+                    f"${_car_sav['cycling']:.2f}/km (EPV 2026.1 Table 7.1). Leave at 0% if the "
+                    "traffic model already removes those car trips, or they are counted twice."
+                ),
+            )
 
             st.session_state.cost_data[case_key] = cd
 
@@ -1250,6 +1281,7 @@ def build_effective_params() -> dict:
         # Entered in kg CO2-e per vkt, held in tonnes
         _set(f"param_carbon_kg_{_vt}", p["carbon_t_per_vkt"], _vt, scale=1e-3)
         _set(f"param_road_damage_{_vt}", p["road_damage_cents_vkt"], _vt)
+        _set(f"param_voc_stop_{_vt}", p["voc_per_stop"], _vt)
     # Scalar parameters: session key → PARAMS key
     for _k, _pk in (("param_reliability_ratio", "reliability_ratio"),
                     ("param_reliability_ratio_freight", "reliability_ratio_freight"),
@@ -1528,6 +1560,7 @@ def _init_session_state() -> None:
                          ("context", "urban"), ("zero_growth_after_last_year", True),
                          ("include_reliability", True), ("include_road_damage", True),
                          ("funding", "nsw"), ("voc_road_type", "stop_start"),
+                         ("include_stop_voc", False),
                          ("project_name", "Untitled project")):
         st.session_state[_k] = st.session_state.get(_k, _default)
     _years = st.session_state["modelling_years"]
@@ -1800,7 +1833,15 @@ with tab_inputs:
             )
 
         st.markdown('<div class="section-header">Benefits included</div>', unsafe_allow_html=True)
-        _b1, _b2 = st.columns(2)
+        _b1, _b2, _b3 = st.columns(3)
+        with _b3:
+            st.checkbox(
+                "VOC from stops", key="include_stop_voc",
+                help="Adds change in stops (Inputs → Traffic → Stops) × EPV VOC per stop "
+                     "(Table 3.14). Off by default: the speed-based VOC models already reflect "
+                     "typical stopping, so use it only where stops change without a matching "
+                     "change in average speed (e.g. intersection works, freeway model).",
+            )
         with _b1:
             st.checkbox(
                 "Reliability benefits", key="include_reliability",
@@ -1914,8 +1955,16 @@ with tab_inputs:
                     st.caption("Install openpyxl for the full Excel template.")
 
         # One metric at a time, so the page stays short as options are added
-        _t_vht, _t_vkt, _t_demand, _t_crash, _t_safety, _t_benefit = st.tabs(
-            ["VHT", "VKT", "Demand", "Crashes", "Safety rates", "Benefit assumptions"])
+        _t_vht, _t_vkt, _t_stops, _t_demand, _t_crash, _t_safety, _t_benefit = st.tabs(
+            ["VHT", "VKT", "Stops", "Demand", "Crashes", "Safety rates", "Benefit assumptions"])
+
+        # ── Stops ─────────────────────────────────────────────────────────────
+        with _t_stops:
+            st.caption(
+                "Vehicle stops per peak period. Used only when **VOC from stops** is on in "
+                "Setup (EPV VOC per stop, Table 3.14)."
+            )
+            render_traffic_matrix("stops", "stops / peak period")
 
         # ── VHT ───────────────────────────────────────────────────────────────
         with _t_vht:
@@ -2074,6 +2123,7 @@ _matrix_inputs = {
     "carbon_basis": "nsw",
     "funding": st.session_state["funding"],
     "voc_road_type": st.session_state["voc_road_type"],
+    "include_stop_voc": st.session_state["include_stop_voc"],
     "n_project_cases": st.session_state.n_project_cases,
 }
 # Each case's safety rates (Inputs → Traffic → Safety rates)
@@ -2258,6 +2308,11 @@ with tab_params:
             (_label, "$/km"): (f"param_health_{_mode}", PARAMS["health_benefits"][_mode])
             for _mode, _label in [("walking", "Walking"), ("cycling", "Cycling")]
         }, unit="$/km", source="EPV 2026.1 Table 7.1 (NSW Ministry of Health)", max_val=20.0)
+        st.caption("Extra savings per km when the walking or cycling replaces a car trip "
+                   "(applied to each option's car-trip share; EPV 2026.1 Table 7.1, former car "
+                   "users). TfNSW does not recommend valuing travel time for active transport.")
+        st.dataframe(pd.DataFrame(PARAMS["active_car_savings"]).rename(columns=str.title),
+                     use_container_width=True)
 
     # ── VOC tables (read-only reference) ─────────────────────────────────────
     for _model, _title in (("stop_start", "urban stop-start (Table 3.9)"),
@@ -2267,6 +2322,22 @@ with tab_params:
             _voc = PARAMS["voc"][_model]
             st.dataframe(pd.DataFrame(_voc).rename_axis("Speed (km/h)"),
                          use_container_width=True)
+    with st.expander("VOC per stop ($/stop)"):
+        st.caption("Used only when VOC from stops is on in Setup. LCV uses the EPV light "
+                   "truck; HCV and Bus the heavy truck.")
+        param_table("voc_stop", {
+            (_label, "$/stop"): (f"param_voc_stop_{_vt}", PARAMS["voc_per_stop"][_vt])
+            for _vt, _label in _VT_ROWS
+        }, unit="$ per stop, incl. fuel", fmt="%.4f", max_val=20.0,
+            source="EPV 2026.1 Table 3.14")
+
+    with st.expander("Asset lives (years, read-only)"):
+        st.caption("Economic life by asset class, for the residual value asset life "
+                   "(Inputs → Costs). Source: EPV 2026.1 Table 12.1 (ATAP 2018, TfNSW).")
+        st.dataframe(pd.DataFrame(
+            [{"Asset class": a, "Life (years)": f"{lo}" if lo == hi else f"{lo}–{hi}"}
+             for a, lo, hi in ASSET_LIVES]), hide_index=True, use_container_width=True)
+
     st.caption("VOC: TfNSW depreciation-adjusted resource-cost models. Car = medium car; LCV = "
                "courier van/utility and 4WD; HCV = all rigid, articulated and combination "
                "trucks; LCV and HCV weighted by the EPV vehicle mix (Table 3.19).")
@@ -2330,6 +2401,9 @@ with tab_about:
          "approximation because the EPV gives rural VOC only as REVS model parameters. Car is a "
          "medium car; LCV, HCV and bus use their EPV vehicle classes weighted by the EPV vehicle "
          "mix. Speeds outside 20–110 km/h use the table's end value (flagged on Results). "
+         "Optionally (Setup, off by default), the change in stops × EPV VOC per stop (Table "
+         "3.14) is added — only where stops change without a matching change in speed, as the "
+         "speed-based models already reflect typical stopping. "
          "Source: TfNSW EPV 2026.1 Tables 3.9, 3.10 and 3.19."),
         ("Reliability", "reliability", "indigo",
          "A proxy: travel time savings × reliability ratio (1.0, TfNSW recommended, EPV "
@@ -2352,7 +2426,10 @@ with tab_about:
          "Benefits from additional walking or cycling induced by the project, "
          f"valued at the NSW Health rates (walking ${PARAMS['health_benefits']['walking']:.2f}/km; "
          f"cycling ${PARAMS['health_benefits']['cycling']:.2f}/km). "
-         "This component is zero unless walking or cycling km are entered. "
+         "The share of those km that replaces car trips also earns the EPV savings for "
+         "former car users (decongestion, VOC, crashes, externalities, road provision, "
+         "parking; walking $1.15/km, cycling $1.25/km) — leave it at 0% if the traffic model "
+         "already removes those car trips. No travel time value, per TfNSW. "
          "Source: TfNSW EPV 2026.1 Table 7.1."),
         ("Road damage savings", "road_damage", "brown",
          "Change in VKT × TfNSW road maintenance cost per vehicle-km (EPV 2026.1 Table 8.1: "
@@ -2373,6 +2450,8 @@ with tab_about:
         ("Residual value", "residual", "brown",
          "Remaining value of the assets at the end of the appraisal period, credited at the "
          "end of the final year (discounted one year further than that year's other flows). "
+         "The asset life can be filled from EPV Table 12.1 (e.g. asphalt pavement 30–40 "
+         "years, concrete bridges 120). "
          "Land keeps its full value; construction (including its share of "
          "contingency) depreciates straight-line over the asset life; planning and design "
          "have none. A manual residual value overrides the calculation."),

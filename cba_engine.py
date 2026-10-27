@@ -236,6 +236,27 @@ PARAMS = {
                        'Nature and landscape': 4.5156,
                        'Urban effects': 0.0,
                        'Biodiversity': 0.0}}},
+    # VOC per stop including fuel, $/stop: EPV Table 3.14 (Car = car; LCV = light
+    # truck; HCV and Bus = heavy truck). Only used when stop VOC is switched on: the
+    # speed-based models already reflect typical stopping, so adding it can double count.
+    "voc_per_stop": {"Car": 0.1056, "LCV": 0.4229, "HCV": 1.1562, "Bus": 1.1562},
+    # Savings per km of walking or cycling by former car users, $/km: EPV Table 7.1
+    # (decongestion, VOC, crashes, externalities, road provision, parking). TfNSW does
+    # not recommend a travel time cost or saving for active transport.
+    "active_car_savings": {
+        "walking": {"Congestion cost savings": 0.5097, "Vehicle operating cost savings": 0.3474,
+                    "Accident cost": 0.1573, "Air pollution": 0.011,
+                    "WTT emissions and pollutions": 0.0055, "Noise": 0.0086,
+                    "Soil and water": 0.0037, "Nature and landscape": 0.002,
+                    "Urban effects": 0.0065, "Biodiversity": 0.0009,
+                    "Roadway provision cost savings": 0.0829, "Parking cost savings": 0.0187},
+        "cycling": {"Congestion cost savings": 0.5097, "Vehicle operating cost savings": 0.2881,
+                    "Accident cost": 0.3132, "Air pollution": 0.011,
+                    "WTT emissions and pollutions": 0.0055, "Noise": 0.0086,
+                    "Soil and water": 0.0037, "Nature and landscape": 0.002,
+                    "Urban effects": 0.0065, "Biodiversity": 0.0009,
+                    "Roadway provision cost savings": 0.0829, "Parking cost savings": 0.0187},
+    },
     # Active transport health benefits, $/km: EPV Table 7.1 (NSW Ministry of Health)
     "health_benefits": {'walking': 5.6924, 'cycling': 3.2264},
     # Reliability ratio: TfNSW recommended value 1.0 (EPV Table 11.8)
@@ -376,6 +397,19 @@ CARBON_VALUES = {
          2050: 317.64},
     },
 }
+
+
+# Economic life of assets, years: EPV Table 12.1 (label, low, high), for the
+# residual value asset life. Ranges are shown as published; the tool suggests the midpoint.
+ASSET_LIVES = [
+    ("Road pavement – asphalt", 30, 40), ("Road pavements – concrete", 60, 80),
+    ("Earthworks", 50, 150), ("Bridges – concrete", 120, 120), ("Bridges – timber", 40, 40),
+    ("Tunnels", 100, 100), ("Culverts", 100, 120), ("Bus priority schemes", 20, 20),
+    ("Rail extensions, busways", 70, 70), ("Bus stops", 20, 20),
+    ("Interchanges, commuter parking facilities", 50, 50),
+    ("Depots, buildings (miscellaneous)", 40, 50), ("Plant and equipment (miscellaneous)", 12, 12),
+    ("Control centres (IT systems, excl. buildings)", 5, 5),
+]
 
 
 def carbon_value(basis: str, case: str, year: int) -> float:
@@ -777,6 +811,7 @@ def calculate_matrix(
     zero_growth_after_last_year = inputs.get("zero_growth_after_last_year", True)
     include_reliability = inputs.get("include_reliability", True)
     include_road_damage = inputs.get("include_road_damage", True)
+    include_stop_voc = inputs.get("include_stop_voc", False)
     carbon_basis = inputs.get("carbon_basis", "nsw")
 
     scn = scenario or {}
@@ -989,6 +1024,12 @@ def calculate_matrix(
                 # Total base VOC minus total project VOC; diverted share at 1.0x,
                 # generated share at 0.5x (same split as TTS)
                 voc_saving = annual_vkt_b * voc_b - annual_vkt_p * voc_p
+                if include_stop_voc:
+                    # Change in stops × EPV VOC per stop (Table 3.14)
+                    stops_b = _traffic(base_traffic[vt].get("stops", []), ey, eval_year)
+                    stops_p = _traffic(proj_traffic[vt].get("stops", []), ey, eval_year)
+                    voc_saving += ((stops_b - stops_p) * ann_factors[vt]
+                                   * _p["voc_per_stop"].get(vt, 0.0))
                 diverted_voc = voc_saving * (1.0 - gen_pct / 100.0)
                 generated_voc = voc_saving * (gen_pct / 100.0) * 0.5
 
@@ -1032,11 +1073,15 @@ def calculate_matrix(
             # ── Active Transport: incremental walking/cycling health benefits ─
             # Inputs are steady-state incremental person-km/day (project − base).
             # Formula mirrors cba-engine.js: pkm_day × $/person-km × 365.
+            # The share of those km that replaces car trips also earns the EPV
+            # savings for former car users (Table 7.1).
             _walk = cost.get("walk_pkm_day", 0.0)
             _cycle = cost.get("cycle_pkm_day", 0.0)
+            _car_share = (cost.get("active_car_share_pct", 0.0) or 0.0) / 100.0
+            _car_sav = {m: sum(_p["active_car_savings"][m].values()) for m in ("walking", "cycling")}
             b_active = (
-                _walk * _p["health_benefits"]["walking"]
-                + _cycle * _p["health_benefits"]["cycling"]
+                _walk * (_p["health_benefits"]["walking"] + _car_share * _car_sav["walking"])
+                + _cycle * (_p["health_benefits"]["cycling"] + _car_share * _car_sav["cycling"])
             ) * 365 / 1e6
 
         if benefit_factor != 1.0:
