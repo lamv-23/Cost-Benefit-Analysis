@@ -112,16 +112,16 @@ DEFAULT_MODELLING_YEARS = [2026, 2031, 2041, 2056]
 
 
 TYPE_LABELS = {
-    "tts": "Travel Time Savings",
+    "tts": "Travel time savings",
     "reliability": "Reliability",
-    "voc": "Vehicle Operating Costs",
+    "voc": "Vehicle operating costs",
     "safety": "Safety",
     "env": "Environmental",
-    "active": "Active Transport",
-    "avoided_costs": "Avoided Base Case Costs",
-    "upfront_carbon": "Upfront Carbon Emissions",
-    "construction_disruption": "Construction Disruption",
-    "residual": "Residual Value",
+    "active": "Active transport",
+    "avoided_costs": "Avoided base case costs",
+    "upfront_carbon": "Upfront carbon emissions",
+    "construction_disruption": "Construction disruption",
+    "residual": "Residual value",
 }
 
 

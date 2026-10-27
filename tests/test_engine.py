@@ -480,7 +480,7 @@ def test_csv_sections():
     summary = appraisal_summary(central, cost)
     text = generate_csv(central, "Test project", summary, rows)
     assert "TfNSW required sensitivity tests" in text
-    assert "Avoided Base Case Costs" in text
+    assert "Avoided base case costs" in text
     assert "P90 capital cost" in text
     assert "P50 outturn capital (nominal $M)" in text
     assert "395.0" in text

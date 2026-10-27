@@ -189,14 +189,18 @@ Mapping is defined in `VTYPE_MAP` constant.
 - **Widget keys set by code** (`_load_sample_data`, project load, `_init_session_state` write-back) must be set before those widgets render: the project name box is filled after the uploader via `_name_slot`; both sample buttons (sidebar and Results empty state) use the `_request_sample` callback, which sets `_sample_requested`, handled at the top of the script (it also sets the name to "Sample Road Upgrade" and un-ticks `confirm_load_sample`; a new session is "Untitled project"); never call `_init_session_state()` mid-run
 - **Restorable widgets**: use `key=` with no `value=`/`index=`, and set the default in `_init_session_state` (written back every run so an early `st.rerun()` can't reset it); never assign a widget's key after it renders
 - **File uploader** returns the file on every run — apply each upload once (guarded by `_loaded_project_id` / `file_id`)
-- **Tabs**: Inputs (sub-tabs 1 · Setup / 2 · Traffic / 3 · Costs) → Results → Cashflow → Sensitivity → Parameters → About. Main tabs are pill-styled via CSS on `div[data-baseweb="tab-list"]`; sub-tabs inside a `tab-panel` are styled plain
+- **Tabs**: Inputs (sub-tabs 1 · Setup / 2 · Traffic / 3 · Costs) → Results → Cashflow → Sensitivity → Parameters → About. Main tabs are pill-styled via CSS on `div[data-baseweb="tab-list"]`; sub-tabs inside a `tab-panel` are plain underlined; a third level (Traffic: VHT / VKT / Demand / Crashes / [Safety rates] / Benefit assumptions; Costs: Capital and other / Recurrent by year) is styled as small segmented buttons. Tabs keep long inputs to one screen; every tab's content still runs each rerun, so edits persist
 - **Explanations**: one plain sentence (`st.caption`) per tab and section; longer detail goes in `help=` tooltips or collapsed expanders
 - Data entry via `st.data_editor` (supports paste-from-Excel)
 - Parameters tab: one editable table per group via `param_table()`; its `on_change` callback writes `param_*` keys (the tab renders after the calculation), and table keys carry `_ptbl_ver`, bumped on edit, reset and project load so tables redraw from session values. Saves keep only `param_*` values (`_is_param_value_key`), not old `_num`/`_sl` widget keys
-- Generated demand and active transport inputs are stored in `cost_data` but shown on Inputs → Traffic (Benefit assumptions, `render_benefit_assumptions()`)
-- Traffic change tables: for VHT, VKT and stops a reduction is green (improvement); demand is uncoloured
+- Generated demand and active transport inputs are stored in `cost_data` but shown on Inputs → Traffic → Benefit assumptions (`render_benefit_assumptions()`)
+- Recurrent costs: one `st.data_editor` with a row per year and a column per case (base case + options), tall enough to show every year; paste a column from Excel
+- Traffic change tables (Option − Base) end with a Total row; for VHT, VKT and stops a reduction is green (improvement); demand is uncoloured. There is no traffic summary on Results
 - Pinned Streamlit 1.47.1 does not accept `width="stretch"` on `st.dataframe`/`st.data_editor`; keep `use_container_width=True` until the pin is raised (the deprecation warnings only appear on newer local installs)
 - Result cards: NPV and BCR only (`st.metric()`), at the top of the Results tab; two options per row when comparing. IRR/FYRR/payback are still computed by the engine but not shown as cards
+- Results charts: one horizontal NPV waterfall (green adds, red subtracts, blue totals; lines rounding to $0.0M are named in a caption), then annual net cashflow and cumulative discounted net benefits. Benefit-type colours are not used on Results
+- Labels are sentence case everywhere (widgets, headings, chart titles, table columns, `TYPE_LABELS`); case names stay "Base Case" / "Option N"
+- Cashflow table: Net follows Benefits and Year is pinned, so both stay in view; Save project is disabled until `_has_inputs()`
 - Sensitivity: the TfNSW required test table is shown; every other analysis is a collapsed expander
 - Charts: Plotly with transparent background for Streamlit theme compatibility
 
@@ -243,7 +247,7 @@ python3 -m pytest tests -q
 ```
 
 - `tests/test_engine.py` — unit tests of `cba_engine` (cost schedule, PV lines, required sensitivity rows, summary, CSV, project-file validation).
-- `tests/test_app_smoke.py` — headless `AppTest` runs of `app.py`: load sample (`confirm_load_sample` checkbox, then the "Load Sample Data" button), change periods, two options, save/load, sensitivity table, results summary, empty-state sample button. Use `AppTest.from_file("app.py", default_timeout=300)`.
+- `tests/test_app_smoke.py` — headless `AppTest` runs of `app.py`: load sample (`confirm_load_sample` checkbox, then `at.button(key="sidebar_load_sample")`; both sample buttons are labelled "Load sample project", so find them by key), change periods, two options, save/load, sensitivity table, results summary, empty-state sample button. Use `AppTest.from_file("app.py", default_timeout=300)`.
 - AppTest can't drive uploads/downloads: use `_capture_saves()` / `_open_in_fresh_app()` in `tests/test_app_smoke.py` (they monkeypatch `streamlit.download_button` / `file_uploader`)
 - Startup check: `streamlit run app.py` must load without errors.
 - Manual checks in `plan.md` still apply for new calculation features (unit chains for TTS, VOC, CO₂; CAGR interpolation).
