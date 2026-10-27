@@ -192,7 +192,7 @@ bus. Weights are EPV Table 3.19.
 - Generated demand and active transport inputs are stored in `cost_data` but shown on Inputs → Traffic → Benefit assumptions (`render_benefit_assumptions()`)
 - Recurrent costs: one `st.data_editor` with a row per year and a column per case (base case + options), tall enough to show every year; paste a column from Excel
 - Traffic change tables (Option − Base) end with a Total row; for VHT and VKT a reduction is green (improvement); demand is uncoloured. There is no traffic summary on Results
-- Pinned Streamlit 1.47.1 does not accept `width="stretch"` on `st.dataframe`/`st.data_editor`; keep `use_container_width=True` until the pin is raised (the deprecation warnings only appear on newer local installs)
+- Streamlit is pinned to 1.50.0, the last release that supports Python 3.9 (local) as well as 3.12 (Cloud). Use `width="stretch"` on `st.dataframe`, `st.data_editor`, `st.button` and `st.download_button`; `st.plotly_chart` has no `width` in 1.50, so keep `use_container_width=True` there. Moving past 1.50 needs Python 3.10+ locally
 - Result cards: NPV and BCR only (`st.metric()`), at the top of the Results tab; two options per row when comparing. IRR/FYRR/payback are still computed by the engine but not shown as cards
 - Results charts: one horizontal NPV waterfall (green adds, red subtracts, blue totals; lines that are exactly zero are named in a caption; bar labels use `signed_m`, which switches to $B like `format_m`), then annual net cashflow and cumulative discounted net benefits. Benefit-type colours are not used on Results
 - Labels are sentence case everywhere (widgets, headings, chart titles, table columns, `TYPE_LABELS`); case names stay "Base Case" / "Option N"
