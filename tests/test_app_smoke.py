@@ -42,8 +42,11 @@ def _app_with_sample():
 
 def test_sample_data_runs():
     at = _app_with_sample()
-    assert _metric(at, "PV Costs")
+    assert _metric(at, "Net Present Value")
     assert _metric(at, "Benefit-Cost Ratio") == "1.69"
+    labels = [m.label for m in at.metric]
+    assert "Internal Rate of Return" not in labels
+    assert "First Year Rate of Return" not in labels
     assert _metric(at, "P50 capital ($M, real)") == "$350.0M"
     assert _metric(at, "P90 capital ($M, real)") == "$383.0M"
     cost = at.session_state["cost_data"]["project_1"]
@@ -129,6 +132,18 @@ def test_empty_project_no_errors():
     assert not at.exception
     assert not at.error
     assert _metric(at, "P50 capital ($M, real)") == "$0.0M"
+
+
+def test_empty_state_loads_sample():
+    """With nothing entered the Results tab offers the sample; the button loads it."""
+    at = AppTest.from_file(APP_PATH, default_timeout=300).run()
+    assert not [m for m in at.metric if m.label == "Benefit-Cost Ratio"]
+    [btn] = [b for b in at.button if b.label == "Load sample project"]
+    btn.click().run()
+    assert not at.exception
+    assert at.session_state["const_years"] == 3
+    assert _metric(at, "Benefit-Cost Ratio") == "1.69"
+    assert not [b for b in at.button if b.label == "Load sample project"]
 
 
 def test_save_load_round_trip_keeps_periods(monkeypatch):
