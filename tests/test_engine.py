@@ -5,7 +5,7 @@ import pytest
 
 from cba_engine import (
     PARAMS, VTYPES, appraisal_summary, build_cost_schedule, calculate_matrix, clean_row,
-    fit_cost_rows, generate_csv,
+    fit_cost_rows, format_summary_value, generate_csv,
     interpolate_modelling_years, make_base_case_costs, make_cost_data,
     run_required_sensitivities, validate_project_file,
 )
@@ -491,3 +491,15 @@ def test_csv_sections():
         < text.index("TfNSW required sensitivity tests") < text.index("Cashflow by year")
     # one cashflow row per year
     assert text.count("\n") >= central["total_years"] + len(rows)
+
+
+def test_summary_screen_format():
+    """On screen: $M to 1 dp with separators, BCR to 2 dp, outturn exactly as entered."""
+    out = "P50 outturn capital (nominal $M)"
+    assert format_summary_value(out, 395.25, screen=True) == "395.25"
+    assert format_summary_value(out, "not entered", screen=True) == "not entered"
+    assert format_summary_value("PV costs ($M)", 1234.56, screen=True) == "1,234.6"
+    assert format_summary_value("BCR", 1.6904, screen=True) == "1.69"
+    # The CSV keeps its precision
+    assert format_summary_value("PV costs ($M)", 1234.56) == "1234.56"
+    assert format_summary_value("BCR", 1.6904) == "1.690"
