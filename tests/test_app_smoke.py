@@ -4,6 +4,7 @@ import io
 import json
 import os
 
+import pytest
 import streamlit
 from streamlit.elements.lib import policies
 from streamlit.testing.v1 import AppTest
@@ -43,7 +44,7 @@ def _app_with_sample():
 def test_sample_data_runs():
     at = _app_with_sample()
     assert _metric(at, "Net present value")
-    assert _metric(at, "Benefit-cost ratio") == "1.82"
+    assert _metric(at, "Benefit-cost ratio") == "2.79"
     labels = [m.label for m in at.metric]
     assert "Internal Rate of Return" not in labels
     assert "First Year Rate of Return" not in labels
@@ -124,7 +125,7 @@ def test_sample_resets_periods():
     assert at.session_state["const_years"] == 3
     assert at.session_state["eval_period"] == 30
     assert at.session_state["construction_start_year"] == 2026
-    assert _metric(at, "Benefit-cost ratio") == "1.82"
+    assert _metric(at, "Benefit-cost ratio") == "2.79"
 
 
 def test_empty_project_no_errors():
@@ -142,7 +143,7 @@ def test_empty_state_loads_sample():
     btn.click().run()
     assert not at.exception
     assert at.session_state["const_years"] == 3
-    assert _metric(at, "Benefit-cost ratio") == "1.82"
+    assert _metric(at, "Benefit-cost ratio") == "2.79"
     assert not [b for b in at.button if b.key == "empty_load_sample"]
 
 
@@ -318,23 +319,23 @@ def test_new_session_is_untitled_and_sample_sets_name():
 def test_parameter_override_changes_result_and_is_listed():
     at = _app_with_sample()
     central = _metric(at, "Benefit-cost ratio")
-    at.session_state["param_vtts_urban_Car"] = 30.0
+    at.session_state["param_vtt_urban_Car"] = 50.0
     at.run()
     assert not at.exception
     assert _metric(at, "Benefit-cost ratio") != central
-    assert any("Changed from default" in c.value and "Car Urban: 19.76 → 30" in c.value
+    assert any("Changed from default" in c.value and "Car Urban: 37.7532 → 50" in c.value
                for c in at.caption)
 
 
 def test_save_keeps_parameter_values_not_widget_keys(monkeypatch):
     saved = _capture_saves(monkeypatch)
     at = _app_with_sample()
-    at.session_state["param_vtts_urban_Car"] = 30.0
-    at.session_state["param_vtts_urban_Car_num"] = 30.0  # left by older versions
+    at.session_state["param_vtt_urban_Car"] = 50.0
+    at.session_state["param_vtt_urban_Car_num"] = 50.0  # left by older versions
     at.run()
     data = json.loads(saved[-1])
-    assert data["param_vtts_urban_Car"] == 30.0
-    assert "param_vtts_urban_Car_num" not in data
+    assert data["param_vtt_urban_Car"] == 50.0
+    assert "param_vtt_urban_Car_num" not in data
 
 
 def test_benefit_assumptions_on_traffic_tab():
@@ -351,7 +352,7 @@ def test_opening_project_clears_earlier_parameter_changes(monkeypatch):
     at = _app_with_sample()
     payload = saved[-1]
     assert not [k for k in json.loads(payload) if k.startswith("param_")]
-    at.session_state["param_vtts_urban_Car"] = 30.0
+    at.session_state["param_vtt_urban_Car"] = 50.0
     at.run()
     changed = _metric(at, "Benefit-cost ratio")
 
@@ -366,8 +367,8 @@ def test_opening_project_clears_earlier_parameter_changes(monkeypatch):
     monkeypatch.setattr(streamlit, "file_uploader", upload_once)
     at.run()
     assert not at.exception
-    assert "param_vtts_urban_Car" not in at.session_state
-    assert _metric(at, "Benefit-cost ratio") == "1.82" != changed
+    assert "param_vtt_urban_Car" not in at.session_state
+    assert _metric(at, "Benefit-cost ratio") == "2.79" != changed
 
 
 def test_new_session_defaults_for_growth_and_benefit_lines():
@@ -382,7 +383,7 @@ def test_reliability_switch_changes_result():
     [rel] = [c for c in at.checkbox if c.label == "Reliability benefits"]
     rel.uncheck().run()
     assert not at.exception
-    assert _metric(at, "Benefit-cost ratio") == "1.60"
+    assert _metric(at, "Benefit-cost ratio") == "2.38"
 
 
 def test_bcr_shows_dash_without_costs():
@@ -402,9 +403,48 @@ def test_old_general_safety_file_keeps_its_rates(monkeypatch):
     """A file saved in General safety mode used the Parameters rates for every case."""
     saved = _capture_saves(monkeypatch)
     _app_with_sample()
-    data = json.loads(saved[-1])
+    data = _as_june_2024_file(json.loads(saved[-1]))
     data["safety_mode"] = "General"
     data["param_safety_vkt_Car"] = 0.2
     fresh = _open_in_fresh_app(monkeypatch, json.dumps(data), file_id="old-general-1")
     svd = fresh.session_state["safety_vkt_data"]
     assert svd["base_case"]["Car"] == 0.2 and svd["project_1"]["Car"] == 0.2
+    assert fresh.session_state["sv_road_project_1"] == "custom"
+
+
+def _as_june_2024_file(data):
+    """A saved project as written before June 2026 prices (no price year or road types)."""
+    data.pop("price_year", None)
+    for k in [k for k in data if k.startswith("sv_road_")]:
+        del data[k]
+    return data
+
+
+def test_june_2024_file_is_flagged_and_indexed(monkeypatch):
+    saved = _capture_saves(monkeypatch)
+    _app_with_sample()
+    data = _as_june_2024_file(json.loads(saved[-1]))
+    data["param_health_walking"] = 3.17  # a June 2024 parameter change
+    fresh = _open_in_fresh_app(monkeypatch, json.dumps(data), file_id="june-2024-1")
+    assert fresh.session_state["_price_year_pending"] == 2024
+    assert "param_health_walking" not in fresh.session_state
+    before = fresh.session_state["cost_data"]["project_1"]["capex_base"]["construction"][0]
+    [btn] = [b for b in fresh.button if b.key == "index_costs_2026"]
+    btn.click().run()
+    assert not fresh.exception
+    after = fresh.session_state["cost_data"]["project_1"]["capex_base"]["construction"][0]
+    assert after == pytest.approx(before * 145.82243724226805 / 137.25)
+    assert "_price_year_pending" not in fresh.session_state
+
+
+def test_safety_road_type_sets_epv_rate():
+    at = _app_with_sample()
+    at.selectbox(key="sv_road_project_1").set_value("urban_divided").run()
+    assert not at.exception
+    # 61.86 crashes per 100 MVKT × $154,147.29 per crash (NSW-funded, urban)
+    assert at.session_state["safety_vkt_data"]["project_1"]["Car"] == pytest.approx(
+        61.86 / 1e8 * 154147.29)
+    [funding] = [r for r in at.radio if r.label == "Funding"]
+    funding.set_value("joint").run()
+    assert at.session_state["safety_vkt_data"]["project_1"]["Car"] == pytest.approx(
+        61.86 / 1e8 * 187044.82)

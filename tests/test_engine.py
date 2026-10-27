@@ -21,12 +21,14 @@ INPUTS = {
     "discount_base_year": 2026,
 }
 ANNUALISATION = {vt: {"factor": 1.0, "days": 1} for vt in VTYPES}
+# Fixed crash cost rates ($/VKT) for the safety mechanics tests
+SAFETY_RATES = {"Car": 0.153, "LCV": 0.098, "HCV": 0.198, "Bus": 0.167}
 
 
 def _run(base, proj, sv_proj=None, cost_overrides=None):
     cost = make_cost_data(1, 2, 30)["project_1"]
     cost.update(cost_overrides or {})
-    sv_base = dict(PARAMS["safety_vkt"])
+    sv_base = dict(SAFETY_RATES)
     sv_p = dict(sv_base)
     if sv_proj:
         sv_p.update(sv_proj)
@@ -46,7 +48,8 @@ def _car(vht, vkt):
 
 def test_voc_uses_total_cost_difference():
     fy = _run(_car([1000, 1000], [60000, 60000]), _car([750, 750], [60000, 60000]))
-    assert _dollars(fy["voc"]) == 720.0
+    # 60,000 vkt at 60 km/h (0.2473 $/km) vs 80 km/h (0.2453 $/km)
+    assert _dollars(fy["voc"]) == pytest.approx(60000 * (0.2473 - 0.2453))
 
 
 def test_safety_uses_rate_difference():
@@ -64,7 +67,8 @@ def test_disbenefit_not_clamped():
     base = make_case_traffic(YEARS, HCV={"vht": [100, 100], "vkt": [8000, 8000]})
     proj = make_case_traffic(YEARS, HCV={"vht": [120, 120], "vkt": [8000, 8000]})
     fy = _run(base, proj)
-    assert _dollars(fy["tts"]) == -987.6
+    # 20 more heavy-vehicle hours at the rural EPV value of $65.4297 per vehicle-hour
+    assert _dollars(fy["tts"]) == pytest.approx(-20 * 65.4297, abs=0.01)
 
 
 def test_interpolation_from_zero():
@@ -195,12 +199,12 @@ def test_central_costs_and_lines():
     assert r["pv_costs"] == pytest.approx(13.6)
     assert r["pv_by_type"]["recurrent_savings"] == pytest.approx(0.0)
     assert r["recurrent_is_saving"] is False
-    # 1000 t split 8/13 and 5/13 over 2026/2027 at NSW central $131 and $133
-    assert r["pv_by_type"]["upfront_carbon"] == pytest.approx(
-        -(1000 * 8 / 13 * 131 + 1000 * 5 / 13 * 133) / 1e6)
+    # 1000 t split 8/13 and 5/13 over 2026/2027 at NSW central $139.66 and $141.79
+    upfront = -(1000 * 8 / 13 * 139.66 + 1000 * 5 / 13 * 141.79) / 1e6
+    assert r["pv_by_type"]["upfront_carbon"] == pytest.approx(upfront)
     assert r["pv_by_type"]["residual"] == pytest.approx(11.109091, abs=1e-6)
-    assert r["pv_benefits"] == pytest.approx(10.977322, abs=1e-6)
-    assert r["bcr"] == pytest.approx(0.807156, abs=1e-6)
+    assert r["pv_benefits"] == pytest.approx(11.109091 + upfront, abs=1e-6)
+    assert r["bcr"] == pytest.approx((11.109091 + upfront) / 13.6, abs=1e-6)
     assert r["capital_p50_total"] == pytest.approx(13.0)
     assert r["capital_p90_total"] == pytest.approx(15.0)
     assert "pavement" not in r["benefits_by_type"]
@@ -231,13 +235,13 @@ def test_validate_project_file():
 def test_carbon_sensitivity_includes_upfront_carbon():
     r = _run_costs()
     rows = r["sensitivity_carbon"]
-    nsw = -(1000 * 8 / 13 * 131 + 1000 * 5 / 13 * 133) / 1e6
-    national = -(1000 * 8 / 13 * 76 + 1000 * 5 / 13 * 88) / 1e6
+    nsw = -(1000 * 8 / 13 * 139.66 + 1000 * 5 / 13 * 141.79) / 1e6
+    national = -(1000 * 8 / 13 * 84.11 + 1000 * 5 / 13 * 97.4) / 1e6
+    assert list(rows) == ["NSW central", "NSW high", "National central", "National low"]
     assert rows["NSW central"]["core"] is True
     assert rows["NSW central"]["pvb"] == pytest.approx(r["pv_benefits"])
     # no traffic, so only the upfront carbon is revalued
     assert rows["National central"]["pvb"] == pytest.approx(r["pv_benefits"] - nsw + national)
-    assert rows["EPV flat ($123/t)"]["pvb"] == pytest.approx(r["pv_benefits"] - nsw - 0.123)
     assert r["bcr_national_carbon"] == pytest.approx(rows["National central"]["bcr"])
 
 
@@ -311,9 +315,9 @@ def test_scenario_delay_1():
     r = _run_scenario({"delay_years": 1})
     # net recurrent 0, 0, −0.3, +0.2, +0.2, +0.2 (base filled with its median 0.8)
     assert r["pv_costs"] == pytest.approx(13.3)
-    # upfront carbon moves to 2027/2028 ($133 and $137)
+    # upfront carbon moves to 2027/2028 ($141.79 and $146.06)
     assert r["pv_benefits"] == pytest.approx(
-        11.109091 - (1000 * 8 / 13 * 133 + 1000 * 5 / 13 * 137) / 1e6, abs=1e-6)
+        11.109091 - (1000 * 8 / 13 * 141.79 + 1000 * 5 / 13 * 146.06) / 1e6, abs=1e-6)
     assert r["total_years"] == 6
 
 
@@ -579,8 +583,8 @@ def test_road_damage_maintenance_share():
     base = make_case_traffic(YEARS, HCV={"vht": [100, 100], "vkt": [3_000_000, 3_000_000]})
     proj = make_case_traffic(YEARS, HCV={"vht": [100, 100], "vkt": [1_000_000, 1_000_000]})
     r = _run_with(traffic=(base, proj))
-    # 2,000,000 fewer heavy vkt × 18.151 c × 46% maintenance share, 3 operating years
-    per_year = 2_000_000 * 18.151 / 100 * 0.46 / 1e6
+    # 2,000,000 fewer heavy vkt × 19.2843 c × 46% maintenance share, 3 operating years
+    per_year = 2_000_000 * 19.2843 / 100 * 0.46 / 1e6
     assert r["benefits_by_type"]["road_damage"] == pytest.approx(
         [0.0, 0.0, per_year, per_year, per_year])
     off = _run_with(inputs={"include_road_damage": False}, traffic=(base, proj))
@@ -591,10 +595,10 @@ def test_operating_carbon_valued_at_each_years_carbon_value():
     base = make_case_traffic(YEARS, Car={"vht": [20_000, 20_000], "vkt": [2_000_000, 2_000_000]})
     proj = make_case_traffic(YEARS, Car={"vht": [10_000, 10_000], "vkt": [1_000_000, 1_000_000]})
     r = _run_with(traffic=(base, proj))
-    t_per_vkt = PARAMS["emission_cost"]["rural"]["car"] / PARAMS["carbon_per_tonne"]
-    # 1,000,000 fewer car vkt in 2028, 2029, 2030 at NSW central $137, $146, $164
+    t_per_vkt = PARAMS["carbon_t_per_vkt"]["Car"]
+    # 1,000,000 fewer car vkt in 2028, 2029, 2030 at NSW central $146.06, $155.65, $174.84
     assert r["annual_env_emit"][2:] == pytest.approx(
-        [1e6 * t_per_vkt * price / 1e6 for price in (137, 146, 164)])
+        [1e6 * t_per_vkt * price / 1e6 for price in (146.06, 155.65, 174.84)])
 
 
 def test_emission_factor_change_scales_operating_carbon():
@@ -604,8 +608,8 @@ def test_emission_factor_change_scales_operating_carbon():
     p["emission_factor_change_pct"] = -5.0
     central = _run_with(traffic=(base, proj))
     falling = _run_with(traffic=(base, proj), params=p)
-    # 2028 is four years after the 2024 factors
-    assert falling["annual_env_emit"][2] == pytest.approx(central["annual_env_emit"][2] * 0.95 ** 4)
+    # 2028 is two years after the FY2026 factors
+    assert falling["annual_env_emit"][2] == pytest.approx(central["annual_env_emit"][2] * 0.95 ** 2)
 
 
 def test_zero_growth_after_last_modelling_year_is_default():
@@ -627,9 +631,68 @@ def test_delay_fills_base_recurrent_with_median():
 
 
 def test_voc_speed_out_of_range_flagged():
-    # 20 km/h, below the rural VOC table's 60 km/h minimum
-    base = make_case_traffic(YEARS, Car={"vht": [1000, 1000], "vkt": [20000, 20000]})
-    proj = make_case_traffic(YEARS, Car={"vht": [500, 500], "vkt": [20000, 20000]})
+    # 10 km/h, below the VOC tables' 20 km/h minimum; the option's 20 km/h is in range
+    base = make_case_traffic(YEARS, Car={"vht": [2000, 2000], "vkt": [20000, 20000]})
+    proj = make_case_traffic(YEARS, Car={"vht": [1000, 1000], "vkt": [20000, 20000]})
     r = _run_with(traffic=(base, proj))
     lo, hi = r["voc_speed_out_of_range"]["Car"]
-    assert lo == pytest.approx(20.0) and hi == pytest.approx(40.0)
+    assert lo == pytest.approx(10.0) and hi == pytest.approx(10.0)
+
+
+# ── EPV 2026.1 parameters ────────────────────────────────────────────────────
+
+def test_crash_cost_per_vkt_from_epv():
+    from cba_engine import crash_cost_per_vkt
+    # Table 5.5 rate per 100 MVKT × Table 3.18 cost per crash
+    assert crash_cost_per_vkt("urban", "divided", "nsw") == pytest.approx(61.86 / 1e8 * 154147.29)
+    assert crash_cost_per_vkt("rural", "single", "joint") == pytest.approx(27.6 / 1e8 * 393010.25)
+
+
+def test_carbon_values_epv_2026():
+    from cba_engine import carbon_value
+    assert carbon_value("nsw", "central", 2026) == pytest.approx(139.66)
+    assert carbon_value("nsw", "central", 2060) == pytest.approx(373.13)   # held after 2050
+    assert carbon_value("national", "central", 2030) == pytest.approx(163.8)
+
+
+def test_index_costs_and_price_year():
+    from cba_engine import CPI_JUNE_2024_TO_2026, index_costs, project_price_year
+    cost, base = fixture_costs()
+    cost["outturn_p50_nominal"] = 395.0
+    cost["construction_disbenefit_annual"] = 0.2
+    data = {"project_1": cost}
+    index_costs(data, base, CPI_JUNE_2024_TO_2026)
+    f = 145.82243724226805 / 137.25
+    assert cost["capex_base"]["construction"] == pytest.approx([4.0 * f, 4.0 * f])
+    assert cost["contingency_p90"] == pytest.approx([2.0 * f, 2.0 * f])
+    assert base["recurrent"][2] == pytest.approx(0.8 * f)
+    assert cost["construction_disbenefit_annual"] == pytest.approx(0.2 * f)
+    assert cost["outturn_p50_nominal"] == 395.0          # nominal, not indexed
+    assert cost["upfront_carbon_t"] == 1000.0            # tonnes, not indexed
+    assert project_price_year({}) == 2024
+    assert project_price_year({"price_year": 2026}) == 2026
+
+
+def test_voc_model_follows_road_type():
+    # Car at 40 km/h in both cases; the option is 20% shorter
+    base = make_case_traffic(YEARS, Car={"vht": [1000, 1000], "vkt": [40000, 40000]})
+    proj = make_case_traffic(YEARS, Car={"vht": [800, 800], "vkt": [32000, 32000]})
+    urban = {"context": "urban"}
+    ss = _run_with(inputs=urban, traffic=(base, proj))
+    fw = _run_with(inputs={**urban, "voc_road_type": "freeway"}, traffic=(base, proj))
+    # 8,000 fewer vkt at 40 km/h: stop-start 0.3777 $/km, freeway 0.2627 $/km
+    assert ss["benefits_by_type"]["voc"][2] == pytest.approx(8000 * 0.3777 / 1e6)
+    assert fw["benefits_by_type"]["voc"][2] == pytest.approx(8000 * 0.2627 / 1e6)
+
+
+def test_bus_has_its_own_rates():
+    assert PARAMS["voc"]["stop_start"]["Bus"][40] == pytest.approx(1.5795)
+    assert PARAMS["externality_cents_vkt"]["urban"]["Bus"] == pytest.approx(29.9058)
+    assert PARAMS["vtt_vehicle_hr"]["urban"]["Bus"] == pytest.approx(498.0528)
+
+
+def test_vsl_sensitivity_follows_funding():
+    nsw = _run_with()
+    joint = _run_with(inputs={"funding": "joint"})
+    assert "Central ($7.3M)" in nsw["sensitivity_vsl"]
+    assert "Central ($9.7M)" in joint["sensitivity_vsl"]

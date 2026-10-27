@@ -1,8 +1,8 @@
 """
 Transport CBA calculation engine (Streamlit-free).
 
-Parameters based on TfNSW Economic Parameter Values (January 2025)
-All monetary values in June 2024 prices (AUD)
+Parameters from TfNSW Economic Parameter Values 2026.1 (July 2026).
+All monetary values in June 2026 prices (AUD).
 """
 from __future__ import annotations
 
@@ -13,135 +13,367 @@ import json
 import math
 import statistics
 
+# Price base of every parameter and of the cost inputs
+PRICE_YEAR = 2026
+PRICE_LABEL = "June 2026"
+# CPI Sydney (ABS A2325806K, EPV Table A4.1): June 2024 137.25, June 2026 145.822,
+# used to index projects saved in June 2024 dollars to June 2026
+CPI_JUNE_2024_TO_2026 = 145.82243724226805 / 137.25
+
 # ─────────────────────────────────────────────────────────────────────────────
-# TfNSW ECONOMIC PARAMETER VALUES (Jan 2025, June 2024 prices)
+# TfNSW ECONOMIC PARAMETER VALUES 2026.1 (July 2026, June 2026 prices)
 # ─────────────────────────────────────────────────────────────────────────────
 PARAMS = {
-    # Value of travel time savings $/person-hr, by vehicle type.
-    # Car/Bus use commute rate (personal travel); LCV/HCV use business rate (freight/commercial).
-    # Source: TfNSW EPV Jan 2025, Table 3
-    "vtts": {
-        "urban": {"Car": 19.76, "LCV": 54.87, "HCV": 54.87, "Bus": 19.76},
-        "rural": {"Car": 17.78, "LCV": 49.38, "HCV": 49.38, "Bus": 17.78},
+    # Value of travel time, $ per vehicle-hour, by vehicle type: EPV Table 2.2 (urban)
+    # and Table 2.3 (rural) averages, weighted by vehicle mix; they include the
+    # private/business car split, freight value for trucks and bus passengers (20).
+    "vtt_vehicle_hr": {
+        "urban": {'Car': 37.7532, 'LCV': 46.2869, 'HCV': 76.7079, 'Bus': 498.0528},
+        "rural": {'Car': 45.4085, 'LCV': 46.2855, 'HCV': 65.4297, 'Bus': 490.5889},
     },
-    # Vehicle occupancy (persons/vehicle). Multiplied by VHT saving to convert
-    # vehicle-hours to person-hours before applying the per-person VTTS.
-    # Car/Bus urban: 2014/15 HTS (Sydney), rural: ATAP 2016 PV2 pp. 16-19.
-    # LCV: commercial driver (occasionally one passenger); HCV: driver only.
-    # Bus: typical all-day average load (urban route / rural coach).
-    # Source: TfNSW EPV Jan 2025, Tables 2.4 & 2.5; ATAP 2016 PV2
-    "occupancy": {
-        "urban": {"Car": 1.14, "LCV": 1.1, "HCV": 1.0, "Bus": 13.0},
-        "rural": {"Car": 1.58, "LCV": 1.1, "HCV": 1.0, "Bus": 10.0},
-    },
-    "voc": {
-        "urban": {
-            "car":   {40: 0.268, 50: 0.241, 60: 0.224, 70: 0.215, 80: 0.212, 90: 0.215, 100: 0.224},
-            "lgv":   {40: 0.323, 50: 0.296, 60: 0.281, 70: 0.273, 80: 0.271, 90: 0.276, 100: 0.287},
-            "rigid": {40: 0.602, 50: 0.553, 60: 0.523, 70: 0.508, 80: 0.505, 90: 0.513, 100: 0.534},
-            "artic": {40: 0.836, 50: 0.768, 60: 0.726, 70: 0.705, 80: 0.700, 90: 0.711, 100: 0.740},
-        },
-        "rural": {
-            "car":   {60: 0.210, 80: 0.198, 100: 0.209, 110: 0.221},
-            "lgv":   {60: 0.265, 80: 0.255, 100: 0.268, 110: 0.282},
-            "rigid": {60: 0.493, 80: 0.475, 100: 0.502, 110: 0.526},
-            "artic": {60: 0.685, 80: 0.660, 100: 0.697, 110: 0.731},
-        },
-    },
-    "safety_vkt": {
-        "Car": 0.153,
-        "LCV": 0.098,
-        "HCV": 0.198,
-        "Bus": 0.167,
-    },
-    # Proportion of blended safety_vkt rate attributable to each crash severity class.
-    # Used to isolate the fatal component for VSL sensitivity testing.
-    # Source: TfNSW EPV Jan 2025 crash unit costs × NSW crash rate distribution.
+    # Vehicle operating cost, $/km by average speed (km/h): TfNSW depreciation-
+    # adjusted resource-cost models, EPV Table 3.9 (urban stop-start) and Table 3.10
+    # (urban freeway). Car = medium car; LCV = courier van utility and 4WD; HCV =
+    # all rigid, articulated and combination trucks; Bus = heavy bus; LCV and HCV
+    # weighted by the EPV vehicle mix (Table 3.19, urban). Rural roads use the
+    # freeway model weighted by the regional mix (an approximation: the EPV gives
+    # rural VOC only as REVS model parameters).
+    "voc": {'stop_start': {'Car': {20: 0.5287,
+                            30: 0.428,
+                            40: 0.3777,
+                            50: 0.3474,
+                            60: 0.3273,
+                            70: 0.3129,
+                            80: 0.3021,
+                            90: 0.2937,
+                            100: 0.287,
+                            110: 0.2815},
+                    'LCV': {20: 0.6989,
+                            30: 0.5571,
+                            40: 0.4862,
+                            50: 0.4437,
+                            60: 0.4153,
+                            70: 0.3951,
+                            80: 0.3799,
+                            90: 0.3681,
+                            100: 0.3586,
+                            110: 0.3509},
+                    'HCV': {20: 1.5665,
+                            30: 1.3518,
+                            40: 1.2445,
+                            50: 1.1801,
+                            60: 1.1371,
+                            70: 1.1065,
+                            80: 1.0835,
+                            90: 1.0656,
+                            100: 1.0513,
+                            110: 1.0395},
+                    'Bus': {20: 2.2388,
+                            30: 1.7992,
+                            40: 1.5795,
+                            50: 1.4476,
+                            60: 1.3597,
+                            70: 1.2969,
+                            80: 1.2498,
+                            90: 1.2132,
+                            100: 1.1839,
+                            110: 1.1599}},
+     'freeway': {'Car': {20: 0.2916,
+                         30: 0.2754,
+                         40: 0.2627,
+                         50: 0.2533,
+                         60: 0.2473,
+                         70: 0.2446,
+                         80: 0.2453,
+                         90: 0.2493,
+                         100: 0.2567,
+                         110: 0.2675},
+                 'LCV': {20: 0.359,
+                         30: 0.3445,
+                         40: 0.3338,
+                         50: 0.3269,
+                         60: 0.3238,
+                         70: 0.3245,
+                         80: 0.329,
+                         90: 0.3374,
+                         100: 0.3495,
+                         110: 0.3654},
+                 'HCV': {20: 0.732,
+                         30: 0.696,
+                         40: 0.673,
+                         50: 0.663,
+                         60: 0.666,
+                         70: 0.682,
+                         80: 0.711,
+                         90: 0.7529,
+                         100: 0.8079,
+                         110: 0.8758},
+                 'Bus': {20: 0.9882,
+                         30: 0.9338,
+                         40: 0.8918,
+                         50: 0.8623,
+                         60: 0.8452,
+                         70: 0.8404,
+                         80: 0.8481,
+                         90: 0.8683,
+                         100: 0.9008,
+                         110: 0.9458}},
+     'rural': {'Car': {20: 0.2916,
+                       30: 0.2754,
+                       40: 0.2627,
+                       50: 0.2533,
+                       60: 0.2473,
+                       70: 0.2446,
+                       80: 0.2453,
+                       90: 0.2493,
+                       100: 0.2567,
+                       110: 0.2675},
+               'LCV': {20: 0.359,
+                       30: 0.3445,
+                       40: 0.3338,
+                       50: 0.3269,
+                       60: 0.3238,
+                       70: 0.3245,
+                       80: 0.329,
+                       90: 0.3374,
+                       100: 0.3495,
+                       110: 0.3654},
+               'HCV': {20: 0.914,
+                       30: 0.8725,
+                       40: 0.846,
+                       50: 0.8344,
+                       60: 0.8378,
+                       70: 0.8561,
+                       80: 0.8894,
+                       90: 0.9376,
+                       100: 1.0008,
+                       110: 1.079},
+               'Bus': {20: 0.9882,
+                       30: 0.9338,
+                       40: 0.8918,
+                       50: 0.8623,
+                       60: 0.8452,
+                       70: 0.8404,
+                       80: 0.8481,
+                       90: 0.8683,
+                       100: 0.9008,
+                       110: 0.9458}}},
+    # Default crash cost per vkt = crash rate (EPV Table 5.5, crashes per 100 MVKT,
+    # by environment and carriageway) × average cost per crash (Table 3.18,
+    # NSW-funded or jointly funded). Each case's rates are set on the Traffic tab.
+    "crash_rate_per_100mvkt": {'rural': {'divided': 26.6, 'single': 27.6}, 'urban': {'divided': 61.86, 'single': 82.49}},
+    "cost_per_crash": {'joint': {'rural': 393010.25, 'urban': 187044.82},
+     'nsw': {'rural': 311070.52, 'urban': 154147.29}},
+    # Proportion of crash costs that are fatal, used only for the VSL sensitivity
+    # (tool assumption, not from the EPV).
     "safety_severity_share": {
         "fatal": 0.36, "serious": 0.30, "minor": 0.20, "pdo": 0.14,
     },
-    "vsl": 8_100_000,
-    # Carbon shadow price used as the basis for emission_cost values below.
-    # Source: TfNSW EPV Jan 2025 (June 2024 prices): $123/tCO₂e.
-    # NOTE: NSW Treasury TPG24-34 mandates the NSW government carbon value;
-    # as of June 2025 this was $135.74/tCO₂e. Verify against the EPV Excel
-    # tool and update emission_cost proportionally if a newer EPV is adopted.
-    # ATAP PV5 (2024) uses a separate target-consistent schedule (starts at
-    # $56/tCO₂e in 2024 rising to $377 by 2050) — not applicable here.
-    "carbon_per_tonne": 123,
-    "air_pollution": {
-        "urban": {"car": 0.032, "lgv": 0.045, "rigid": 0.179, "artic": 0.228},
-        "rural": {"car": 0.005, "lgv": 0.007, "rigid": 0.028, "artic": 0.036},
-    },
-    "noise": {
-        "urban": {"car": 0.005, "lgv": 0.005, "rigid": 0.037, "artic": 0.037},
-        "rural": {"car": 0.001, "lgv": 0.001, "rigid": 0.006, "artic": 0.006},
-    },
-    "health_benefits": {"walking": 3.17, "cycling": 1.60},
-    "reliability_ratio": 0.9,
-    "reliability_ratio_freight": 0.6,  # LCV/HCV — lower than passenger per TfNSW EPV
+    # Value of a statistical life (EPV Table 5.1): NSW values for NSW-funded
+    # projects, ATAP-based values for jointly funded projects
+    "vsl": {'atap': 9701634.38, 'nsw': 7275000},
+    # Operating carbon, tonnes CO2-e per vkt: EPV Table 6.2 (car, bus) and Table 6.3
+    # (LCV, HV) cents/vkt at the FY2026 core carbon value $139.66/t
+    "carbon_t_per_vkt": {'Car': 0.00018214, 'LCV': 0.00026429, 'HCV': 0.00062143, 'Bus': 0.00083928},
+    # Other externalities (air pollution, well-to-tank, noise, soil and water,
+    # nature and landscape, urban effects, biodiversity), cents/vkt: EPV Tables
+    # 6.5/6.6 (car, bus) and 6.7/6.8 (LCV, HV), urban and rural
+    "externality_cents_vkt": {'urban': {'Car': 3.8164, 'LCV': 6.2268, 'HCV': 25.7204, 'Bus': 29.9058},
+     'rural': {'Car': 2.5559, 'LCV': 2.7098, 'HCV': 11.8995, 'Bus': 7.2736}},
+    "externality_breakdown_cents_vkt": {'urban': {'Car': {'Air pollution': 1.0957,
+                       'WTT emissions and pollutions': 0.5504,
+                       'Noise': 0.8633,
+                       'Soil and water': 0.3652,
+                       'Nature and landscape': 0.1992,
+                       'Urban effects': 0.653,
+                       'Biodiversity': 0.0896},
+               'LCV': {'Air pollution': 3.1211,
+                       'WTT emissions and pollutions': 0.6986,
+                       'Noise': 1.0957,
+                       'Soil and water': 0.498,
+                       'Nature and landscape': 0.1992,
+                       'Urban effects': 0.5755,
+                       'Biodiversity': 0.0387},
+               'HCV': {'Air pollution': 9.0423,
+                       'WTT emissions and pollutions': 2.2017,
+                       'Noise': 5.6556,
+                       'Soil and water': 3.9511,
+                       'Nature and landscape': 0.5312,
+                       'Urban effects': 2.9329,
+                       'Biodiversity': 1.4056},
+               'Bus': {'Air pollution': 13.7571,
+                       'WTT emissions and pollutions': 2.6462,
+                       'Noise': 6.0983,
+                       'Soil and water': 4.3274,
+                       'Nature and landscape': 0.4538,
+                       'Urban effects': 1.9147,
+                       'Biodiversity': 0.7083}},
+     'rural': {'Car': {'Air pollution': 0.01,
+                       'WTT emissions and pollutions': 0.5504,
+                       'Noise': 0.0089,
+                       'Soil and water': 0.0387,
+                       'Nature and landscape': 1.9479,
+                       'Urban effects': 0.0,
+                       'Biodiversity': 0.0},
+               'LCV': {'Air pollution': 0.0312,
+                       'WTT emissions and pollutions': 0.6986,
+                       'Noise': 0.01,
+                       'Soil and water': 0.0,
+                       'Nature and landscape': 1.97,
+                       'Urban effects': 0.0,
+                       'Biodiversity': 0.0},
+               'HCV': {'Air pollution': 0.9075,
+                       'WTT emissions and pollutions': 0.1778,
+                       'Noise': 0.0564,
+                       'Soil and water': 1.4056,
+                       'Nature and landscape': 5.2793,
+                       'Urban effects': 0.0,
+                       'Biodiversity': 4.0729},
+               'Bus': {'Air pollution': 0.0,
+                       'WTT emissions and pollutions': 2.6462,
+                       'Noise': 0.0609,
+                       'Soil and water': 0.0509,
+                       'Nature and landscape': 4.5156,
+                       'Urban effects': 0.0,
+                       'Biodiversity': 0.0}}},
+    # Active transport health benefits, $/km: EPV Table 7.1 (NSW Ministry of Health)
+    "health_benefits": {'walking': 5.6924, 'cycling': 3.2264},
+    # Reliability ratio: TfNSW recommended value 1.0 (EPV Table 11.8)
+    "reliability_ratio": 1.0,
+    "reliability_ratio_freight": 1.0,
     # Share of travel time savings attributed to reliability (proxy; no published
     # source verified). Reliability benefit = TTS × reliability ratio × this share.
     "reliability_share_of_tts": 0.3,
-    # Road damage: TfNSW EPV 2026.1 (July 2026) Table 8.1 unit cost of road
-    # maintenance, cents/vkt in June 2026 prices, deflated to June 2024 with CPI
-    # Sydney (A2325806K, EPV Table A4.1): 137.25 / 145.822 = 0.94122.
-    # Car = Cars and motorcycles; LCV = Light rigid (LCV); HCV = Sub-total heavy
-    # vehicles; Bus = Buses. EPV note: 46% of the cost is road repair and
-    # maintenance, 54% road provision, so only the maintenance share is counted.
-    "road_damage_cents_vkt": {"Car": 5.278, "LCV": 5.278, "HCV": 18.151, "Bus": 9.927},
+    # Road damage: EPV Table 8.1 unit cost of road maintenance, cents/vkt. Car =
+    # Cars and motorcycles; LCV = Light rigid (LCV); HCV = Sub-total heavy vehicles;
+    # Bus = Buses. EPV note: 46% of the cost is road repair and maintenance, 54%
+    # road provision, so only the maintenance share is counted.
+    "road_damage_cents_vkt": {'Car': 5.6076, 'LCV': 5.6076, 'HCV': 19.2843, 'Bus': 10.5468},
     "road_damage_maintenance_share": 0.46,
-    # Annual change (%) in emissions per vehicle-km from the 2024 EPV factors
+    # Annual change (%) in emissions per vehicle-km from the FY2026 EPV factors
     # (e.g. fleet electrification). 0 holds today's factors for the whole period.
     "emission_factor_change_pct": 0.0,
-    "working_days_per_year": 253,
-    "days_per_year": 365,
-    "traffic_composition": {
-        "urban": {"car": 0.84, "lgv": 0.08, "rigid": 0.05, "artic": 0.03},
-        "rural": {"car": 0.75, "lgv": 0.10, "rigid": 0.08, "artic": 0.07},
-    },
-    # Phase 0a: Emission cost per vehicle-km ($/veh-km), combining emission factor × carbon price
-    # Derived from NTC fleet-average emission factors × $123/tCO₂e (June 2024)
-    "emission_cost": {
-        "urban": {"car": 0.023, "lgv": 0.027, "rigid": 0.071, "bus": 0.101},
-        "rural": {"car": 0.007, "lgv": 0.009, "rigid": 0.022, "bus": 0.032},
-    },
 }
 
-def _carbon_schedule(first_year: int, values: list) -> dict:
-    return {first_year + i: float(v) for i, v in enumerate(values)}
 
-
-# Carbon values ($/tCO2-e) by financial year, from TfNSW "Implementation of NSW
-# Government Business Case Guidelines and Carbon", October 2025, Appendix.
-# NSW Carbon Values (NSW Treasury TPG24-34) are in $2024, matching the June 2024
-# prices used throughout; they form the core BCR. National Carbon Values
-# (Infrastructure Australia, Feb 2024) are in $2023 and are used as published.
-# Years before the first value use the first; years after 2050 hold the 2050 value.
+# Carbon values ($/tCO2-e, June 2026 $) by financial year: EPV Table 6.1 FY2026
+# core value $139.6586 × the Table 6.4 adjustment factors. NSW Carbon Values
+# (NSW Treasury TPG24-34) give the core BCR; National Carbon Values (Infrastructure
+# Australia) give the second BCR. Years after 2050 hold the 2050 value.
 CARBON_VALUES = {
     "nsw": {
-        "label": "NSW Carbon Values (TPG24-34, $2024)",
-        "low": _carbon_schedule(2025, [
-            90, 89, 88, 90, 96, 112, 141, 183, 225, 255, 270, 277, 278, 278, 276, 274,
-            272, 269, 267, 264, 262, 260, 257, 255, 252, 250]),
-        "central": _carbon_schedule(2025, [
-            130, 131, 133, 137, 146, 164, 196, 240, 284, 316, 334, 343, 347, 349, 350,
-            350, 350, 350, 350, 350, 350, 350, 350, 350, 350, 350]),
-        "high": _carbon_schedule(2025, [
-            230, 231, 233, 237, 246, 269, 313, 370, 426, 470, 501, 522, 538, 552, 565,
-            578, 590, 602, 614, 627, 639, 651, 663, 676, 688, 700]),
+        "label": "NSW Carbon Values (TPG24-34, June 2026 $)",
+        "central": {2024: 138.59,
+         2025: 138.59,
+         2026: 139.66,
+         2027: 141.79,
+         2028: 146.06,
+         2029: 155.65,
+         2030: 174.84,
+         2031: 208.95,
+         2032: 255.86,
+         2033: 302.77,
+         2034: 336.89,
+         2035: 356.08,
+         2036: 365.67,
+         2037: 369.94,
+         2038: 372.07,
+         2039: 373.13,
+         2040: 373.13,
+         2041: 373.13,
+         2042: 373.13,
+         2043: 373.13,
+         2044: 373.13,
+         2045: 373.13,
+         2046: 373.13,
+         2047: 373.13,
+         2048: 373.13,
+         2049: 373.13,
+         2050: 373.13},
+        "high": {2024: 245.2,
+         2025: 245.2,
+         2026: 246.27,
+         2027: 248.4,
+         2028: 252.66,
+         2029: 262.26,
+         2030: 286.78,
+         2031: 333.69,
+         2032: 394.46,
+         2033: 454.16,
+         2034: 501.07,
+         2035: 534.11,
+         2036: 556.5,
+         2037: 573.56,
+         2038: 588.49,
+         2039: 602.34,
+         2040: 616.2,
+         2041: 629.0,
+         2042: 641.79,
+         2043: 654.58,
+         2044: 668.44,
+         2045: 681.24,
+         2046: 694.03,
+         2047: 706.82,
+         2048: 720.68,
+         2049: 733.47,
+         2050: 746.27},
     },
     "national": {
-        "label": "National Carbon Values (Infrastructure Australia, $2023)",
-        "low": _carbon_schedule(2024, [
-            44, 56, 62, 69, 76, 87, 107, 124, 144, 159, 166, 172, 184, 191, 193, 206,
-            210, 212, 215, 228, 246, 267, 272, 274, 276, 284, 287]),
-        "central": _carbon_schedule(2024, [
-            56, 66, 76, 88, 104, 123, 148, 171, 192, 209, 222, 234, 244, 254, 264, 273,
-            282, 291, 300, 309, 318, 326, 335, 344, 354, 363, 377]),
-        "high": _carbon_schedule(2024, [
-            66, 77, 95, 107, 132, 152, 180, 210, 227, 258, 262, 280, 293, 308, 319, 329,
-            340, 351, 361, 370, 375, 380, 403, 421, 429, 437, 469]),
+        "label": "National Carbon Values (Infrastructure Australia, June 2026 $)",
+        "central": {2024: 61.98,
+         2025: 73.05,
+         2026: 84.11,
+         2027: 97.4,
+         2028: 115.1,
+         2029: 136.13,
+         2030: 163.8,
+         2031: 189.26,
+         2032: 212.5,
+         2033: 231.31,
+         2034: 245.7,
+         2035: 258.98,
+         2036: 270.05,
+         2037: 281.12,
+         2038: 292.19,
+         2039: 302.15,
+         2040: 312.11,
+         2041: 322.07,
+         2042: 332.03,
+         2043: 341.99,
+         2044: 351.95,
+         2045: 360.8,
+         2046: 370.77,
+         2047: 380.73,
+         2048: 391.79,
+         2049: 401.75,
+         2050: 417.25},
+        "low": {2024: 48.7,
+         2025: 61.98,
+         2026: 68.62,
+         2027: 76.37,
+         2028: 84.11,
+         2029: 96.29,
+         2030: 118.42,
+         2031: 137.24,
+         2032: 159.37,
+         2033: 175.98,
+         2034: 183.72,
+         2035: 190.36,
+         2036: 203.64,
+         2037: 211.39,
+         2038: 213.61,
+         2039: 227.99,
+         2040: 232.42,
+         2041: 234.63,
+         2042: 237.95,
+         2043: 252.34,
+         2044: 272.26,
+         2045: 295.51,
+         2046: 301.04,
+         2047: 303.25,
+         2048: 305.47,
+         2049: 314.32,
+         2050: 317.64},
     },
 }
 
@@ -152,16 +384,17 @@ def carbon_value(basis: str, case: str, year: int) -> float:
     return sched[min(max(year, min(sched)), max(sched))]
 
 
-# Phase 0b: Vehicle type mapping — UI labels to PARAMS internal keys
-# Note: Bus approximated as artic for VOC/air/noise externality rates
-VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "artic"}
+def crash_cost_per_vkt(environment: str, carriageway: str, funding: str = "nsw",
+                       params: dict | None = None) -> float:
+    """EPV default crash cost, $/vkt: crash rate (Table 5.5) × cost per crash (Table 3.18).
 
-# Separate mapping for emission_cost (uses "bus" key, not "artic")
-EMISSION_VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "bus"}
+    ``environment`` "urban"|"rural", ``carriageway`` "divided"|"single",
+    ``funding`` "nsw" (NSW-funded) or "joint" (NSW and federal).
+    """
+    p = params if params is not None else PARAMS
+    rate = p["crash_rate_per_100mvkt"][environment][carriageway] / 1e8
+    return rate * p["cost_per_crash"][funding][environment]
 
-# Separate mapping for air_pollution and noise (Bus approximated as "artic";
-# kept explicit here so a future change to VTYPE_MAP won't silently affect env calcs)
-AIR_NOISE_VTYPE_MAP = {"Car": "car", "LCV": "lgv", "HCV": "rigid", "Bus": "artic"}
 
 # Canonical vehicle type list for matrix inputs
 VTYPES = ["Car", "LCV", "HCV", "Bus"]
@@ -396,6 +629,31 @@ def validate_project_file(data: dict) -> str | None:
     return OLD_FILE_ERROR
 
 
+def project_price_year(data: dict) -> int:
+    """Price year of a saved project's costs; files saved before June 2026 prices were June 2024."""
+    return int(data.get("price_year", 2024))
+
+
+def index_costs(cost_data: dict, base_case_costs: dict, factor: float) -> None:
+    """Multiply every real-dollar cost input by ``factor`` in place (e.g. June 2024 → 2026).
+
+    Indexes capital rows, contingencies, recurrent rows (options and base case),
+    construction disruption and a manual residual value. Nominal outturn figures
+    and upfront carbon (tonnes) are not dollars in the appraisal price base, so
+    they are left alone.
+    """
+    for cost in cost_data.values():
+        for cat in cost.get("capex_base", {}):
+            cost["capex_base"][cat] = [v * factor for v in cost["capex_base"][cat]]
+        for key in ("contingency_p50", "contingency_p90", "recurrent"):
+            if key in cost:
+                cost[key] = [v * factor for v in cost[key]]
+        for key in ("construction_disbenefit_annual", "residual"):
+            if cost.get(key):
+                cost[key] = cost[key] * factor
+    base_case_costs["recurrent"] = [v * factor for v in base_case_costs.get("recurrent", [])]
+
+
 def discount_factor(rate: float, year: int) -> float:
     return 1.0 / math.pow(1 + rate / 100, year)
 
@@ -534,10 +792,11 @@ def calculate_matrix(
     # Annualisation: modelled-period VHT/VKT → annual (per vehicle type)
     ann_factors = {vt: annualisation[vt]["factor"] * annualisation[vt]["days"] for vt in VTYPES}
 
-    # VTTS by vehicle type ($/person-hr)
-    vtts_by_vtype = _p["vtts"][ctx]
-    # Occupancy (persons/vehicle): converts VHT savings (veh-hrs) → person-hours
-    occupancy_by_vtype = _p["occupancy"][ctx]
+    # Value of travel time, $ per vehicle-hour (EPV averages incl. occupancy and freight)
+    vtt_by_vtype = _p["vtt_vehicle_hr"][ctx]
+    funding = inputs.get("funding", "nsw")
+    # Urban roads use the stop-start or freeway VOC model; rural roads the rural table
+    voc_model = "rural" if ctx == "rural" else inputs.get("voc_road_type", "stop_start")
 
     # Yearly capital (P50) and recurrent cost schedule, real $M
     schedule = build_cost_schedule(
@@ -586,9 +845,7 @@ def calculate_matrix(
     residual = (cost["residual"] if (cost.get("residual", 0.0) or 0.0) > 0.0
                 else _auto_residual * cost_factor)
 
-    # Carbon: tonnes per vehicle-km come from the EPV emission costs (valued at
-    # the EPV flat price) and are revalued at the carbon value for each year.
-    _epv_carbon = _p["carbon_per_tonne"]
+    # Carbon: EPV tonnes per vehicle-km, valued at the carbon value for each year
     _emit_growth = _p.get("emission_factor_change_pct", 0.0) / 100.0
     _rd_rates = _p.get("road_damage_cents_vkt", {})
     _rd_share = _p.get("road_damage_maintenance_share", 1.0)
@@ -681,8 +938,8 @@ def calculate_matrix(
                 generated_vht = annual_vht_saving * (gen_pct / 100.0)
 
                 # Calculate TTS for diverted (1.0x VTTS) and generated (0.5x VTTS)
-                diverted_tts = diverted_vht * occupancy_by_vtype[vt] * vtts_by_vtype[vt] / 1e6
-                generated_tts = generated_vht * occupancy_by_vtype[vt] * vtts_by_vtype[vt] * 0.5 / 1e6
+                diverted_tts = diverted_vht * vtt_by_vtype[vt] / 1e6
+                generated_tts = generated_vht * vtt_by_vtype[vt] * 0.5 / 1e6
 
                 vt_tts = diverted_tts + generated_tts
                 b_tts_by_vt[vt] = vt_tts
@@ -702,8 +959,7 @@ def calculate_matrix(
             # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
             # Rule-of-Half: split VKT delta into diverted and generated
             for vt in VTYPES:
-                param_vt = VTYPE_MAP[vt]
-                voc_table = _p["voc"][ctx].get(param_vt, {})
+                voc_table = _p["voc"][voc_model].get(vt, {})
                 if not voc_table:
                     continue
 
@@ -741,8 +997,10 @@ def calculate_matrix(
             # ── Safety: $/VKT per vehicle type (per-case rates) ─────────────
             # No Rule-of-Half: crash costs are counted on the full change in VKT,
             # including generated trips (ATAP T2 — Rule-of-Half applies to user benefits only)
-            _sv_base = safety_vkt_base if safety_vkt_base is not None else _p["safety_vkt"]
-            _sv_proj = safety_vkt_proj if safety_vkt_proj is not None else _p["safety_vkt"]
+            # Without per-case rates, both cases use the EPV single-carriageway default
+            _sv_default = {v: crash_cost_per_vkt(ctx, "single", funding, _p) for v in VTYPES}
+            _sv_base = safety_vkt_base if safety_vkt_base is not None else _sv_default
+            _sv_proj = safety_vkt_proj if safety_vkt_proj is not None else _sv_default
             for vt in VTYPES:
                 vkt_b = _traffic(base_traffic[vt]["vkt"], ey, eval_year)
                 vkt_p = _traffic(proj_traffic[vt]["vkt"], ey, eval_year)
@@ -753,22 +1011,19 @@ def calculate_matrix(
 
             # ── Environmental and road damage per vtype × VKT Δ ─────────────
             # No Rule-of-Half: externalities are counted on the full change in VKT.
-            # Operating carbon: EPV $/vkt ÷ EPV $/t = t/vkt, adjusted by the annual
-            # emission-factor change from 2024, valued at this year's carbon value.
-            _emit_scale = (1.0 + _emit_growth) ** (eval_year - 2024)
+            # Operating carbon: EPV t/vkt, adjusted by the annual emission-factor change
+            # from FY2026, valued at this year's carbon value. Other externalities are
+            # the EPV cents/vkt for this context.
+            _emit_scale = (1.0 + _emit_growth) ** (eval_year - 2026)
             for vt in VTYPES:
-                emit_vt = EMISSION_VTYPE_MAP[vt]
-                air_noise_vt = AIR_NOISE_VTYPE_MAP[vt]
-                t_per_vkt = (_p["emission_cost"][ctx].get(emit_vt, 0.0) / _epv_carbon
-                             * _emit_scale)
-                air_rate = _p["air_pollution"][ctx].get(air_noise_vt, 0.0)
-                noise_rate = _p["noise"][ctx].get(air_noise_vt, 0.0)
+                t_per_vkt = _p["carbon_t_per_vkt"][vt] * _emit_scale
+                ext_rate = _p["externality_cents_vkt"][ctx][vt] / 100.0
 
                 vkt_b = _traffic(base_traffic[vt]["vkt"], ey, eval_year)
                 vkt_p = _traffic(proj_traffic[vt]["vkt"], ey, eval_year)
                 vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
                 op_carbon_t += vkt_delta * t_per_vkt
-                b_env += vkt_delta * (air_rate + noise_rate) / 1e6
+                b_env += vkt_delta * ext_rate / 1e6
                 if include_road_damage:
                     b_road += vkt_delta * _rd_rates.get(vt, 0.0) / 100.0 * _rd_share / 1e6
             b_env_emit = op_carbon_t * carbon_price / 1e6
@@ -863,8 +1118,8 @@ def calculate_matrix(
     _carbon_rows = [
         (f"{_basis_label} {_case}", (lambda yr, b=_b, c=_case: carbon_value(b, c, yr)), _b, _case)
         for _b, _basis_label in (("nsw", "NSW"), ("national", "National"))
-        for _case in ("low", "central", "high")
-    ] + [(f"EPV flat (${_epv_carbon:g}/t)", (lambda yr: _epv_carbon), None, None)]
+        for _case in CARBON_VALUES[_b] if _case != "label"
+    ]
     for _label, _price_of, _b, _case in _carbon_rows:
         s_pvb = _carbon_pvb(_price_of)
         sensitivity_carbon[_label] = {
@@ -879,15 +1134,13 @@ def calculate_matrix(
     # VSL sensitivity: scale only the fatal crash cost component of safety benefits.
     # Fatal share (default 36%) of the blended safety_vkt rate is isolated in annual_safety_fatal.
     # Other severity classes (serious, minor, PDO) are held at base values.
-    # Source: TfNSW EPV Jan 2025 VSL = $8.1M; sensitivity range per ATAP T2.
-    _base_vsl_m = PARAMS["vsl"] / 1e6  # 8.1 ($M)
+    # Source: EPV Table 5.1 VSL (NSW value for NSW-funded, ATAP-based for jointly
+    # funded projects); sensitivity range per ATAP T2.
+    _base_vsl_m = _p["vsl"]["nsw" if funding == "nsw" else "atap"] / 1e6
     sensitivity_vsl = {}
-    for _label, _factor in [
-        ("Low (0.7×, $5.7M)", 0.7),
-        ("Central ($8.1M)", 1.0),
-        ("High (1.3×, $10.5M)", 1.3),
-        ("Very High (2.0×, $16.2M)", 2.0),
-    ]:
+    for _name, _factor in [("Low", 0.7), ("Central", 1.0), ("High", 1.3), ("Very high", 2.0)]:
+        _label = (f"{_name} (${_base_vsl_m * _factor:.1f}M)" if _factor == 1.0
+                  else f"{_name} ({_factor:g}×, ${_base_vsl_m * _factor:.1f}M)")
         s_pvb = pv_benefits + (_factor - 1.0) * _pv(annual_safety_fatal)
         sensitivity_vsl[_label] = {
             "pvb": s_pvb, "pvc": pv_costs,
@@ -1127,6 +1380,9 @@ def run_monte_carlo(
     cost_orig         = cost_data[case_key]
     sv_base_orig      = safety_vkt_data.get("base_case") if safety_vkt_data else None
     sv_proj_orig      = safety_vkt_data.get(case_key)    if safety_vkt_data else None
+    # Same fallback as calculate_matrix: EPV single-carriageway crash cost
+    _sv_default = {vt: crash_cost_per_vkt(inputs["context"], "single",
+                                          inputs.get("funding", "nsw"), _p_base) for vt in VTYPES}
 
     def _scale_capital(factor: float) -> dict:
         """Copy of the case costs with P50 construction capital scaled by ``factor``."""
@@ -1140,11 +1396,11 @@ def run_monte_carlo(
         p = copy.deepcopy(_p_base)
         for _ctx in ("urban", "rural"):
             for _vt in VTYPES:
-                p["vtts"][_ctx][_vt] *= vtts_factors[i]
+                p["vtt_vehicle_hr"][_ctx][_vt] *= vtts_factors[i]
 
         sf = safety_factors[i]
-        sv_base = {vt: (sv_base_orig[vt] if sv_base_orig else p["safety_vkt"][vt]) * sf for vt in VTYPES}
-        sv_proj = {vt: (sv_proj_orig[vt] if sv_proj_orig else p["safety_vkt"][vt]) * sf for vt in VTYPES}
+        sv_base = {vt: (sv_base_orig or _sv_default)[vt] * sf for vt in VTYPES}
+        sv_proj = {vt: (sv_proj_orig or _sv_default)[vt] * sf for vt in VTYPES}
 
         # ── Perturb traffic (same factor for base and project) ───────────────
         f_base = f_proj = traffic_factors[i]
@@ -1199,9 +1455,9 @@ def run_monte_carlo(
         _p = copy.deepcopy(_p_base)
         for _ctx in ("urban", "rural"):
             for _vt in VTYPES:
-                _p["vtts"][_ctx][_vt] *= vtts_f
-        _sv_b = {vt: (sv_base_orig[vt] if sv_base_orig else _p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
-        _sv_p = {vt: (sv_proj_orig[vt] if sv_proj_orig else _p_base["safety_vkt"][vt]) * safety_f for vt in VTYPES}
+                _p["vtt_vehicle_hr"][_ctx][_vt] *= vtts_f
+        _sv_b = {vt: (sv_base_orig or _sv_default)[vt] * safety_f for vt in VTYPES}
+        _sv_p = {vt: (sv_proj_orig or _sv_default)[vt] * safety_f for vt in VTYPES}
         _bt = _scale_traffic(base_traffic_orig, traffic_f)
         _pt = _scale_traffic(proj_traffic_orig, traffic_f)
         _c = _scale_capital(cost_f)
@@ -1253,11 +1509,16 @@ METHOD_NOTES = (
     "residual value is discounted from the end of the final year.",
     "Recurrent costs: net of the base case. A net increase is a cost; a net saving is the "
     "'Recurrent cost savings' benefit (TfNSW CBA Guide 2024, section 6.8).",
-    "Carbon: operating and upfront carbon valued at NSW Carbon Values (TPG24-34, $2024) by "
-    "year; a BCR with National Carbon Values ($2023, as published) is also reported.",
-    "Road damage: TfNSW EPV 2026.1 Table 8.1 deflated to June 2024 (CPI Sydney), "
-    "maintenance share only (46%).",
-    "Buses use articulated-truck VOC, air pollution and noise rates (no bus rates in the EPV tables used).",
+    "Parameters: TfNSW Economic Parameter Values 2026.1 (July 2026), June 2026 prices.",
+    "Travel time: EPV average value per vehicle-hour by vehicle type (Tables 2.2 urban, 2.3 rural).",
+    "VOC: TfNSW depreciation-adjusted resource-cost models (EPV Tables 3.9 stop-start, 3.10 "
+    "freeway); rural roads use the freeway model with the regional vehicle mix (approximation; "
+    "the EPV gives rural VOC only as REVS model parameters).",
+    "Carbon: operating and upfront carbon valued at NSW Carbon Values (TPG24-34) by year "
+    "(EPV Tables 6.1, 6.4); a BCR with National Carbon Values is also reported.",
+    "Safety: crash cost per vkt by case; EPV defaults = crash rate (Table 5.5) x cost per crash "
+    "(Table 3.18, NSW-funded or jointly funded).",
+    "Road damage: EPV Table 8.1, maintenance share only (46%).",
     "BCR shows '–' when PV costs are zero or negative (not defined); use NPV.",
 )
 
@@ -1267,7 +1528,7 @@ def appraisal_summary(result: dict, cost: dict) -> dict:
 
     The two outturn figures are nominal $M copied from ``cost`` exactly as
     entered (reporting only, never used in a calculation); a blank one shows
-    ``"not entered"``. Every other figure is real June 2024 dollars.
+    ``"not entered"``. Every other figure is real June 2026 dollars.
     """
     def _outturn(key: str):
         v = cost.get(key)
@@ -1319,7 +1580,7 @@ def generate_csv(results: dict, project_name: str, summary: dict,
     w.writerow(["Transport CBA Dashboard Export"])
     w.writerow(["Project", safe_name])
     w.writerow(["Discount Rate", f"{r['dr']}%"])
-    w.writerow(["All values are real June 2024 dollars, except the nominal outturn capital rows."])
+    w.writerow([f"All values are real {PRICE_LABEL} dollars, except the nominal outturn capital rows."])
     for note in METHOD_NOTES:
         w.writerow(["Method", note])
     w.writerow([])
