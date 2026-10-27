@@ -11,6 +11,7 @@ import csv
 import io
 import json
 import math
+import statistics
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TfNSW ECONOMIC PARAMETER VALUES (Jan 2025, June 2024 prices)
@@ -79,6 +80,20 @@ PARAMS = {
     "health_benefits": {"walking": 3.17, "cycling": 1.60},
     "reliability_ratio": 0.9,
     "reliability_ratio_freight": 0.6,  # LCV/HCV — lower than passenger per TfNSW EPV
+    # Share of travel time savings attributed to reliability (proxy; no published
+    # source verified). Reliability benefit = TTS × reliability ratio × this share.
+    "reliability_share_of_tts": 0.3,
+    # Road damage: TfNSW EPV 2026.1 (July 2026) Table 8.1 unit cost of road
+    # maintenance, cents/vkt in June 2026 prices, deflated to June 2024 with CPI
+    # Sydney (A2325806K, EPV Table A4.1): 137.25 / 145.822 = 0.94122.
+    # Car = Cars and motorcycles; LCV = Light rigid (LCV); HCV = Sub-total heavy
+    # vehicles; Bus = Buses. EPV note: 46% of the cost is road repair and
+    # maintenance, 54% road provision, so only the maintenance share is counted.
+    "road_damage_cents_vkt": {"Car": 5.278, "LCV": 5.278, "HCV": 18.151, "Bus": 9.927},
+    "road_damage_maintenance_share": 0.46,
+    # Annual change (%) in emissions per vehicle-km from the 2024 EPV factors
+    # (e.g. fleet electrification). 0 holds today's factors for the whole period.
+    "emission_factor_change_pct": 0.0,
     "working_days_per_year": 253,
     "days_per_year": 365,
     "traffic_composition": {
@@ -92,6 +107,50 @@ PARAMS = {
         "rural": {"car": 0.007, "lgv": 0.009, "rigid": 0.022, "bus": 0.032},
     },
 }
+
+def _carbon_schedule(first_year: int, values: list) -> dict:
+    return {first_year + i: float(v) for i, v in enumerate(values)}
+
+
+# Carbon values ($/tCO2-e) by financial year, from TfNSW "Implementation of NSW
+# Government Business Case Guidelines and Carbon", October 2025, Appendix.
+# NSW Carbon Values (NSW Treasury TPG24-34) are in $2024, matching the June 2024
+# prices used throughout; they form the core BCR. National Carbon Values
+# (Infrastructure Australia, Feb 2024) are in $2023 and are used as published.
+# Years before the first value use the first; years after 2050 hold the 2050 value.
+CARBON_VALUES = {
+    "nsw": {
+        "label": "NSW Carbon Values (TPG24-34, $2024)",
+        "low": _carbon_schedule(2025, [
+            90, 89, 88, 90, 96, 112, 141, 183, 225, 255, 270, 277, 278, 278, 276, 274,
+            272, 269, 267, 264, 262, 260, 257, 255, 252, 250]),
+        "central": _carbon_schedule(2025, [
+            130, 131, 133, 137, 146, 164, 196, 240, 284, 316, 334, 343, 347, 349, 350,
+            350, 350, 350, 350, 350, 350, 350, 350, 350, 350, 350]),
+        "high": _carbon_schedule(2025, [
+            230, 231, 233, 237, 246, 269, 313, 370, 426, 470, 501, 522, 538, 552, 565,
+            578, 590, 602, 614, 627, 639, 651, 663, 676, 688, 700]),
+    },
+    "national": {
+        "label": "National Carbon Values (Infrastructure Australia, $2023)",
+        "low": _carbon_schedule(2024, [
+            44, 56, 62, 69, 76, 87, 107, 124, 144, 159, 166, 172, 184, 191, 193, 206,
+            210, 212, 215, 228, 246, 267, 272, 274, 276, 284, 287]),
+        "central": _carbon_schedule(2024, [
+            56, 66, 76, 88, 104, 123, 148, 171, 192, 209, 222, 234, 244, 254, 264, 273,
+            282, 291, 300, 309, 318, 326, 335, 344, 354, 363, 377]),
+        "high": _carbon_schedule(2024, [
+            66, 77, 95, 107, 132, 152, 180, 210, 227, 258, 262, 280, 293, 308, 319, 329,
+            340, 351, 361, 370, 375, 380, 403, 421, 429, 437, 469]),
+    },
+}
+
+
+def carbon_value(basis: str, case: str, year: int) -> float:
+    """$/tCO2-e for ``year`` from the ``basis`` ("nsw"|"national") ``case`` schedule."""
+    sched = CARBON_VALUES[basis][case]
+    return sched[min(max(year, min(sched)), max(sched))]
+
 
 # Phase 0b: Vehicle type mapping — UI labels to PARAMS internal keys
 # Note: Bus approximated as artic for VOC/air/noise externality rates
@@ -117,8 +176,9 @@ TYPE_LABELS = {
     "voc": "Vehicle operating costs",
     "safety": "Safety",
     "env": "Environmental",
+    "road_damage": "Road damage savings",
     "active": "Active transport",
-    "avoided_costs": "Avoided base case costs",
+    "recurrent_savings": "Recurrent cost savings",
     "upfront_carbon": "Upfront carbon emissions",
     "construction_disruption": "Construction disruption",
     "residual": "Residual value",
@@ -246,10 +306,16 @@ def fit_cost_rows(costs: dict, const_years: int, eval_period: int) -> None:
 
 
 def _row_at(row: list, i: int) -> float:
-    """Value of ``row`` at index ``i``, repeating the last value past the end."""
+    """Value of ``row`` at index ``i``; past the end, the row's median.
+
+    Only the opening-delay tests reach past the end. The median stands for a
+    typical year, so a one-off renewal in the final year is not repeated.
+    """
     if not row:
         return 0.0
-    return float(row[i] if i < len(row) else row[-1])
+    if i < len(row):
+        return float(row[i])
+    return float(statistics.median(row))
 
 
 def build_cost_schedule(
@@ -332,6 +398,11 @@ def validate_project_file(data: dict) -> str | None:
 
 def discount_factor(rate: float, year: int) -> float:
     return 1.0 / math.pow(1 + rate / 100, year)
+
+
+def benefit_cost_ratio(pv_benefits: float, pv_costs: float) -> float | None:
+    """PV benefits ÷ PV costs, or ``None`` (not defined) when PV costs are zero or negative."""
+    return pv_benefits / pv_costs if pv_costs > 0 else None
 
 
 def interpolate_voc(voc_table: dict, speed: float) -> float:
@@ -424,9 +495,15 @@ def calculate_matrix(
                        ``benefit_factor`` (1.0), ``discount_rate`` (None: use
                        ``inputs["discount_rate"]``). ``None`` is the central case.
 
-    Costs per year are P50 capital + project recurrent. Avoided base case
-    recurrent costs, upfront carbon, construction disruption and residual value
-    are benefit lines (the last three usually negative or end-of-period).
+    Costs per year are P50 capital + net recurrent cost (option − base case) when
+    that is an increase in PV terms; a net saving is the "recurrent_savings"
+    benefit line instead. Upfront carbon, construction disruption and residual
+    value are benefit lines (the first two negative, the last at the end of the
+    final year). Carbon is valued at the ``carbon_basis`` central schedule.
+    ``inputs`` may also set ``zero_growth_after_last_year`` (default True),
+    ``include_reliability`` and ``include_road_damage`` (default True) and
+    ``carbon_basis`` ("nsw" default, or "national"). ``bcr`` is None when PV
+    costs are zero or negative.
 
     Returns:
         Result dict with the same keys as the legacy ``calculate()`` output so
@@ -438,7 +515,11 @@ def calculate_matrix(
     const_years = inputs["construction_years"]
     discount_base_year = inputs.get("discount_base_year", 2026)
     construction_start_year = inputs.get("construction_start_year", discount_base_year)
-    zero_growth_after_last_year = inputs.get("zero_growth_after_last_year", False)
+    # Traffic is held at the last modelling year by default rather than extrapolated
+    zero_growth_after_last_year = inputs.get("zero_growth_after_last_year", True)
+    include_reliability = inputs.get("include_reliability", True)
+    include_road_damage = inputs.get("include_road_damage", True)
+    carbon_basis = inputs.get("carbon_basis", "nsw")
 
     scn = scenario or {}
     scn_capital = scn.get("capital", "p50")
@@ -469,14 +550,32 @@ def calculate_matrix(
         for k in ("p50", "p90")
     )
     schedule["capital"] = [v * cost_factor for v in schedule["capital"]]
-    schedule["project_recurrent"] = [v * cost_factor for v in schedule["project_recurrent"]]
-    carbon_price = _p["carbon_per_tonne"]
+    total_years = delay + const_years + eval_period
+    # Start-of-year convention: discount exponent = eval_year - discount_base_year.
+    base_offset = construction_start_year - discount_base_year
+
+    # Recurrent costs are net (option − base case), scaled with costs in the cost
+    # tests. A net increase is a cost; a net saving is a benefit (TfNSW CBA Guide
+    # §6.8: cost savings are treated as a benefit). The side is set by the PV.
+    net_recurrent = [
+        (p - b) * cost_factor
+        for p, b in zip(schedule["project_recurrent"], schedule["base_recurrent"])
+    ]
+    pv_net_recurrent = sum(v * discount_factor(dr, base_offset + t)
+                           for t, v in enumerate(net_recurrent))
+    recurrent_is_saving = pv_net_recurrent < 0
+    recurrent_cost_row = [0.0] * total_years if recurrent_is_saving else list(net_recurrent)
+    recurrent_saving_row = ([-v for v in net_recurrent] if recurrent_is_saving
+                            else [0.0] * total_years)
+
     disruption_annual = cost.get("construction_disbenefit_annual", 0.0) or 0.0
     # Residual value: straight-line depreciation per ATAP T2 / TfNSW CBA Guidelines.
     # Land: full value retained (perpetual, no depreciation).
     # Construction (incl. attributed contingency): depreciated over construction_asset_life.
     # Planning/design: no residual (professional services, no physical asset).
     # Manual override: cost["residual"] > 0 takes precedence over auto-calculation.
+    # Valued at the end of the final appraisal year (discounted one year further
+    # than that year's other flows).
     _const_life = cost.get("construction_asset_life", 40)
     _remaining_frac = (
         max(0.0, (_const_life - eval_period) / _const_life) if _const_life > 0 else 0.0
@@ -487,8 +586,15 @@ def calculate_matrix(
     residual = (cost["residual"] if (cost.get("residual", 0.0) or 0.0) > 0.0
                 else _auto_residual * cost_factor)
 
+    # Carbon: tonnes per vehicle-km come from the EPV emission costs (valued at
+    # the EPV flat price) and are revalued at the carbon value for each year.
+    _epv_carbon = _p["carbon_per_tonne"]
+    _emit_growth = _p.get("emission_factor_change_pct", 0.0) / 100.0
+    _rd_rates = _p.get("road_damage_cents_vkt", {})
+    _rd_share = _p.get("road_damage_maintenance_share", 1.0)
+    _rel_share = _p.get("reliability_share_of_tts", 0.3)
+
     modelling_years = base_traffic["years"]
-    total_years = delay + const_years + eval_period
     open_idx = delay + const_years   # timeline index of the opening year (Y0)
     opening_year = construction_start_year + open_idx
 
@@ -513,10 +619,11 @@ def calculate_matrix(
     annual_capital: list = []
     annual_recurrent: list = []
     annual_benefits: list = []
-    annual_env_emit: list = []       # emission_cost component only (used for carbon sensitivity)
+    annual_env_emit: list = []       # operating-carbon component of env (carbon sensitivity)
     annual_safety_fatal: list = []   # fatal component of safety benefit (used for VSL sensitivity)
-    _line_keys = ("tts", "reliability", "voc", "safety", "env", "active",
-                  "avoided_costs", "upfront_carbon", "construction_disruption", "residual")
+    annual_carbon_t: list = []       # net tonnes saved: operating saving − upfront emitted
+    _line_keys = ("tts", "reliability", "voc", "safety", "env", "road_damage", "active",
+                  "recurrent_savings", "upfront_carbon", "construction_disruption", "residual")
     benefits_by_type: dict = {k: [] for k in _line_keys}
     for vt in VTYPES:
         benefits_by_type[f"tts_{vt}"] = []
@@ -525,31 +632,31 @@ def calculate_matrix(
     disc_benefits: list = []
     disc_net: list = []
     cum_disc_net: list = []
+    voc_out_of_range: dict = {}      # vtype → (min, max) average speed outside the VOC table
 
     pv_costs = 0.0
     pv_benefits = 0.0
     cum = 0.0
     payback_year = None
 
-    # Start-of-year convention: discount exponent = eval_year - discount_base_year.
-    # First operational year has DF = 1.0 when discount_base_year = construction_start_year + const_years.
-    base_offset = construction_start_year - discount_base_year
-
     for y in range(total_years):
         eval_year = construction_start_year + y
         discount_exp = base_offset + y
         df_factor = discount_factor(dr, discount_exp)
+        carbon_price = carbon_value(carbon_basis, "central", eval_year)
         # Clamp traffic eval year to last modelling year when zero-growth is selected
         ey = min(eval_year, modelling_years[-1]) if zero_growth_after_last_year else eval_year
         cap_y = schedule["capital"][y]
-        rec_y = schedule["project_recurrent"][y]
+        rec_y = recurrent_cost_row[y]
         cost_y = cap_y + rec_y
-        b_tts = b_rel = b_voc = b_safety = b_env = b_env_emit = b_active = 0.0
+        b_tts = b_rel = b_voc = b_safety = b_env = b_env_emit = b_active = b_road = 0.0
         b_safety_fatal = 0.0
+        op_carbon_t = 0.0
         b_tts_by_vt: dict = {vt: 0.0 for vt in VTYPES}
-        b_avoided = schedule["base_recurrent"][y]
+        b_recurrent = recurrent_saving_row[y]
         # Disbenefits (0.0 - x keeps zero years at +0.0, not -0.0)
-        b_carbon = 0.0 - schedule["upfront_carbon_t"][y] * carbon_price / 1e6
+        upfront_t = schedule["upfront_carbon_t"][y]
+        b_carbon = 0.0 - upfront_t * carbon_price / 1e6
         b_disruption = 0.0 - disruption_annual if schedule["construction_years"][y] else 0.0
         b_residual = residual if y == total_years - 1 else 0.0
 
@@ -581,17 +688,16 @@ def calculate_matrix(
                 b_tts_by_vt[vt] = vt_tts
                 b_tts += vt_tts
 
-            # Reliability benefit: per-vehicle-type TTS × reliability_ratio × 0.3.
-            # The 0.3 (30%) is the Austroads / TfNSW standard apportionment of
-            # travel-time savings attributable to reliability improvement.
-            # Passenger (Car, Bus): reliability_ratio (default 0.9, relative VTTS for reliability).
-            # Freight (LCV, HCV): reliability_ratio_freight (default 0.6) — lower per TfNSW EPV,
-            # reflecting that freight scheduling has less sensitivity to travel time variability.
+            # Reliability benefit (proxy): per-vehicle-type TTS × reliability ratio ×
+            # reliability_share_of_tts (default 0.3; no published source verified).
+            # Passenger (Car, Bus): reliability_ratio; freight (LCV, HCV):
+            # reliability_ratio_freight. Off when include_reliability is False.
             b_rel = 0.0
-            for vt in VTYPES:
-                _rr = (_p["reliability_ratio_freight"] if vt in ("LCV", "HCV")
-                       else _p["reliability_ratio"])
-                b_rel += b_tts_by_vt[vt] * _rr * 0.3
+            if include_reliability:
+                for vt in VTYPES:
+                    _rr = (_p["reliability_ratio_freight"] if vt in ("LCV", "HCV")
+                           else _p["reliability_ratio"])
+                    b_rel += b_tts_by_vt[vt] * _rr * _rel_share
 
             # ── VOC: per vehicle type, speed derived from VKT/VHT ──────────
             # Rule-of-Half: split VKT delta into diverted and generated
@@ -608,6 +714,12 @@ def calculate_matrix(
 
                 spd_b = vkt_b / vht_b if vht_b > 0 else 0.0
                 spd_p = vkt_p / vht_p if vht_p > 0 else 0.0
+                # Speeds outside the table are clamped to its end values; record them
+                _lo, _hi = min(voc_table), max(voc_table)
+                for _s in (spd_b, spd_p):
+                    if _s > 0 and (_s < _lo or _s > _hi):
+                        _seen = voc_out_of_range.get(vt, (_s, _s))
+                        voc_out_of_range[vt] = (min(_seen[0], _s), max(_seen[1], _s))
 
                 voc_b = interpolate_voc(voc_table, spd_b) if spd_b > 0 else 0.0
                 voc_p = interpolate_voc(voc_table, spd_p) if spd_p > 0 else 0.0
@@ -639,20 +751,28 @@ def calculate_matrix(
             # Fatal component: used for VSL sensitivity (scales this share ±, rest held fixed).
             b_safety_fatal = b_safety * _p["safety_severity_share"]["fatal"]
 
-            # ── Environmental: emission + air + noise per vtype × VKT Δ ────
-            # No Rule-of-Half: externalities are counted on the full change in VKT
+            # ── Environmental and road damage per vtype × VKT Δ ─────────────
+            # No Rule-of-Half: externalities are counted on the full change in VKT.
+            # Operating carbon: EPV $/vkt ÷ EPV $/t = t/vkt, adjusted by the annual
+            # emission-factor change from 2024, valued at this year's carbon value.
+            _emit_scale = (1.0 + _emit_growth) ** (eval_year - 2024)
             for vt in VTYPES:
                 emit_vt = EMISSION_VTYPE_MAP[vt]
                 air_noise_vt = AIR_NOISE_VTYPE_MAP[vt]
-                emit_rate = _p["emission_cost"][ctx].get(emit_vt, 0.0)
+                t_per_vkt = (_p["emission_cost"][ctx].get(emit_vt, 0.0) / _epv_carbon
+                             * _emit_scale)
                 air_rate = _p["air_pollution"][ctx].get(air_noise_vt, 0.0)
                 noise_rate = _p["noise"][ctx].get(air_noise_vt, 0.0)
 
                 vkt_b = _traffic(base_traffic[vt]["vkt"], ey, eval_year)
                 vkt_p = _traffic(proj_traffic[vt]["vkt"], ey, eval_year)
                 vkt_delta = (vkt_b - vkt_p) * ann_factors[vt]
-                b_env += vkt_delta * (emit_rate + air_rate + noise_rate) / 1e6
-                b_env_emit += vkt_delta * emit_rate / 1e6
+                op_carbon_t += vkt_delta * t_per_vkt
+                b_env += vkt_delta * (air_rate + noise_rate) / 1e6
+                if include_road_damage:
+                    b_road += vkt_delta * _rd_rates.get(vt, 0.0) / 100.0 * _rd_share / 1e6
+            b_env_emit = op_carbon_t * carbon_price / 1e6
+            b_env += b_env_emit
 
             # ── Active Transport: incremental walking/cycling health benefits ─
             # Inputs are steady-state incremental person-km/day (project − base).
@@ -665,7 +785,7 @@ def calculate_matrix(
             ) * 365 / 1e6
 
         if benefit_factor != 1.0:
-            # Scale transport benefits only; avoided costs, upfront carbon,
+            # Scale transport benefits only; recurrent cost savings, upfront carbon,
             # construction disruption and residual value are held fixed.
             b_tts *= benefit_factor
             b_rel *= benefit_factor
@@ -673,39 +793,45 @@ def calculate_matrix(
             b_safety *= benefit_factor
             b_env *= benefit_factor
             b_env_emit *= benefit_factor
+            b_road *= benefit_factor
             b_active *= benefit_factor
             b_safety_fatal *= benefit_factor
+            op_carbon_t *= benefit_factor
             for vt in VTYPES:
                 b_tts_by_vt[vt] *= benefit_factor
 
-        line_values = (b_tts, b_rel, b_voc, b_safety, b_env, b_active,
-                       b_avoided, b_carbon, b_disruption, b_residual)
+        line_values = (b_tts, b_rel, b_voc, b_safety, b_env, b_road, b_active,
+                       b_recurrent, b_carbon, b_disruption, b_residual)
         benefit_y = sum(line_values)
 
         net = benefit_y - cost_y
+        # The residual sits at the end of the final year: one more year of discounting
+        disc_benefit_y = ((benefit_y - b_residual) * df_factor
+                          + b_residual * discount_factor(dr, discount_exp + 1))
         annual_costs.append(cost_y)
         annual_capital.append(cap_y)
         annual_recurrent.append(rec_y)
         annual_benefits.append(benefit_y)
         annual_env_emit.append(b_env_emit)
         annual_safety_fatal.append(b_safety_fatal)
+        annual_carbon_t.append(op_carbon_t - upfront_t)
         for k, v in zip(_line_keys, line_values):
             benefits_by_type[k].append(v)
         for vt in VTYPES:
             benefits_by_type[f"tts_{vt}"].append(b_tts_by_vt[vt])
         annual_net.append(net)
         disc_costs.append(cost_y * df_factor)
-        disc_benefits.append(benefit_y * df_factor)
-        disc_net.append(net * df_factor)
+        disc_benefits.append(disc_benefit_y)
+        disc_net.append(disc_benefit_y - cost_y * df_factor)
         pv_costs += cost_y * df_factor
-        pv_benefits += benefit_y * df_factor
-        cum += net * df_factor
+        pv_benefits += disc_benefit_y
+        cum += disc_benefit_y - cost_y * df_factor
         cum_disc_net.append(cum)
         if payback_year is None and cum >= 0 and y >= open_idx:
             payback_year = y + 1
 
     npv = pv_benefits - pv_costs
-    bcr = pv_benefits / pv_costs if pv_costs > 0 else 0.0
+    bcr = benefit_cost_ratio(pv_benefits, pv_costs)
     first_op = open_idx if open_idx < total_years else 0
     # FYRR (First Year Rate of Return): net benefit in first operational year
     # expressed as a percentage of total undiscounted P50 capital cost.
@@ -714,37 +840,41 @@ def calculate_matrix(
     _first_op_net = annual_benefits[first_op] - annual_costs[first_op]
     fyrr = (_first_op_net / capital_p50_total * 100) if capital_p50_total > 0 else 0.0
 
-    def _pv(row: list) -> float:
-        return sum(row[y] * discount_factor(dr, base_offset + y) for y in range(total_years))
+    def _pv(row: list, shift: int = 0) -> float:
+        return sum(row[y] * discount_factor(dr, base_offset + y + shift) for y in range(total_years))
 
     pv_by_type = {t: _pv(benefits_by_type[t]) for t in benefits_by_type}
+    pv_by_type["residual"] = _pv(benefits_by_type["residual"], shift=1)
     pv_capital = _pv(annual_capital)
     pv_recurrent = _pv(annual_recurrent)
 
-    # Carbon price sensitivity: scale the emission_cost component of env benefits
-    # and the upfront (construction) carbon line.
-    # Base carbon price: $123/tCO₂e (TfNSW EPV Jan 2025, June 2024 prices).
-    # NSW Treasury TPG24-34 mandates $135.74/tCO₂e — included as a distinct scenario.
-    _base_carbon = PARAMS["carbon_per_tonne"]  # 123
-    sensitivity_carbon = {}
-    for _label, _factor in [
-        ("Low (0.5×, $62/t)", 0.5),
-        ("Central ($123/t)", 1.0),
-        (f"Treasury (${135.74}/t)", 135.74 / _base_carbon),
-        ("High (2.0×, $246/t)", 2.0),
-    ]:
-        s_pvb = sum(
-            (annual_benefits[y]
-             + (annual_env_emit[y] + benefits_by_type["upfront_carbon"][y]) * (_factor - 1.0))
+    # Carbon sensitivity: revalue the net tonnes (operating saving − upfront
+    # emitted) at each schedule; everything else is unchanged.
+    def _carbon_pvb(price_of) -> float:
+        return pv_benefits + sum(
+            annual_carbon_t[y]
+            * (price_of(construction_start_year + y)
+               - carbon_value(carbon_basis, "central", construction_start_year + y)) / 1e6
             * discount_factor(dr, base_offset + y)
             for y in range(total_years)
         )
+
+    sensitivity_carbon = {}
+    _carbon_rows = [
+        (f"{_basis_label} {_case}", (lambda yr, b=_b, c=_case: carbon_value(b, c, yr)), _b, _case)
+        for _b, _basis_label in (("nsw", "NSW"), ("national", "National"))
+        for _case in ("low", "central", "high")
+    ] + [(f"EPV flat (${_epv_carbon:g}/t)", (lambda yr: _epv_carbon), None, None)]
+    for _label, _price_of, _b, _case in _carbon_rows:
+        s_pvb = _carbon_pvb(_price_of)
         sensitivity_carbon[_label] = {
             "pvb": s_pvb, "pvc": pv_costs,
             "npv": s_pvb - pv_costs,
-            "bcr": s_pvb / pv_costs if pv_costs > 0 else 0.0,
-            "carbon_price": round(_base_carbon * _factor, 2),
+            "bcr": benefit_cost_ratio(s_pvb, pv_costs),
+            "basis": _b, "case": _case,
+            "core": _b == carbon_basis and _case == "central",
         }
+    bcr_national_carbon = sensitivity_carbon["National central"]["bcr"]
 
     # VSL sensitivity: scale only the fatal crash cost component of safety benefits.
     # Fatal share (default 36%) of the blended safety_vkt rate is isolated in annual_safety_fatal.
@@ -758,15 +888,11 @@ def calculate_matrix(
         ("High (1.3×, $10.5M)", 1.3),
         ("Very High (2.0×, $16.2M)", 2.0),
     ]:
-        s_pvb = sum(
-            (annual_benefits[y] + annual_safety_fatal[y] * (_factor - 1.0))
-            * discount_factor(dr, base_offset + y)
-            for y in range(total_years)
-        )
+        s_pvb = pv_benefits + (_factor - 1.0) * _pv(annual_safety_fatal)
         sensitivity_vsl[_label] = {
             "pvb": s_pvb, "pvc": pv_costs,
             "npv": s_pvb - pv_costs,
-            "bcr": s_pvb / pv_costs if pv_costs > 0 else 0.0,
+            "bcr": benefit_cost_ratio(s_pvb, pv_costs),
             "vsl": round(_base_vsl_m * _factor, 2),
         }
 
@@ -782,9 +908,13 @@ def calculate_matrix(
     # Source: TfNSW CBA framework; ATAP T2 §5.3 (supplementary).
     # Find the real discount rate (%) at which NPV = 0 via bisection.
     # Uses the same start-of-year, base_offset convention as the main calculation.
+    _res_row = benefits_by_type["residual"]
+
     def _npv_at_rate(r_pct: float) -> float:
         return sum(
-            (annual_benefits[y] - annual_costs[y]) * discount_factor(r_pct, base_offset + y)
+            (annual_benefits[y] - _res_row[y] - annual_costs[y])
+            * discount_factor(r_pct, base_offset + y)
+            + _res_row[y] * discount_factor(r_pct, base_offset + y + 1)
             for y in range(total_years)
         )
 
@@ -808,6 +938,13 @@ def calculate_matrix(
 
     return {
         "npv": npv, "bcr": bcr, "pv_benefits": pv_benefits, "pv_costs": pv_costs,
+        "bcr_without_reliability": benefit_cost_ratio(
+            pv_benefits - pv_by_type["reliability"], pv_costs),
+        "bcr_national_carbon": bcr_national_carbon,
+        "carbon_basis": carbon_basis,
+        "recurrent_is_saving": recurrent_is_saving,
+        "pv_net_recurrent": pv_net_recurrent,
+        "voc_speed_out_of_range": voc_out_of_range,
         "fyrr": fyrr, "fyrr_deferral_pass": fyrr_deferral_pass,
         "irr": irr,
         "payback_year": payback_year,
@@ -1038,10 +1175,10 @@ def run_monte_carlo(
             params=p,
         )
         npv_arr[i] = result["npv"]
-        bcr_arr[i] = result["bcr"]
+        bcr_arr[i] = np.nan if result["bcr"] is None else result["bcr"]
 
     p10_npv, p25_npv, p50_npv, p75_npv, p90_npv = np.percentile(npv_arr, [10, 25, 50, 75, 90])
-    p10_bcr, p25_bcr, p50_bcr, p75_bcr, p90_bcr = np.percentile(bcr_arr, [10, 25, 50, 75, 90])
+    p10_bcr, p25_bcr, p50_bcr, p75_bcr, p90_bcr = np.nanpercentile(bcr_arr, [10, 25, 50, 75, 90])
 
     # ── Tornado: one-at-a-time sensitivity around central values ────────────
     # Each parameter held at its P10 / P90 while others stay at median (factor=1)
@@ -1108,6 +1245,21 @@ def run_monte_carlo(
 # ─────────────────────────────────────────────────────────────────────────────
 
 NOT_ENTERED = "not entered"
+NOT_DEFINED = "–"  # BCR when PV costs are zero or negative
+
+# Method notes written to the CSV so a reviewer can see the conventions used
+METHOD_NOTES = (
+    "Discounting: start-of-year convention, 1 / (1 + r)^(year - discount base year); "
+    "residual value is discounted from the end of the final year.",
+    "Recurrent costs: net of the base case. A net increase is a cost; a net saving is the "
+    "'Recurrent cost savings' benefit (TfNSW CBA Guide 2024, section 6.8).",
+    "Carbon: operating and upfront carbon valued at NSW Carbon Values (TPG24-34, $2024) by "
+    "year; a BCR with National Carbon Values ($2023, as published) is also reported.",
+    "Road damage: TfNSW EPV 2026.1 Table 8.1 deflated to June 2024 (CPI Sydney), "
+    "maintenance share only (46%).",
+    "Buses use articulated-truck VOC, air pollution and noise rates (no bus rates in the EPV tables used).",
+    "BCR shows '–' when PV costs are zero or negative (not defined); use NPV.",
+)
 
 
 def appraisal_summary(result: dict, cost: dict) -> dict:
@@ -1125,11 +1277,15 @@ def appraisal_summary(result: dict, cost: dict) -> dict:
         "P50 outturn capital (nominal $M)": _outturn("outturn_p50_nominal"),
         "P90 outturn capital (nominal $M)": _outturn("outturn_p90_nominal"),
         "PV capital ($M)": result["pv_capital"],
-        "PV recurrent costs ($M)": result["pv_recurrent"],
+        "PV net recurrent costs ($M)": result["pv_recurrent"],
         "PV costs ($M)": result["pv_costs"],
         "PV benefits ($M)": result["pv_benefits"],
         "NPV ($M)": result["npv"],
         "BCR": result["bcr"],
+        "BCR without reliability": result["bcr_without_reliability"],
+        "BCR with National carbon values": result["bcr_national_carbon"],
+        "Carbon values (core)": CARBON_VALUES[result["carbon_basis"]]["label"] + ", central",
+        "Discounting": "Start of year; residual value at the end of the final year",
     }
 
 
@@ -1142,9 +1298,11 @@ def format_summary_value(key: str, value, screen: bool = False) -> str:
     """
     if isinstance(value, str):
         return value
+    if value is None:
+        return NOT_DEFINED
     if key.startswith(("P50 outturn", "P90 outturn")):
         return str(value)
-    if key == "BCR":
+    if key.startswith("BCR"):
         return f"{value:.2f}" if screen else f"{value:.3f}"
     return f"{value:,.1f}" if screen else f"{value:.2f}"
 
@@ -1162,6 +1320,8 @@ def generate_csv(results: dict, project_name: str, summary: dict,
     w.writerow(["Project", safe_name])
     w.writerow(["Discount Rate", f"{r['dr']}%"])
     w.writerow(["All values are real June 2024 dollars, except the nominal outturn capital rows."])
+    for note in METHOD_NOTES:
+        w.writerow(["Method", note])
     w.writerow([])
     w.writerow(["Appraisal summary"])
     for k, v in summary.items():
@@ -1171,13 +1331,13 @@ def generate_csv(results: dict, project_name: str, summary: dict,
     for k, lbl in TYPE_LABELS.items():
         w.writerow([lbl, f"{r['pv_by_type'][k]:.2f}"])
     w.writerow(["PV capital", f"{r['pv_capital']:.2f}"])
-    w.writerow(["PV recurrent costs", f"{r['pv_recurrent']:.2f}"])
+    w.writerow(["PV net recurrent costs", f"{r['pv_recurrent']:.2f}"])
     w.writerow([])
     w.writerow(["TfNSW required sensitivity tests"])
     w.writerow(["Test", "PV benefits ($M)", "PV costs ($M)", "NPV ($M)", "BCR"])
     for row in sensitivity_rows:
         w.writerow([row["test"], f"{row['pvb']:.2f}", f"{row['pvc']:.2f}",
-                    f"{row['npv']:.2f}", f"{row['bcr']:.3f}"])
+                    f"{row['npv']:.2f}", format_summary_value("BCR", row["bcr"])])
     w.writerow([])
     w.writerow(["Cashflow by year ($M)"])
     w.writerow(["Year", "Capital", "Recurrent", "Benefits", "Net",

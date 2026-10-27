@@ -109,7 +109,7 @@ All costs are real June 2024 dollars, entered as yearly cashflows (never spread 
   "contingency_p50": [...C],         # $M by year, takes base to P50 (core result)
   "contingency_p90": [...C],         # $M by year, takes base to P90 (sensitivity only)
   "recurrent": [...C + E],           # $M by year: operations, maintenance, renewals
-  "upfront_carbon_t": float,         # tCO2e, spread by P50 capital, valued at the carbon price
+  "upfront_carbon_t": float,         # tCO2e, spread by P50 capital, valued at the NSW carbon value for each year
   "outturn_p50_nominal": float | None,  # nominal $M, reporting only, never used in a calculation
   "outturn_p90_nominal": float | None,  # blank shows "not entered"
   "construction_disbenefit_annual": float, "construction_asset_life": int, "residual": float,
@@ -118,7 +118,7 @@ All costs are real June 2024 dollars, entered as yearly cashflows (never spread 
 }
 ```
 
-Base case: `base_case_costs = {"recurrent": [...C + E]}`, shared by all options. Avoided base case costs are a benefit; project capital and recurrent costs are the costs. Saved projects carry `cost_format` (`COST_FORMAT_VERSION`); older files are refused, not migrated.
+Base case: `base_case_costs = {"recurrent": [...C + E]}`, shared by all options. Recurrent costs are net (option − base, scaled in the cost tests): a net increase in PV terms is a cost (`pv_recurrent`), a net saving is the `recurrent_savings` benefit (TfNSW CBA Guide §6.8). Capital is the other cost. Saved projects carry `cost_format` (`COST_FORMAT_VERSION`); older files are refused, not migrated.
 
 ### Calculation Output (per case)
 ```python
@@ -156,7 +156,7 @@ Mapping is defined in `VTYPE_MAP` constant.
 - `"project_1"` through `"project_5"` — up to 5 options; shown as "Option 1"… via `case_label()` / `case_labels()` (keys and saved files keep `project_N`; template import accepts "Option N" and older "Project N")
 
 ### Benefit Types
-`tts`, `reliability`, `voc`, `safety`, `env`, `active`, plus the lines `avoided_costs`, `upfront_carbon` and `construction_disruption` (disbenefit) and `residual`. Labels are in `TYPE_LABELS`.
+`tts`, `reliability` (proxy, switchable), `voc`, `safety`, `env`, `road_damage` (switchable), `active`, plus the lines `recurrent_savings`, `upfront_carbon` and `construction_disruption` (disbenefits) and `residual`. Labels are in `TYPE_LABELS`.
 
 ### Context
 `"urban"` or `"rural"` — affects VTTS and some cost rates
@@ -189,7 +189,7 @@ Mapping is defined in `VTYPE_MAP` constant.
 - **Widget keys set by code** (`_load_sample_data`, project load, `_init_session_state` write-back) must be set before those widgets render: the project name box is filled after the uploader via `_name_slot`; both sample buttons (sidebar and Results empty state) use the `_request_sample` callback, which sets `_sample_requested`, handled at the top of the script (it also sets the name to "Sample Road Upgrade" and un-ticks `confirm_load_sample`; a new session is "Untitled project"); never call `_init_session_state()` mid-run
 - **Restorable widgets**: use `key=` with no `value=`/`index=`, and set the default in `_init_session_state` (written back every run so an early `st.rerun()` can't reset it); never assign a widget's key after it renders
 - **File uploader** returns the file on every run — apply each upload once (guarded by `_loaded_project_id` / `file_id`)
-- **Tabs**: Inputs (sub-tabs 1 · Setup / 2 · Traffic / 3 · Costs) → Results → Cashflow → Sensitivity → Parameters → About. Main tabs are pill-styled via CSS on `div[data-baseweb="tab-list"]`; sub-tabs inside a `tab-panel` are plain underlined; a third level (Traffic: VHT / VKT / Demand / Crashes / [Safety rates] / Benefit assumptions; Costs: Capital and other / Recurrent by year) is styled as small segmented buttons. Tabs keep long inputs to one screen; every tab's content still runs each rerun, so edits persist
+- **Tabs**: Inputs (sub-tabs 1 · Setup / 2 · Traffic / 3 · Costs) → Results → Cashflow → Sensitivity → Parameters → About. Main tabs are pill-styled via CSS on `div[data-baseweb="tab-list"]`; sub-tabs inside a `tab-panel` are plain underlined; a third level (Traffic: VHT / VKT / Demand / Crashes / Safety rates / Benefit assumptions; Costs: Capital and other / Recurrent by year) is styled as small segmented buttons. Tabs keep long inputs to one screen; every tab's content still runs each rerun, so edits persist
 - **Explanations**: one plain sentence (`st.caption`) per tab and section; longer detail goes in `help=` tooltips or collapsed expanders
 - Data entry via `st.data_editor` (supports paste-from-Excel)
 - Parameters tab: one editable table per group via `param_table()`; its `on_change` callback writes `param_*` keys (the tab renders after the calculation), and table keys carry `_ptbl_ver`, bumped on edit, reset and project load so tables redraw from session values. Saves keep only changed `param_*` values (`_is_param_value_key`), not old `_num`/`_sl` widget keys, so opening a project clears all overrides before applying the file's
@@ -211,7 +211,7 @@ voc      #fd7e14  (orange)
 safety   #dc3545  (red)
 env      #198754  (green)
 active   #6f42c1  (purple)
-avoided_costs           #20c997
+recurrent_savings       #20c997
 upfront_carbon          #6c757d
 construction_disruption #adb5bd
 residual                #795548
@@ -299,5 +299,10 @@ refactor: extract calculate_matrix into standalone function
 - **Benefits are incremental** — always project minus base; never absolute values
 - **Costs are real** — the nominal outturn fields are for reporting only; never feed them into a calculation
 - **Contingency once** — P50 capital is base rows plus the P50 contingency row; do not add a contingency percentage on top
-- **Avoided base case costs once** — they come from the base case recurrent row only
+- **Recurrent costs are net** — option minus base case; never put the base case row in benefits as well
+- **Carbon** — operating and upfront carbon use `carbon_value("nsw", "central", year)` (`CARBON_VALUES`, TfNSW Oct 2025 appendix, $2024); `bcr_national_carbon` and the carbon sensitivity rows revalue the net tonnes (`annual_carbon_t`). The EPV `emission_cost` ÷ $123 gives tonnes per vkt
+- **BCR is `None`** when PV costs ≤ 0 (`benefit_cost_ratio`); display with `fmt_bcr` ("–"), never format it as a float directly
+- **Residual value** is discounted from the end of the final year (exponent + 1); any PV of the benefit rows must treat the residual row that way
+- **Defaults** — `zero_growth_after_last_year` True; `include_reliability` and `include_road_damage` True; safety rates are always per case (`safety_vkt_data`); old files in General safety mode are migrated on load
+- **Road damage** — `road_damage_cents_vkt` is EPV 2026.1 Table 8.1 deflated to June 2024 (CPI Sydney 137.25/145.82) × `road_damage_maintenance_share` (0.46)
 - **Tests** — run `python3 -m pytest tests -q` before committing; keep `cba_engine.py` free of `streamlit` imports

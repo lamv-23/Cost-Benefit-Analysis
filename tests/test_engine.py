@@ -190,13 +190,17 @@ def _run_costs(**cost_overrides):
 def test_central_costs_and_lines():
     r = _run_costs()
     assert r["pv_capital"] == pytest.approx(13.0)
-    assert r["pv_recurrent"] == pytest.approx(4.0)
-    assert r["pv_costs"] == pytest.approx(17.0)
-    assert r["pv_by_type"]["avoided_costs"] == pytest.approx(3.4)
-    assert r["pv_by_type"]["upfront_carbon"] == pytest.approx(-0.123)
+    # Net recurrent (option − base) = +0.6, an increase, so a cost
+    assert r["pv_recurrent"] == pytest.approx(0.6)
+    assert r["pv_costs"] == pytest.approx(13.6)
+    assert r["pv_by_type"]["recurrent_savings"] == pytest.approx(0.0)
+    assert r["recurrent_is_saving"] is False
+    # 1000 t split 8/13 and 5/13 over 2026/2027 at NSW central $131 and $133
+    assert r["pv_by_type"]["upfront_carbon"] == pytest.approx(
+        -(1000 * 8 / 13 * 131 + 1000 * 5 / 13 * 133) / 1e6)
     assert r["pv_by_type"]["residual"] == pytest.approx(11.109091, abs=1e-6)
-    assert r["pv_benefits"] == pytest.approx(14.386091, abs=1e-6)
-    assert r["bcr"] == pytest.approx(0.846241, abs=1e-6)
+    assert r["pv_benefits"] == pytest.approx(10.977322, abs=1e-6)
+    assert r["bcr"] == pytest.approx(0.807156, abs=1e-6)
     assert r["capital_p50_total"] == pytest.approx(13.0)
     assert r["capital_p90_total"] == pytest.approx(15.0)
     assert "pavement" not in r["benefits_by_type"]
@@ -207,7 +211,7 @@ def test_construction_disruption_is_disbenefit():
     assert r["pv_by_type"]["construction_disruption"] == pytest.approx(-0.4)
     assert r["benefits_by_type"]["construction_disruption"] == pytest.approx(
         [-0.2, -0.2, 0.0, 0.0, 0.0])
-    assert r["pv_costs"] == pytest.approx(17.0)
+    assert r["pv_costs"] == pytest.approx(13.6)
 
 
 def test_manual_residual_override():
@@ -226,9 +230,15 @@ def test_validate_project_file():
 
 def test_carbon_sensitivity_includes_upfront_carbon():
     r = _run_costs()
-    high = r["sensitivity_carbon"]["High (2.0×, $246/t)"]
-    # upfront carbon -0.123 doubles to -0.246; no traffic, so no other carbon
-    assert high["pvb"] == pytest.approx(r["pv_benefits"] - 0.123)
+    rows = r["sensitivity_carbon"]
+    nsw = -(1000 * 8 / 13 * 131 + 1000 * 5 / 13 * 133) / 1e6
+    national = -(1000 * 8 / 13 * 76 + 1000 * 5 / 13 * 88) / 1e6
+    assert rows["NSW central"]["core"] is True
+    assert rows["NSW central"]["pvb"] == pytest.approx(r["pv_benefits"])
+    # no traffic, so only the upfront carbon is revalued
+    assert rows["National central"]["pvb"] == pytest.approx(r["pv_benefits"] - nsw + national)
+    assert rows["EPV flat ($123/t)"]["pvb"] == pytest.approx(r["pv_benefits"] - nsw - 0.123)
+    assert r["bcr_national_carbon"] == pytest.approx(rows["National central"]["bcr"])
 
 
 # ── Scenario options in calculate_matrix ─────────────────────────────────────
@@ -263,7 +273,7 @@ def test_scenario_none_matches_empty_dict():
 
 def test_scenario_p90():
     r = _run_scenario({"capital": "p90"})
-    assert r["pv_costs"] == pytest.approx(19.0)
+    assert r["pv_costs"] == pytest.approx(15.6)
     assert r["pv_by_type"]["residual"] == pytest.approx(12.818182, abs=1e-6)
     assert r["capital_p50_total"] == pytest.approx(13.0)
     assert r["capital_p90_total"] == pytest.approx(15.0)
@@ -271,9 +281,9 @@ def test_scenario_p90():
 
 def test_scenario_cost_factor():
     r = _run_scenario({"cost_factor": 1.2})
-    assert r["pv_costs"] == pytest.approx(20.4)
+    # capital 13 and net recurrent 0.6 both scale
+    assert r["pv_costs"] == pytest.approx(1.2 * 13.6)
     assert r["pv_by_type"]["residual"] == pytest.approx(13.330909, abs=1e-6)
-    assert r["pv_by_type"]["avoided_costs"] == pytest.approx(3.4)
 
 
 def test_scenario_cost_factor_keeps_manual_residual():
@@ -289,18 +299,21 @@ def test_scenario_benefit_factor():
     r = _run_scenario({"benefit_factor": 1.4}, traffic=traffic, walk_pkm_day=1000.0,
                       construction_disbenefit_annual=0.2)
     assert central["pv_by_type"]["tts"] > 0
-    for key in ("tts", "reliability", "voc", "safety", "env", "active", "tts_Car"):
+    for key in ("tts", "reliability", "voc", "safety", "env", "road_damage", "active",
+                "tts_Car"):
         assert r["pv_by_type"][key] == pytest.approx(1.4 * central["pv_by_type"][key])
-    for key in ("avoided_costs", "upfront_carbon", "construction_disruption", "residual"):
+    for key in ("recurrent_savings", "upfront_carbon", "construction_disruption", "residual"):
         assert r["pv_by_type"][key] == pytest.approx(central["pv_by_type"][key])
     assert r["pv_costs"] == pytest.approx(central["pv_costs"])
 
 
 def test_scenario_delay_1():
     r = _run_scenario({"delay_years": 1})
-    assert r["pv_costs"] == pytest.approx(17.5)
-    assert r["pv_by_type"]["avoided_costs"] == pytest.approx(4.2)
-    assert r["pv_benefits"] == pytest.approx(15.186091, abs=1e-6)
+    # net recurrent 0, 0, −0.3, +0.2, +0.2, +0.2 (base filled with its median 0.8)
+    assert r["pv_costs"] == pytest.approx(13.3)
+    # upfront carbon moves to 2027/2028 ($133 and $137)
+    assert r["pv_benefits"] == pytest.approx(
+        11.109091 - (1000 * 8 / 13 * 133 + 1000 * 5 / 13 * 137) / 1e6, abs=1e-6)
     assert r["total_years"] == 6
 
 
@@ -445,8 +458,9 @@ def test_calculate_matrix_drops_old_scenario_tables():
 
 SUMMARY_KEYS = [
     "P50 outturn capital (nominal $M)", "P90 outturn capital (nominal $M)",
-    "PV capital ($M)", "PV recurrent costs ($M)", "PV costs ($M)",
-    "PV benefits ($M)", "NPV ($M)", "BCR",
+    "PV capital ($M)", "PV net recurrent costs ($M)", "PV costs ($M)",
+    "PV benefits ($M)", "NPV ($M)", "BCR", "BCR without reliability",
+    "BCR with National carbon values", "Carbon values (core)", "Discounting",
 ]
 
 
@@ -460,11 +474,13 @@ def test_summary_outturn_not_entered():
     assert s["P50 outturn capital (nominal $M)"] == "not entered"
     assert s["P90 outturn capital (nominal $M)"] == "not entered"
     assert s["PV capital ($M)"] == r["pv_capital"]
-    assert s["PV recurrent costs ($M)"] == r["pv_recurrent"]
+    assert s["PV net recurrent costs ($M)"] == r["pv_recurrent"]
     assert s["PV costs ($M)"] == r["pv_costs"]
     assert s["PV benefits ($M)"] == r["pv_benefits"]
     assert s["NPV ($M)"] == r["npv"]
     assert s["BCR"] == r["bcr"]
+    assert s["BCR with National carbon values"] == r["bcr_national_carbon"]
+    assert s["Carbon values (core)"].startswith("NSW Carbon Values")
 
 
 def test_summary_outturn_copied():
@@ -480,12 +496,13 @@ def test_csv_sections():
     summary = appraisal_summary(central, cost)
     text = generate_csv(central, "Test project", summary, rows)
     assert "TfNSW required sensitivity tests" in text
-    assert "Avoided base case costs" in text
+    assert "Recurrent cost savings" in text
+    assert 'Method,"Discounting: start-of-year' in text
     assert "P90 capital cost" in text
     assert "P50 outturn capital (nominal $M)" in text
     assert "395.0" in text
     assert "P90 outturn capital (nominal $M),not entered" in text
-    assert "PV capital ($M)" in text and "PV recurrent costs ($M)" in text
+    assert "PV capital ($M)" in text and "PV net recurrent costs ($M)" in text
     assert "Discounted net" in text and "Cumulative" in text
     assert text.index("Appraisal summary") < text.index("Itemised PV") \
         < text.index("TfNSW required sensitivity tests") < text.index("Cashflow by year")
@@ -503,3 +520,116 @@ def test_summary_screen_format():
     # The CSV keeps its precision
     assert format_summary_value("PV costs ($M)", 1234.56) == "1234.56"
     assert format_summary_value("BCR", 1.6904) == "1.690"
+
+
+# ── CBA method: recurrent costs, residual, carbon, switches ─────────────────
+
+def _run_with(inputs=None, traffic=None, params=None, scenario=None, **cost_overrides):
+    cost, base = fixture_costs()
+    cost["construction_asset_life"] = 40
+    base_override = cost_overrides.pop("base_recurrent", None)
+    if base_override is not None:
+        base["recurrent"] = base_override
+    cost.update(cost_overrides)
+    base_traffic, proj_traffic = traffic or (
+        make_case_traffic(YEARS), make_case_traffic(YEARS))
+    return calculate_matrix(
+        {**COST_INPUTS, **(inputs or {})}, base_traffic, proj_traffic, cost, base,
+        ANNUALISATION, params=params or PARAMS, scenario=scenario,
+    )
+
+
+def test_recurrent_saving_is_a_benefit():
+    # Option costs 1.0 a year to run against 2.0 in the base case: a saving of 3.0
+    r = _run_with(base_recurrent=[0.5, 0.5, 2.0, 2.0, 2.0])
+    assert r["recurrent_is_saving"] is True
+    assert r["pv_recurrent"] == pytest.approx(0.0)
+    assert r["pv_costs"] == pytest.approx(13.0)
+    assert r["pv_by_type"]["recurrent_savings"] == pytest.approx(3.0)
+
+
+def test_residual_discounted_from_end_of_final_year():
+    r = _run_with(inputs={"discount_rate": 5})
+    # final year is index 4 (2030) with base year 2026: discounted over 5 years
+    assert r["pv_by_type"]["residual"] == pytest.approx(r["residual"] / 1.05 ** 5)
+    assert r["benefits_by_type"]["residual"][-1] == pytest.approx(r["residual"])
+
+
+def test_bcr_not_defined_without_costs():
+    zero = [0.0, 0.0]
+    r = _run_with(capex_base={"planning": zero, "land": zero, "construction": zero},
+                  contingency_p50=zero, contingency_p90=zero,
+                  recurrent=[0.0] * 5, base_recurrent=[0.0] * 5)
+    assert r["pv_costs"] == pytest.approx(0.0)
+    assert r["bcr"] is None
+    assert format_summary_value("BCR", r["bcr"]) == "–"
+    assert format_summary_value("BCR", r["bcr"], screen=True) == "–"
+
+
+def test_reliability_switch():
+    traffic = _saving_traffic()
+    on = _run_with(traffic=traffic)
+    off = _run_with(inputs={"include_reliability": False}, traffic=traffic)
+    assert on["pv_by_type"]["reliability"] > 0
+    assert off["pv_by_type"]["reliability"] == 0
+    assert on["bcr_without_reliability"] == pytest.approx(off["bcr"])
+
+
+def test_road_damage_maintenance_share():
+    base = make_case_traffic(YEARS, HCV={"vht": [100, 100], "vkt": [3_000_000, 3_000_000]})
+    proj = make_case_traffic(YEARS, HCV={"vht": [100, 100], "vkt": [1_000_000, 1_000_000]})
+    r = _run_with(traffic=(base, proj))
+    # 2,000,000 fewer heavy vkt × 18.151 c × 46% maintenance share, 3 operating years
+    per_year = 2_000_000 * 18.151 / 100 * 0.46 / 1e6
+    assert r["benefits_by_type"]["road_damage"] == pytest.approx(
+        [0.0, 0.0, per_year, per_year, per_year])
+    off = _run_with(inputs={"include_road_damage": False}, traffic=(base, proj))
+    assert off["pv_by_type"]["road_damage"] == 0
+
+
+def test_operating_carbon_valued_at_each_years_carbon_value():
+    base = make_case_traffic(YEARS, Car={"vht": [20_000, 20_000], "vkt": [2_000_000, 2_000_000]})
+    proj = make_case_traffic(YEARS, Car={"vht": [10_000, 10_000], "vkt": [1_000_000, 1_000_000]})
+    r = _run_with(traffic=(base, proj))
+    t_per_vkt = PARAMS["emission_cost"]["rural"]["car"] / PARAMS["carbon_per_tonne"]
+    # 1,000,000 fewer car vkt in 2028, 2029, 2030 at NSW central $137, $146, $164
+    assert r["annual_env_emit"][2:] == pytest.approx(
+        [1e6 * t_per_vkt * price / 1e6 for price in (137, 146, 164)])
+
+
+def test_emission_factor_change_scales_operating_carbon():
+    base = make_case_traffic(YEARS, Car={"vht": [20_000, 20_000], "vkt": [2_000_000, 2_000_000]})
+    proj = make_case_traffic(YEARS, Car={"vht": [10_000, 10_000], "vkt": [1_000_000, 1_000_000]})
+    p = copy.deepcopy(PARAMS)
+    p["emission_factor_change_pct"] = -5.0
+    central = _run_with(traffic=(base, proj))
+    falling = _run_with(traffic=(base, proj), params=p)
+    # 2028 is four years after the 2024 factors
+    assert falling["annual_env_emit"][2] == pytest.approx(central["annual_env_emit"][2] * 0.95 ** 4)
+
+
+def test_zero_growth_after_last_modelling_year_is_default():
+    years = [2026, 2028]
+    base = make_case_traffic(years, Car={"vht": [1000, 1210], "vkt": [60000, 72600]})
+    proj = make_case_traffic(years, Car={"vht": [900, 1089], "vkt": [60000, 72600]})
+    held = _run_with(traffic=(base, proj))
+    grown = _run_with(inputs={"zero_growth_after_last_year": False}, traffic=(base, proj))
+    tts_held, tts_grown = held["benefits_by_type"]["tts"], grown["benefits_by_type"]["tts"]
+    assert tts_held[3] == pytest.approx(tts_held[2])     # 2029 held at 2028
+    assert tts_grown[3] == pytest.approx(tts_grown[2] * 1.1)  # 10% a year extrapolated
+
+
+def test_delay_fills_base_recurrent_with_median():
+    cost, base = fixture_costs()
+    base["recurrent"] = [0.5, 0.5, 0.8, 0.8, 5.0]   # a renewal in the final year
+    s = build_cost_schedule(cost, base, 2, 3, delay_years=1)
+    assert s["base_recurrent"] == [0.5, 0.5, 0.8, 0.8, 5.0, 0.8]
+
+
+def test_voc_speed_out_of_range_flagged():
+    # 20 km/h, below the rural VOC table's 60 km/h minimum
+    base = make_case_traffic(YEARS, Car={"vht": [1000, 1000], "vkt": [20000, 20000]})
+    proj = make_case_traffic(YEARS, Car={"vht": [500, 500], "vkt": [20000, 20000]})
+    r = _run_with(traffic=(base, proj))
+    lo, hi = r["voc_speed_out_of_range"]["Car"]
+    assert lo == pytest.approx(20.0) and hi == pytest.approx(40.0)
