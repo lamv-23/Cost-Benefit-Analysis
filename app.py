@@ -131,10 +131,11 @@ def _request_sample() -> None:
 
 
 def _load_sample_data() -> None:
-    """Pre-populate session state with a representative rural road upgrade scenario.
+    """Pre-populate session state with a generic road upgrade.
 
-    Scenario: 2-lane rural highway bypass, Car-dominant with moderate HCV freight.
-    Base case = existing alignment; Option 1 = new bypass with higher speeds.
+    Car-dominant traffic with moderate HCV freight. Base case = the existing road;
+    Option 1 = an upgraded road that is shorter and faster with fewer stops. It
+    uses whatever context (urban or rural) is set in Setup.
     All values are illustrative only (not based on any real project).
     """
     years = [2026, 2031, 2041, 2056]
@@ -173,7 +174,7 @@ def _load_sample_data() -> None:
                   "stops": [90.0, 100.0, 115.0, 133.0],
                   "demand": [1200.0, 1350.0, 1550.0, 1800.0]}
 
-    # ── Project 1 (bypass: shorter route, fewer stops, free-flow) ───────
+    # ── Option 1 (upgrade: shorter route, fewer stops, faster) ──────────
     # VKT and VHT both decrease — benefits across TTS, VOC, safety, env.
     p1 = td["project_1"]
     p1["Car"]  = {"vht": [980.0, 1100.0, 1270.0, 1480.0],
@@ -1617,7 +1618,7 @@ with st.sidebar:
 
     st.divider()
     with st.expander("Load sample project", expanded=False):
-        st.caption("A rural bypass scenario, to explore the tool without entering data.")
+        st.caption("A generic road upgrade, to explore the tool without entering data.")
         _confirm_load = st.checkbox("I understand this will overwrite all current data", key="confirm_load_sample")
         st.button("Load sample project", key="sidebar_load_sample", use_container_width=True, disabled=not _confirm_load,
                   on_click=_request_sample)
@@ -2545,7 +2546,7 @@ if _calc_error is not None or not _inputs_present:
                 _b1, _b2, _b3 = st.columns([2, 1, 2])
                 _b2.button("Load sample project", key="empty_load_sample", type="primary",
                            use_container_width=True, on_click=_request_sample,
-                           help="Fills the inputs with an illustrative rural bypass.")
+                           help="Fills the inputs with an illustrative generic road upgrade.")
     st.stop()
 
 # ═══════════════════════════════════════════════════════════════════════════════
