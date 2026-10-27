@@ -343,3 +343,28 @@ def test_benefit_assumptions_on_traffic_tab():
     walk.set_value(500.0).run()
     assert not at.exception
     assert at.session_state["cost_data"]["project_1"]["walk_pkm_day"] == 500.0
+
+
+def test_opening_project_clears_earlier_parameter_changes(monkeypatch):
+    """A file saved with default parameters must not inherit the session's overrides."""
+    saved = _capture_saves(monkeypatch)
+    at = _app_with_sample()
+    payload = saved[-1]
+    assert not [k for k in json.loads(payload) if k.startswith("param_")]
+    at.session_state["param_vtts_urban_Car"] = 30.0
+    at.run()
+    changed = _metric(at, "Benefit-cost ratio")
+
+    real_uploader = streamlit.file_uploader
+
+    def upload_once(label, *args, **kwargs):
+        if kwargs.get("key") == "load_project_uploader":
+            real_uploader(label, *args, **kwargs)
+            return _FakeUpload(payload.encode("utf-8"), file_id="defaults-1")
+        return real_uploader(label, *args, **kwargs)
+
+    monkeypatch.setattr(streamlit, "file_uploader", upload_once)
+    at.run()
+    assert not at.exception
+    assert "param_vtts_urban_Car" not in at.session_state
+    assert _metric(at, "Benefit-cost ratio") == "1.69" != changed

@@ -1133,14 +1133,20 @@ def appraisal_summary(result: dict, cost: dict) -> dict:
     }
 
 
-def format_summary_value(key: str, value) -> str:
+def format_summary_value(key: str, value, screen: bool = False) -> str:
+    """Format one appraisal summary value.
+
+    The CSV (default) uses $M to 2 dp and BCR to 3 dp; ``screen=True`` uses $M to
+    1 dp with thousands separators and BCR to 2 dp. Outturn figures are always
+    shown exactly as entered.
+    """
     if isinstance(value, str):
         return value
-    if key == "BCR":
-        return f"{value:.3f}"
     if key.startswith(("P50 outturn", "P90 outturn")):
         return str(value)
-    return f"{value:.2f}"
+    if key == "BCR":
+        return f"{value:.2f}" if screen else f"{value:.3f}"
+    return f"{value:,.1f}" if screen else f"{value:.2f}"
 
 
 def generate_csv(results: dict, project_name: str, summary: dict,
