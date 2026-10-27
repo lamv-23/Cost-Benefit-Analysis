@@ -34,7 +34,7 @@ def _app_with_sample():
     at = AppTest.from_file(APP_PATH, default_timeout=300).run()
     assert not at.exception
     at.checkbox(key="confirm_load_sample").check().run()
-    [btn] = [b for b in at.button if b.label == "Load Sample Data"]
+    btn = at.button(key="sidebar_load_sample")
     btn.click().run()
     assert not at.exception
     return at
@@ -42,8 +42,8 @@ def _app_with_sample():
 
 def test_sample_data_runs():
     at = _app_with_sample()
-    assert _metric(at, "Net Present Value")
-    assert _metric(at, "Benefit-Cost Ratio") == "1.69"
+    assert _metric(at, "Net present value")
+    assert _metric(at, "Benefit-cost ratio") == "1.69"
     labels = [m.label for m in at.metric]
     assert "Internal Rate of Return" not in labels
     assert "First Year Rate of Return" not in labels
@@ -56,7 +56,7 @@ def test_sample_data_runs():
 
 def test_change_construction_years_keeps_costs():
     at = _app_with_sample()
-    _number_input(at, "Construction Period (years)").set_value(4).run()
+    _number_input(at, "Construction period (years)").set_value(4).run()
     assert not at.exception
     cost = at.session_state["cost_data"]["project_1"]
     assert cost["capex_base"]["construction"] == [60.0, 120.0, 80.0, 0.0]
@@ -67,7 +67,7 @@ def test_change_construction_years_keeps_costs():
 def test_two_options_share_base_costs():
     at = _app_with_sample()
     base_before = list(at.session_state["base_case_costs"]["recurrent"])
-    _number_input(at, "Number of Project Cases").set_value(2).run()
+    _number_input(at, "Number of options").set_value(2).run()
     assert not at.exception
     assert at.session_state["base_case_costs"]["recurrent"] == base_before
     assert len(base_before) == 33
@@ -77,7 +77,7 @@ def test_two_options_share_base_costs():
 def test_adding_option_and_changing_years_keep_costs():
     at = _app_with_sample()
     before = copy.deepcopy(at.session_state["cost_data"]["project_1"])
-    _number_input(at, "Number of Project Cases").set_value(2).run()
+    _number_input(at, "Number of options").set_value(2).run()
     assert not at.exception
     costs = at.session_state["cost_data"]
     assert costs["project_1"]["capex_base"] == before["capex_base"]
@@ -100,10 +100,10 @@ def test_adding_option_and_changing_years_keep_costs():
 
 def test_option_change_keeps_periods():
     at = AppTest.from_file(APP_PATH, default_timeout=300).run()
-    _number_input(at, "Construction Period (years)").set_value(5).run()
-    _number_input(at, "Evaluation Period (years)").set_value(40).run()
-    _number_input(at, "Construction Start Year").set_value(2030).run()
-    _number_input(at, "Number of Project Cases").set_value(2).run()
+    _number_input(at, "Construction period (years)").set_value(5).run()
+    _number_input(at, "Evaluation period (years)").set_value(40).run()
+    _number_input(at, "Construction start year").set_value(2030).run()
+    _number_input(at, "Number of options").set_value(2).run()
     assert not at.exception
     assert at.session_state["const_years"] == 5
     assert at.session_state["eval_period"] == 40
@@ -114,17 +114,17 @@ def test_option_change_keeps_periods():
 
 def test_sample_resets_periods():
     at = AppTest.from_file(APP_PATH, default_timeout=300).run()
-    _number_input(at, "Construction Period (years)").set_value(5).run()
-    _number_input(at, "Evaluation Period (years)").set_value(40).run()
-    _number_input(at, "Construction Start Year").set_value(2030).run()
+    _number_input(at, "Construction period (years)").set_value(5).run()
+    _number_input(at, "Evaluation period (years)").set_value(40).run()
+    _number_input(at, "Construction start year").set_value(2030).run()
     at.checkbox(key="confirm_load_sample").check().run()
-    [btn] = [b for b in at.button if b.label == "Load Sample Data"]
+    btn = at.button(key="sidebar_load_sample")
     btn.click().run()
     assert not at.exception
     assert at.session_state["const_years"] == 3
     assert at.session_state["eval_period"] == 30
     assert at.session_state["construction_start_year"] == 2026
-    assert _metric(at, "Benefit-Cost Ratio") == "1.69"
+    assert _metric(at, "Benefit-cost ratio") == "1.69"
 
 
 def test_empty_project_no_errors():
@@ -137,13 +137,13 @@ def test_empty_project_no_errors():
 def test_empty_state_loads_sample():
     """With nothing entered the Results tab offers the sample; the button loads it."""
     at = AppTest.from_file(APP_PATH, default_timeout=300).run()
-    assert not [m for m in at.metric if m.label == "Benefit-Cost Ratio"]
-    [btn] = [b for b in at.button if b.label == "Load sample project"]
+    assert not [m for m in at.metric if m.label == "Benefit-cost ratio"]
+    btn = at.button(key="empty_load_sample")
     btn.click().run()
     assert not at.exception
     assert at.session_state["const_years"] == 3
-    assert _metric(at, "Benefit-Cost Ratio") == "1.69"
-    assert not [b for b in at.button if b.label == "Load sample project"]
+    assert _metric(at, "Benefit-cost ratio") == "1.69"
+    assert not [b for b in at.button if b.key == "empty_load_sample"]
 
 
 def test_save_load_round_trip_keeps_periods(monkeypatch):
@@ -155,8 +155,8 @@ def test_save_load_round_trip_keeps_periods(monkeypatch):
     """
     saved = _capture_saves(monkeypatch)
     at = _app_with_sample()
-    _number_input(at, "Construction Period (years)").set_value(4).run()
-    _number_input(at, "Construction Start Year").set_value(2027).run()
+    _number_input(at, "Construction period (years)").set_value(4).run()
+    _number_input(at, "Construction start year").set_value(2027).run()
     cost = at.session_state["cost_data"]["project_1"]
     cost["capex_base"]["construction"] = [60.0, 120.0, 80.0, 40.0]
     at.session_state["cost_data"] = at.session_state["cost_data"]
@@ -173,7 +173,7 @@ def test_save_load_round_trip_keeps_periods(monkeypatch):
     assert _metric(fresh, "P50 capital ($M, real)") == "$390.0M"
 
     # The file is still in the uploader; later edits must not be reverted by it.
-    _number_input(fresh, "Construction Period (years)").set_value(5).run()
+    _number_input(fresh, "Construction period (years)").set_value(5).run()
     assert not fresh.exception
     assert fresh.session_state["const_years"] == 5
     loaded = fresh.session_state["cost_data"]["project_1"]
@@ -187,7 +187,7 @@ def _capture_saves(monkeypatch):
     real_download = streamlit.download_button
 
     def capture_download(label, data, *args, **kwargs):
-        if label == "Save Project (.json)":
+        if label == "Save project (.json)":
             saved.append(data)
         return real_download(label, data, *args, **kwargs)
 
@@ -218,29 +218,29 @@ def test_save_load_round_trip_keeps_settings(monkeypatch):
     """Discount rate, context, base year, zero-growth flag and name survive a reload."""
     saved = _capture_saves(monkeypatch)
     at = _app_with_sample()
-    _number_input(at, "Discount Rate (%)").set_value(7.0).run()
-    _number_input(at, "Discount Base Year").set_value(2025).run()
+    _number_input(at, "Discount rate (%)").set_value(7.0).run()
+    _number_input(at, "Discount base year").set_value(2025).run()
     [ctx] = [s for s in at.selectbox if s.label == "Context"]
     ctx.set_value("rural").run()
     [zg] = [c for c in at.checkbox if c.label == "Zero growth after last modelling year"]
     zg.check().run()
-    [name] = [t for t in at.text_input if t.label == "Project Name"]
+    [name] = [t for t in at.text_input if t.label == "Project name"]
     name.set_value("Picton Bypass").run()
     assert not at.exception
     payload = saved[-1]
 
     fresh = _open_in_fresh_app(monkeypatch, payload, file_id="saved-settings-1")
-    assert _number_input(fresh, "Discount Rate (%)").value == 7.0
-    assert _number_input(fresh, "Discount Base Year").value == 2025
+    assert _number_input(fresh, "Discount rate (%)").value == 7.0
+    assert _number_input(fresh, "Discount base year").value == 2025
     assert [s for s in fresh.selectbox if s.label == "Context"][0].value == "rural"
     assert [c for c in fresh.checkbox
             if c.label == "Zero growth after last modelling year"][0].value is True
-    assert [t for t in fresh.text_input if t.label == "Project Name"][0].value == "Picton Bypass"
+    assert [t for t in fresh.text_input if t.label == "Project name"][0].value == "Picton Bypass"
 
     # The file stays in the uploader; a later edit must stick.
-    _number_input(fresh, "Discount Rate (%)").set_value(4.0).run()
+    _number_input(fresh, "Discount rate (%)").set_value(4.0).run()
     assert not fresh.exception
-    assert _number_input(fresh, "Discount Rate (%)").value == 4.0
+    assert _number_input(fresh, "Discount rate (%)").value == 4.0
 
 
 def test_save_includes_edit_made_this_run(monkeypatch):
@@ -285,7 +285,7 @@ def _dr_chart_labels(at):
 def test_discount_rate_chart_has_no_duplicate_points():
     at = _app_with_sample()
     assert _dr_chart_labels(at) == ["3%", "4%", "5%", "7%"]
-    _number_input(at, "Discount Rate (%)").set_value(7.0).run()
+    _number_input(at, "Discount rate (%)").set_value(7.0).run()
     assert not at.exception
     assert _dr_chart_labels(at) == ["3%", "4%", "7%"]
     frames = [d.value for d in at.dataframe if "Test" in d.value.columns]
@@ -298,7 +298,48 @@ def test_dashboard_summary():
     key = "P50 outturn capital (nominal $M)"
     frames = [d.value for d in at.dataframe if key in list(d.value.index)]
     assert frames, "appraisal summary table not found"
-    assert list(frames[0].columns) == ["Project 1"]
-    assert frames[0].loc[key, "Project 1"] == "395.0"
-    assert frames[0].loc["P90 outturn capital (nominal $M)", "Project 1"] == "432.0"
+    assert list(frames[0].columns) == ["Option 1"]
+    assert frames[0].loc[key, "Option 1"] == "395.0"
+    assert frames[0].loc["P90 outturn capital (nominal $M)", "Option 1"] == "432.0"
 
+
+
+def test_new_session_is_untitled_and_sample_sets_name():
+    at = AppTest.from_file(APP_PATH, default_timeout=300).run()
+    assert not at.exception
+    assert [t for t in at.text_input if t.label == "Project name"][0].value == "Untitled project"
+    at.checkbox(key="confirm_load_sample").check().run()
+    btn = at.button(key="sidebar_load_sample")
+    btn.click().run()
+    assert not at.exception
+    assert [t for t in at.text_input if t.label == "Project name"][0].value == "Sample Road Upgrade"
+
+
+def test_parameter_override_changes_result_and_is_listed():
+    at = _app_with_sample()
+    central = _metric(at, "Benefit-cost ratio")
+    at.session_state["param_vtts_urban_Car"] = 30.0
+    at.run()
+    assert not at.exception
+    assert _metric(at, "Benefit-cost ratio") != central
+    assert any("Changed from default" in c.value and "Car Urban: 19.76 → 30" in c.value
+               for c in at.caption)
+
+
+def test_save_keeps_parameter_values_not_widget_keys(monkeypatch):
+    saved = _capture_saves(monkeypatch)
+    at = _app_with_sample()
+    at.session_state["param_vtts_urban_Car"] = 30.0
+    at.session_state["param_vtts_urban_Car_num"] = 30.0  # left by older versions
+    at.run()
+    data = json.loads(saved[-1])
+    assert data["param_vtts_urban_Car"] == 30.0
+    assert "param_vtts_urban_Car_num" not in data
+
+
+def test_benefit_assumptions_on_traffic_tab():
+    at = _app_with_sample()
+    [walk] = [w for w in at.number_input if w.label == "Additional walking (person-km/day)"]
+    walk.set_value(500.0).run()
+    assert not at.exception
+    assert at.session_state["cost_data"]["project_1"]["walk_pkm_day"] == 500.0
