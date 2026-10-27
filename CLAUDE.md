@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A Transport Cost-Benefit Analysis (CBA) dashboard implementing the TfNSW (Transport for New South Wales) Economic Parameter Values framework (January 2025, June 2024 prices in AUD). The tool supports multi-vehicle-type, multi-project-case analysis with discounting, sensitivity analysis, and flexible data import/export.
+A Transport Cost-Benefit Analysis (CBA) dashboard implementing the TfNSW (Transport for New South Wales) Economic Parameter Values 2026.1 (July 2026, June 2026 prices in AUD). The tool supports multi-vehicle-type, multi-project-case analysis with discounting, sensitivity analysis, and flexible data import/export.
 
 Teams use it to appraise road upgrade projects whose results go to assurance reviews, so it follows the TfNSW CBA Guide (August 2024) and NSW Treasury TPG23-08: P50/P90 capital, base case and recurrent costs, upfront carbon, and the TfNSW required sensitivity tests.
 
@@ -63,7 +63,7 @@ There is no build step. Code must run on Python 3.9 and 3.12.
 
 | Area | Names |
 |------|-------|
-| Parameters and maps | `PARAMS`, `VTYPE_MAP`, `VTYPES`, `TYPE_LABELS` (benefit and cost line labels) |
+| Parameters | `PARAMS`, `CARBON_VALUES`, `carbon_value()`, `crash_cost_per_vkt()`, `PRICE_YEAR`/`PRICE_LABEL`, `VTYPES`, `TYPE_LABELS` (benefit and cost line labels) |
 | Data factories | `make_traffic_case()`, `make_traffic_data()`, `make_cost_data()`, `make_base_case_costs()` |
 | Cost schedule | `clean_row()`, `fit_cost_rows()`, `build_cost_schedule()` |
 | Calculation | `calculate_matrix()` (one option vs base), `calculate_all_cases()` |
@@ -101,7 +101,7 @@ Session state keys follow these patterns:
 
 ### Cost Data (per project case)
 
-All costs are real June 2024 dollars, entered as yearly cashflows (never spread automatically). `C` = construction years, `E` = appraisal period (counted from opening).
+All costs are real June 2026 dollars (`PRICE_LABEL`), entered as yearly cashflows (never spread automatically). `C` = construction years, `E` = appraisal period (counted from opening).
 
 ```python
 {
@@ -142,14 +142,10 @@ The TfNSW required sensitivity table is separate: `run_required_sensitivities()`
 ## Naming Conventions
 
 ### Vehicle Types
-| User-facing (VTYPES) | Internal PARAMS key |
-|----------------------|---------------------|
-| `Car` | `car` |
-| `LCV` | `lgv` |
-| `HCV` | `rigid` / `artic` |
-| `Bus` | `bus` |
-
-Mapping is defined in `VTYPE_MAP` constant.
+`PARAMS` is keyed by the user-facing types `Car`, `LCV`, `HCV`, `Bus` (no mapping). Each is an
+EPV 2026.1 vehicle class or a vehicle-mix-weighted group: Car = medium car (VOC) / car; LCV =
+courier van utility + 4WD; HCV = all rigid, articulated and combination trucks (HV); Bus = heavy
+bus. Weights are EPV Table 3.19.
 
 ### Case Keys
 - `"base_case"` — always present
@@ -174,10 +170,10 @@ Mapping is defined in `VTYPE_MAP` constant.
 | **Rule-of-Half** | Halves only the generated-demand share of TTS, reliability and VOC; safety and environment use the full VKT change |
 | **Discount rates** | 5% central; required sensitivity at 3%, 4% (federal PPR) and 7% (TfNSW CBA Guide Aug 2024 / TPG23-08) |
 | **Discounting** | Start-of-year convention: `1 / (1 + rate/100)^year` |
-| **TTS** | From VHT delta × occupancy × VTTS (VHT only, not VKT) |
-| **VOC** | Speed-dependent rates, interpolated from lookup tables |
+| **TTS** | VHT delta × EPV value per vehicle-hour (`vtt_vehicle_hr`, Tables 2.2/2.3; includes occupancy, business share, freight) |
+| **VOC** | Speed-dependent $/km from `voc[model][vtype]`: urban `stop_start` or `freeway` (Setup), rural uses `rural` (freeway model, regional mix) |
 | **Safety** | Per-VKT crash cost rates ($/VKT per vehicle type, per case) |
-| **Environment** | Combined emission_cost + air_pollution + noise per VKT delta |
+| **Environment** | Operating carbon (`carbon_t_per_vkt` × carbon value for the year) + other externalities (`externality_cents_vkt`) per VKT delta |
 | **Benefits** | All incremental: project case minus base case |
 
 ---
@@ -232,7 +228,7 @@ Export: CSV results download (appraisal summary, itemised PV, required sensitivi
 
 ## Parameters System
 
-- `PARAMS` dict holds immutable defaults (TfNSW Jan 2025 values)
+- `PARAMS` dict holds immutable defaults (TfNSW EPV 2026.1, June 2026 prices; each entry cites its table). Values were extracted from the EPV Excel tool, which is not in the repo
 - User edits in Parameters tab are stored as overrides in `st.session_state`
 - `build_effective_params()` merges overrides into a copy of `PARAMS` at calculation time
 - Never mutate `PARAMS` directly
@@ -295,14 +291,14 @@ refactor: extract calculate_matrix into standalone function
 - **Speed is always derived** (`VKT/VHT`), never accept speed as a direct input
 - **CAGR interpolation, not linear** — use the geometric interpolation formula for year-by-year expansion
 - **Discounting is start-of-year** — discount factor = `1/(1+r)^year`, not mid-year
-- **Vehicle type mapping** — user sees `Car/LCV/HCV/Bus`; `PARAMS` uses `car/lgv/rigid/artic`
+- **Price year** — everything is June 2026; saved projects carry `price_year` (missing = 2024). Opening another price year sets `_price_year_pending`; the Costs tab offers `index_costs()` by CPI Sydney (`CPI_JUNE_2024_TO_2026`) and parameter overrides from that file are dropped
 - **Benefits are incremental** — always project minus base; never absolute values
 - **Costs are real** — the nominal outturn fields are for reporting only; never feed them into a calculation
 - **Contingency once** — P50 capital is base rows plus the P50 contingency row; do not add a contingency percentage on top
 - **Recurrent costs are net** — option minus base case; never put the base case row in benefits as well
-- **Carbon** — operating and upfront carbon use `carbon_value("nsw", "central", year)` (`CARBON_VALUES`, TfNSW Oct 2025 appendix, $2024); `bcr_national_carbon` and the carbon sensitivity rows revalue the net tonnes (`annual_carbon_t`). The EPV `emission_cost` ÷ $123 gives tonnes per vkt
+- **Carbon** — operating and upfront carbon use `carbon_value("nsw", "central", year)` (`CARBON_VALUES`: EPV Table 6.1 FY2026 value × Table 6.4 factors, June 2026 $; NSW central/high, National central/low); `bcr_national_carbon` and the carbon sensitivity rows revalue the net tonnes (`annual_carbon_t`)
 - **BCR is `None`** when PV costs ≤ 0 (`benefit_cost_ratio`); display with `fmt_bcr` ("–"), never format it as a float directly
 - **Residual value** is discounted from the end of the final year (exponent + 1); any PV of the benefit rows must treat the residual row that way
-- **Defaults** — `zero_growth_after_last_year` True; `include_reliability` and `include_road_damage` True; safety rates are always per case (`safety_vkt_data`); old files in General safety mode are migrated on load
-- **Road damage** — `road_damage_cents_vkt` is EPV 2026.1 Table 8.1 deflated to June 2024 (CPI Sydney 137.25/145.82) × `road_damage_maintenance_share` (0.46)
+- **Defaults** — `zero_growth_after_last_year` True; `include_reliability` and `include_road_damage` True; safety rates are always per case (`safety_vkt_data`), set from each case's road type (`sv_road_<case>`: urban/rural × divided/single → `crash_cost_per_vkt`, or `custom`) and the Setup `funding` basis (`nsw`/`joint`, also picks the VSL); old files keep their rates as `custom`
+- **Road damage** — `road_damage_cents_vkt` is EPV 2026.1 Table 8.1 × `road_damage_maintenance_share` (0.46)
 - **Tests** — run `python3 -m pytest tests -q` before committing; keep `cba_engine.py` free of `streamlit` imports
