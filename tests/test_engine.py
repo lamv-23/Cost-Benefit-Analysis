@@ -696,3 +696,32 @@ def test_vsl_sensitivity_follows_funding():
     joint = _run_with(inputs={"funding": "joint"})
     assert "Central ($7.3M)" in nsw["sensitivity_vsl"]
     assert "Central ($9.7M)" in joint["sensitivity_vsl"]
+
+
+# ── EPV values: stop VOC, former car users, asset lives ─────────────────────
+
+def test_stop_voc_only_when_switched_on():
+    base = make_case_traffic(YEARS, Car={"vht": [1000, 1000], "vkt": [60000, 60000],
+                                         "stops": [500, 500]})
+    proj = make_case_traffic(YEARS, Car={"vht": [1000, 1000], "vkt": [60000, 60000],
+                                         "stops": [400, 400]})
+    off = _run_with(traffic=(base, proj))
+    on = _run_with(inputs={"include_stop_voc": True}, traffic=(base, proj))
+    assert off["benefits_by_type"]["voc"][2] == pytest.approx(0.0)
+    # 100 fewer car stops × $0.1056 per stop (EPV Table 3.14, incl. fuel)
+    assert on["benefits_by_type"]["voc"][2] == pytest.approx(100 * 0.1056 / 1e6)
+
+
+def test_active_transport_former_car_user_savings():
+    health_only = _run_with(walk_pkm_day=1000.0)
+    with_cars = _run_with(walk_pkm_day=1000.0, active_car_share_pct=50.0)
+    extra = with_cars["benefits_by_type"]["active"][2] - health_only["benefits_by_type"]["active"][2]
+    # 500 km/day of former car trips × $1.1542/km (EPV Table 7.1) × 365
+    assert extra == pytest.approx(500 * 1.1542 * 365 / 1e6, rel=1e-4)
+
+
+def test_asset_lives_from_epv():
+    from cba_engine import ASSET_LIVES
+    lives = {label: (lo, hi) for label, lo, hi in ASSET_LIVES}
+    assert lives["Road pavement – asphalt"] == (30, 40)
+    assert lives["Bridges – concrete"] == (120, 120)

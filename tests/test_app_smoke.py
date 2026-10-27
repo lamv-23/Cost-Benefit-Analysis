@@ -448,3 +448,24 @@ def test_safety_road_type_sets_epv_rate():
     funding.set_value("joint").run()
     assert at.session_state["safety_vkt_data"]["project_1"]["Car"] == pytest.approx(
         61.86 / 1e8 * 187044.82)
+
+
+def test_stop_voc_and_car_share_raise_benefits():
+    at = _app_with_sample()
+    central = float(_metric(at, "Benefit-cost ratio"))
+    [stops] = [c for c in at.checkbox if c.label == "VOC from stops"]
+    stops.check().run()
+    assert not at.exception
+    with_stops = float(_metric(at, "Benefit-cost ratio"))
+    assert with_stops > central          # the sample option has fewer stops
+    _number_input(at, "Share of these km that replace car trips (%)").set_value(50.0).run()
+    assert not at.exception
+    assert float(_metric(at, "Benefit-cost ratio")) > with_stops
+
+
+def test_asset_type_sets_life():
+    at = _app_with_sample()
+    at.selectbox(key="cost_asset_type_1").set_value("Road pavement – asphalt").run()
+    assert not at.exception
+    assert at.session_state["cost_data"]["project_1"]["construction_asset_life"] == 35
+    assert _number_input(at, "Construction asset life (years)").value == 35

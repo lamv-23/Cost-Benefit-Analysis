@@ -192,7 +192,7 @@ bus. Weights are EPV Table 3.19.
 - Generated demand and active transport inputs are stored in `cost_data` but shown on Inputs → Traffic → Benefit assumptions (`render_benefit_assumptions()`)
 - Recurrent costs: one `st.data_editor` with a row per year and a column per case (base case + options), tall enough to show every year; paste a column from Excel
 - Traffic change tables (Option − Base) end with a Total row; for VHT and VKT a reduction is green (improvement); demand is uncoloured. There is no traffic summary on Results
-- Pinned Streamlit 1.47.1 does not accept `width="stretch"` on `st.dataframe`/`st.data_editor`; keep `use_container_width=True` until the pin is raised (the deprecation warnings only appear on newer local installs)
+- Streamlit is pinned to 1.50.0, the last release that supports Python 3.9 (local) as well as 3.12 (Cloud). Use `width="stretch"` on `st.dataframe`, `st.data_editor`, `st.button` and `st.download_button`; `st.plotly_chart` has no `width` in 1.50, so keep `use_container_width=True` there. Moving past 1.50 needs Python 3.10+ locally
 - Result cards: NPV and BCR only (`st.metric()`), at the top of the Results tab; two options per row when comparing. IRR/FYRR/payback are still computed by the engine but not shown as cards
 - Results charts: one horizontal NPV waterfall (green adds, red subtracts, blue totals; lines that are exactly zero are named in a caption; bar labels use `signed_m`, which switches to $B like `format_m`), then annual net cashflow and cumulative discounted net benefits. Benefit-type colours are not used on Results
 - Labels are sentence case everywhere (widgets, headings, chart titles, table columns, `TYPE_LABELS`); case names stay "Base Case" / "Option N"
@@ -301,4 +301,7 @@ refactor: extract calculate_matrix into standalone function
 - **Residual value** is discounted from the end of the final year (exponent + 1); any PV of the benefit rows must treat the residual row that way
 - **Defaults** — `zero_growth_after_last_year` True; `include_reliability` and `include_road_damage` True; safety rates are always per case (`safety_vkt_data`), set from each case's road type (`sv_road_<case>`: urban/rural × divided/single → `crash_cost_per_vkt`, or `custom`) and the Setup `funding` basis (`nsw`/`joint`, also picks the VSL); old files keep their rates as `custom`
 - **Road damage** — `road_damage_cents_vkt` is EPV 2026.1 Table 8.1 × `road_damage_maintenance_share` (0.46)
+- **Stop VOC** — `include_stop_voc` (default False) adds change in stops × `voc_per_stop` (Table 3.14) to the VOC line; off by default because the speed-based VOC models already reflect typical stopping
+- **Active transport** — health rate on all new km, plus `active_car_savings` (Table 7.1, former car users) on each option's `active_car_share_pct`; no travel time value (TfNSW)
+- **Asset lives** — `ASSET_LIVES` (Table 12.1); the Costs picker sets `construction_asset_life` to the midpoint via a callback that drops the `cost_asset_life_<i>` widget key
 - **Tests** — run `python3 -m pytest tests -q` before committing; keep `cba_engine.py` free of `streamlit` imports

@@ -22,7 +22,7 @@ import os
 
 from cba_engine import (  # noqa: E402,F401
     PARAMS, VTYPES, PRICE_YEAR, PRICE_LABEL, CPI_JUNE_2024_TO_2026,
-    crash_cost_per_vkt, project_price_year, index_costs,
+    crash_cost_per_vkt, project_price_year, index_costs, ASSET_LIVES,
     DEFAULT_MODELLING_YEARS, TYPE_LABELS, CARBON_VALUES,
     make_traffic_case, make_traffic_data, make_cost_data,
     COST_FORMAT_VERSION, CAPEX_CATEGORIES, clean_row, make_base_case_costs,
@@ -114,6 +114,16 @@ def _clear_safety_inputs() -> None:
         del st.session_state[k]
 
 
+def _apply_asset_life(i: int) -> None:
+    """Selectbox callback: set option ``i``'s asset life from EPV Table 12.1."""
+    label = st.session_state.get(f"cost_asset_type_{i}")
+    for name, low, high in ASSET_LIVES:
+        if name == label:
+            st.session_state.cost_data[f"project_{i}"]["construction_asset_life"] = round((low + high) / 2)
+            # The life input redraws from the new value
+            st.session_state.pop(f"cost_asset_life_{i}", None)
+
+
 def _index_pending_costs() -> None:
     """Button callback: index a June 2024 project's costs to June 2026 (CPI Sydney)."""
     index_costs(st.session_state.cost_data, st.session_state.base_case_costs,
@@ -131,10 +141,11 @@ def _request_sample() -> None:
 
 
 def _load_sample_data() -> None:
-    """Pre-populate session state with a representative rural road upgrade scenario.
+    """Pre-populate session state with a generic road upgrade.
 
-    Scenario: 2-lane rural highway bypass, Car-dominant with moderate HCV freight.
-    Base case = existing alignment; Option 1 = new bypass with higher speeds.
+    Car-dominant traffic with moderate HCV freight. Base case = the existing road;
+    Option 1 = an upgraded road that is shorter and faster with fewer stops. It
+    uses whatever context (urban or rural) is set in Setup.
     All values are illustrative only (not based on any real project).
     """
     years = [2026, 2031, 2041, 2056]
@@ -173,7 +184,7 @@ def _load_sample_data() -> None:
                   "stops": [90.0, 100.0, 115.0, 133.0],
                   "demand": [1200.0, 1350.0, 1550.0, 1800.0]}
 
-    # ── Project 1 (bypass: shorter route, fewer stops, free-flow) ───────
+    # ── Option 1 (upgrade: shorter route, fewer stops, faster) ──────────
     # VKT and VHT both decrease — benefits across TTS, VOC, safety, env.
     p1 = td["project_1"]
     p1["Car"]  = {"vht": [980.0, 1100.0, 1270.0, 1480.0],
@@ -278,6 +289,7 @@ def _serialise_project() -> dict:
         "project_name", "const_years", "eval_period", "construction_start_year",
         "discount_rate", "discount_base_year", "context", "zero_growth_after_last_year",
         "include_reliability", "include_road_damage", "funding", "voc_road_type",
+        "include_stop_voc",
     ]
     data = {"version": __version__, "type": "cba_project",
             "cost_format": COST_FORMAT_VERSION, "price_year": PRICE_YEAR}
@@ -313,7 +325,8 @@ def _deserialise_project(data: dict) -> bool:
     _clear_safety_inputs()
     # Settings added later: files without them get the defaults
     for k, default in (("include_reliability", True), ("include_road_damage", True),
-                       ("funding", "nsw"), ("voc_road_type", "stop_start")):
+                       ("funding", "nsw"), ("voc_road_type", "stop_start"),
+                       ("include_stop_voc", False)):
         st.session_state[k] = data.get(k, default)
     # Each case's safety road type. Older files have none: their per-case rates
     # are kept as custom values, except files in the old General mode, which used
@@ -400,7 +413,7 @@ def case_labels(n: int) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Traffic metrics where a fall (project below base) is an improvement
-_REDUCTION_IS_GOOD = ("vht", "vkt")
+_REDUCTION_IS_GOOD = ("vht", "vkt", "stops")
 
 
 def _style_change(val):
@@ -452,7 +465,7 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
             df_edit,
             num_rows="fixed",
             key=f"de_{metric}_{case_key}",
-            use_container_width=True,
+            width="stretch",
             column_config=col_cfg,
         )
 
@@ -505,7 +518,7 @@ def render_traffic_matrix(metric: str, unit_label: str) -> None:
             _styled = incr_df.style.format("{:+,.0f}")
             if metric in _REDUCTION_IS_GOOD:
                 _styled = _styled.map(_style_change)
-            st.dataframe(_styled, use_container_width=True)
+            st.dataframe(_styled, width="stretch")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -533,7 +546,7 @@ def _edit_year_rows(rows: dict, years: list, key: str) -> dict:
     cols = [str(y) for y in years]
     df = pd.DataFrame([list(v) for v in rows.values()], index=list(rows), columns=cols)
     edited = st.data_editor(
-        df, num_rows="fixed", key=key, use_container_width=True,
+        df, num_rows="fixed", key=key, width="stretch",
         column_config={c: st.column_config.NumberColumn(c, format="%.2f")
                        for c in cols},
     )
@@ -573,7 +586,7 @@ def render_cost_entry(const_years: int, eval_period: int, start_year: int) -> No
         _rec_df = pd.DataFrame({case_label(k): _rec_rows[k] for k in _rec_keys},
                                index=pd.Index([str(y) for y in all_years], name="Year"))
         _rec_edit = st.data_editor(
-            _rec_df, num_rows="fixed", use_container_width=True,
+            _rec_df, num_rows="fixed", width="stretch",
             # Tall enough to show every year without an inner scrollbar
             height=35 * (len(all_years) + 1) + 3,
             key=f"cost_recurrent_{n}_{start_year}_{len(all_years)}",
@@ -652,7 +665,14 @@ def render_cost_entry(const_years: int, eval_period: int, start_year: int) -> No
 
             # ── Residual value ───────────────────────────────────────────────
             st.markdown("**Residual value**")
-            _a1, _a2 = st.columns(2)
+            _a0, _a1, _a2 = st.columns(3)
+            with _a0:
+                st.selectbox(
+                    "Asset type (EPV Table 12.1)", ["—"] + [a[0] for a in ASSET_LIVES],
+                    key=f"cost_asset_type_{i}", on_change=_apply_asset_life, args=(i,),
+                    help="Fills the asset life with the EPV economic life (the midpoint where "
+                         "the EPV gives a range). Edit the life if the project differs.",
+                )
             with _a1:
                 cd["construction_asset_life"] = st.number_input(
                     "Construction asset life (years)",
@@ -815,6 +835,18 @@ def render_benefit_assumptions() -> None:
                         "Source: TfNSW EPV 2026.1, Table 7.1."
                     ),
                 )
+            _car_sav = {m: sum(PARAMS["active_car_savings"][m].values()) for m in ("walking", "cycling")}
+            cd["active_car_share_pct"] = st.number_input(
+                "Share of these km that replace car trips (%)", min_value=0.0, max_value=100.0,
+                value=float(cd.get("active_car_share_pct", 0.0) or 0.0), step=5.0,
+                key=f"cost_active_car_share_{i}",
+                help=(
+                    "Former car trips also save decongestion, VOC, crash, externality, road "
+                    f"provision and parking costs: walking ${_car_sav['walking']:.2f}/km, cycling "
+                    f"${_car_sav['cycling']:.2f}/km (EPV 2026.1 Table 7.1). Leave at 0% if the "
+                    "traffic model already removes those car trips, or they are counted twice."
+                ),
+            )
 
             st.session_state.cost_data[case_key] = cd
 
@@ -1209,7 +1241,7 @@ def param_table(name: str, cells: dict, unit: str, source: str,
     )
     editor_key = f"ptbl_{name}_{st.session_state.get('_ptbl_ver', 0)}"
     st.data_editor(
-        df, key=editor_key, num_rows="fixed", use_container_width=True,
+        df, key=editor_key, num_rows="fixed", width="stretch",
         column_config={c: st.column_config.NumberColumn(
             c, format=fmt, min_value=min_val, max_value=max_val, help=unit) for c in cols},
         on_change=_param_table_changed, args=(editor_key, rows, cells),
@@ -1249,6 +1281,7 @@ def build_effective_params() -> dict:
         # Entered in kg CO2-e per vkt, held in tonnes
         _set(f"param_carbon_kg_{_vt}", p["carbon_t_per_vkt"], _vt, scale=1e-3)
         _set(f"param_road_damage_{_vt}", p["road_damage_cents_vkt"], _vt)
+        _set(f"param_voc_stop_{_vt}", p["voc_per_stop"], _vt)
     # Scalar parameters: session key → PARAMS key
     for _k, _pk in (("param_reliability_ratio", "reliability_ratio"),
                     ("param_reliability_ratio_freight", "reliability_ratio_freight"),
@@ -1527,6 +1560,7 @@ def _init_session_state() -> None:
                          ("context", "urban"), ("zero_growth_after_last_year", True),
                          ("include_reliability", True), ("include_road_damage", True),
                          ("funding", "nsw"), ("voc_road_type", "stop_start"),
+                         ("include_stop_voc", False),
                          ("project_name", "Untitled project")):
         st.session_state[_k] = st.session_state.get(_k, _default)
     _years = st.session_state["modelling_years"]
@@ -1617,9 +1651,9 @@ with st.sidebar:
 
     st.divider()
     with st.expander("Load sample project", expanded=False):
-        st.caption("A rural bypass scenario, to explore the tool without entering data.")
+        st.caption("A generic road upgrade, to explore the tool without entering data.")
         _confirm_load = st.checkbox("I understand this will overwrite all current data", key="confirm_load_sample")
-        st.button("Load sample project", key="sidebar_load_sample", use_container_width=True, disabled=not _confirm_load,
+        st.button("Load sample project", key="sidebar_load_sample", width="stretch", disabled=not _confirm_load,
                   on_click=_request_sample)
 
     st.divider()
@@ -1799,7 +1833,15 @@ with tab_inputs:
             )
 
         st.markdown('<div class="section-header">Benefits included</div>', unsafe_allow_html=True)
-        _b1, _b2 = st.columns(2)
+        _b1, _b2, _b3 = st.columns(3)
+        with _b3:
+            st.checkbox(
+                "VOC from stops", key="include_stop_voc",
+                help="Adds change in stops (Inputs → Traffic → Stops) × EPV VOC per stop "
+                     "(Table 3.14). Off by default: the speed-based VOC models already reflect "
+                     "typical stopping, so use it only where stops change without a matching "
+                     "change in average speed (e.g. intersection works, freeway model).",
+            )
         with _b1:
             st.checkbox(
                 "Reliability benefits", key="include_reliability",
@@ -1892,7 +1934,7 @@ with tab_inputs:
                         tmpl_bytes,
                         file_name="cba_data_template.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
+                        width="stretch",
                     )
                 else:
                     # CSV fallback (VHT only) when openpyxl is absent
@@ -1908,13 +1950,21 @@ with tab_inputs:
                         "\n".join(csv_lines),
                         file_name="cba_vht_template.csv",
                         mime="text/csv",
-                        use_container_width=True,
+                        width="stretch",
                     )
                     st.caption("Install openpyxl for the full Excel template.")
 
         # One metric at a time, so the page stays short as options are added
-        _t_vht, _t_vkt, _t_demand, _t_crash, _t_safety, _t_benefit = st.tabs(
-            ["VHT", "VKT", "Demand", "Crashes", "Safety rates", "Benefit assumptions"])
+        _t_vht, _t_vkt, _t_stops, _t_demand, _t_crash, _t_safety, _t_benefit = st.tabs(
+            ["VHT", "VKT", "Stops", "Demand", "Crashes", "Safety rates", "Benefit assumptions"])
+
+        # ── Stops ─────────────────────────────────────────────────────────────
+        with _t_stops:
+            st.caption(
+                "Vehicle stops per peak period. Used only when **VOC from stops** is on in "
+                "Setup (EPV VOC per stop, Table 3.14)."
+            )
+            render_traffic_matrix("stops", "stops / peak period")
 
         # ── VHT ───────────────────────────────────────────────────────────────
         with _t_vht:
@@ -1971,7 +2021,7 @@ with tab_inputs:
                 _crash_df = pd.DataFrame(_crash_rows).set_index("Severity")[[str(y) for y in _years]]
                 _edited = st.data_editor(
                     _crash_df,
-                    use_container_width=True,
+                    width="stretch",
                     key=f"crash_{_ck}_{st.session_state.get('_crash_edit_counter', 0)}",
                     num_rows="fixed",
                 )
@@ -2042,10 +2092,10 @@ with tab_inputs:
             )
             _i1, _i2, _ = st.columns([1, 1, 1])
             _i1.button(f"Index costs to {PRICE_LABEL}", key="index_costs_2026", type="primary",
-                       on_click=_index_pending_costs, use_container_width=True)
+                       on_click=_index_pending_costs, width="stretch")
             _i2.button("Keep as entered", key="keep_costs_as_entered",
                        on_click=lambda: st.session_state.pop("_price_year_pending", None),
-                       use_container_width=True)
+                       width="stretch")
         render_cost_entry(const_years, eval_period, construction_start_year)
 
 
@@ -2073,6 +2123,7 @@ _matrix_inputs = {
     "carbon_basis": "nsw",
     "funding": st.session_state["funding"],
     "voc_road_type": st.session_state["voc_road_type"],
+    "include_stop_voc": st.session_state["include_stop_voc"],
     "n_project_cases": st.session_state.n_project_cases,
 }
 # Each case's safety rates (Inputs → Traffic → Safety rates)
@@ -2114,7 +2165,7 @@ with _save_slot:
         _proj_json,
         file_name=f"{_safe_filename}.json",
         mime="application/json",
-        use_container_width=True,
+        width="stretch",
         # Nothing to save until some traffic or cost has been entered
         disabled=not _inputs_present,
         help=None if _inputs_present else "Enter traffic or costs, or load the sample, first.",
@@ -2135,7 +2186,7 @@ with tab_params:
                                      key="confirm_reset_params")
     with _r2:
         if st.button("Reset all to defaults", key="reset_params", disabled=not _confirm_reset,
-                     use_container_width=True):
+                     width="stretch"):
             for _k in list(st.session_state.keys()):
                 if _k.startswith("param_"):
                     del st.session_state[_k]
@@ -2221,7 +2272,7 @@ with tab_params:
         st.dataframe(pd.DataFrame({
             f"{'NSW' if _b == 'nsw' else 'National'} {_c}": [CARBON_VALUES[_b][_c].get(_y) for _y in _cy]
             for _b in ("nsw", "national") for _c in CARBON_VALUES[_b] if _c != "label"
-        }, index=pd.Index(_cy, name="Financial year")), use_container_width=True, height=300)
+        }, index=pd.Index(_cy, name="Financial year")), width="stretch", height=300)
 
     # ── Other externalities ──────────────────────────────────────────────────
     with st.expander("Other externalities (cents/veh-km)"):
@@ -2235,7 +2286,7 @@ with tab_params:
         _brk = PARAMS["externality_breakdown_cents_vkt"]
         st.dataframe(pd.DataFrame({
             f"{_vt} {_ctx}": _brk[_ctx][_vt] for _ctx in ("urban", "rural") for _vt in VTYPES
-        }), use_container_width=True)
+        }), width="stretch")
 
     # ── Road damage ──────────────────────────────────────────────────────────
     with st.expander("Road damage (cents/veh-km)"):
@@ -2257,6 +2308,11 @@ with tab_params:
             (_label, "$/km"): (f"param_health_{_mode}", PARAMS["health_benefits"][_mode])
             for _mode, _label in [("walking", "Walking"), ("cycling", "Cycling")]
         }, unit="$/km", source="EPV 2026.1 Table 7.1 (NSW Ministry of Health)", max_val=20.0)
+        st.caption("Extra savings per km when the walking or cycling replaces a car trip "
+                   "(applied to each option's car-trip share; EPV 2026.1 Table 7.1, former car "
+                   "users). TfNSW does not recommend valuing travel time for active transport.")
+        st.dataframe(pd.DataFrame(PARAMS["active_car_savings"]).rename(columns=str.title),
+                     width="stretch")
 
     # ── VOC tables (read-only reference) ─────────────────────────────────────
     for _model, _title in (("stop_start", "urban stop-start (Table 3.9)"),
@@ -2265,7 +2321,23 @@ with tab_params:
         with st.expander(f"Vehicle operating costs — {_title} ($/veh-km, read-only)"):
             _voc = PARAMS["voc"][_model]
             st.dataframe(pd.DataFrame(_voc).rename_axis("Speed (km/h)"),
-                         use_container_width=True)
+                         width="stretch")
+    with st.expander("VOC per stop ($/stop)"):
+        st.caption("Used only when VOC from stops is on in Setup. LCV uses the EPV light "
+                   "truck; HCV and Bus the heavy truck.")
+        param_table("voc_stop", {
+            (_label, "$/stop"): (f"param_voc_stop_{_vt}", PARAMS["voc_per_stop"][_vt])
+            for _vt, _label in _VT_ROWS
+        }, unit="$ per stop, incl. fuel", fmt="%.4f", max_val=20.0,
+            source="EPV 2026.1 Table 3.14")
+
+    with st.expander("Asset lives (years, read-only)"):
+        st.caption("Economic life by asset class, for the residual value asset life "
+                   "(Inputs → Costs). Source: EPV 2026.1 Table 12.1 (ATAP 2018, TfNSW).")
+        st.dataframe(pd.DataFrame(
+            [{"Asset class": a, "Life (years)": f"{lo}" if lo == hi else f"{lo}–{hi}"}
+             for a, lo, hi in ASSET_LIVES]), hide_index=True, width="stretch")
+
     st.caption("VOC: TfNSW depreciation-adjusted resource-cost models. Car = medium car; LCV = "
                "courier van/utility and 4WD; HCV = all rigid, articulated and combination "
                "trucks; LCV and HCV weighted by the EPV vehicle mix (Table 3.19).")
@@ -2329,6 +2401,9 @@ with tab_about:
          "approximation because the EPV gives rural VOC only as REVS model parameters. Car is a "
          "medium car; LCV, HCV and bus use their EPV vehicle classes weighted by the EPV vehicle "
          "mix. Speeds outside 20–110 km/h use the table's end value (flagged on Results). "
+         "Optionally (Setup, off by default), the change in stops × EPV VOC per stop (Table "
+         "3.14) is added — only where stops change without a matching change in speed, as the "
+         "speed-based models already reflect typical stopping. "
          "Source: TfNSW EPV 2026.1 Tables 3.9, 3.10 and 3.19."),
         ("Reliability", "reliability", "indigo",
          "A proxy: travel time savings × reliability ratio (1.0, TfNSW recommended, EPV "
@@ -2351,7 +2426,10 @@ with tab_about:
          "Benefits from additional walking or cycling induced by the project, "
          f"valued at the NSW Health rates (walking ${PARAMS['health_benefits']['walking']:.2f}/km; "
          f"cycling ${PARAMS['health_benefits']['cycling']:.2f}/km). "
-         "This component is zero unless walking or cycling km are entered. "
+         "The share of those km that replaces car trips also earns the EPV savings for "
+         "former car users (decongestion, VOC, crashes, externalities, road provision, "
+         "parking; walking $1.15/km, cycling $1.25/km) — leave it at 0% if the traffic model "
+         "already removes those car trips. No travel time value, per TfNSW. "
          "Source: TfNSW EPV 2026.1 Table 7.1."),
         ("Road damage savings", "road_damage", "brown",
          "Change in VKT × TfNSW road maintenance cost per vehicle-km (EPV 2026.1 Table 8.1: "
@@ -2372,6 +2450,8 @@ with tab_about:
         ("Residual value", "residual", "brown",
          "Remaining value of the assets at the end of the appraisal period, credited at the "
          "end of the final year (discounted one year further than that year's other flows). "
+         "The asset life can be filled from EPV Table 12.1 (e.g. asphalt pavement 30–40 "
+         "years, concrete bridges 120). "
          "Land keeps its full value; construction (including its share of "
          "contingency) depreciates straight-line over the asset life; planning and design "
          "have none. A manual residual value overrides the calculation."),
@@ -2544,8 +2624,8 @@ if _calc_error is not None or not _inputs_present:
             if _where == "results":
                 _b1, _b2, _b3 = st.columns([2, 1, 2])
                 _b2.button("Load sample project", key="empty_load_sample", type="primary",
-                           use_container_width=True, on_click=_request_sample,
-                           help="Fills the inputs with an illustrative rural bypass.")
+                           width="stretch", on_click=_request_sample,
+                           help="Fills the inputs with an illustrative generic road upgrade.")
     st.stop()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2606,7 +2686,7 @@ with tab_results:
             format_summary_value(_k, _v, screen=True) for _k, _v in _summ.items()
         ]
     st.dataframe(pd.DataFrame(_summ_cols, index=list(_summ.keys())),
-                 use_container_width=True,
+                 width="stretch",
                  height=35 * (len(_summ) + 1) + 3)  # every row, no inner scroll
     st.caption(
         "Outturn capital is nominal $M, copied from the cost estimate and never used in "
@@ -2866,7 +2946,7 @@ with tab_cashflow:
 
     # Shown to 2 dp; the CSV download keeps 3 dp
     st.dataframe(
-        df_cf, use_container_width=True, hide_index=True,
+        df_cf, width="stretch", hide_index=True,
         column_config={
             "Year": st.column_config.NumberColumn("Year", format="%d", pinned=True),
             **{c: st.column_config.NumberColumn(c, format="%.2f") for c in df_cf.columns if c != "Year"},
@@ -2883,7 +2963,7 @@ with tab_cashflow:
             file_name=f"cashflow-{view_mode.lower()}{_cf_filename_suffix}.csv",
             mime="text/csv",
             key="dl_cashflow",
-            use_container_width=True,
+            width="stretch",
         )
     with _dl_col2:
         _full_export_r = matrix_results.get(_cf_sel, {})
@@ -2900,7 +2980,7 @@ with tab_cashflow:
                 file_name=f"cba-results-{_case_label}.csv",
                 mime="text/csv",
                 key="dl_full_results",
-                use_container_width=True,
+                width="stretch",
             )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2953,7 +3033,7 @@ with tab_sensitivity:
                 "NPV ($M)": "{:.1f}",
                 "BCR": lambda b: fmt_bcr(None if pd.isna(b) else b),
             }),
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
             height=35 * (len(df_req) + 1) + 3,  # all 17 rows, no inner scroll
         )
         st.caption("Highlighted row = central case (P50 capital, central discount rate). "
@@ -3053,7 +3133,7 @@ with tab_sensitivity:
                 _df_c.style.apply(_highlight_carbon, axis=1).format({
                     "PV benefits ($M)": "{:,.1f}", "NPV ($M)": "{:,.1f}", "BCR": fmt_bcr,
                 }),
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
                 column_config={"Core": None},
             )
             st.caption(
@@ -3119,7 +3199,7 @@ with tab_sensitivity:
             "Adjusted NPV ($M)": "{:.1f}",
             "Adjusted BCR": "{:.2f}",
         })
-        st.dataframe(_styled_web, use_container_width=True, hide_index=True)
+        st.dataframe(_styled_web, width="stretch", hide_index=True)
         st.caption(
             "WEB uplift = WEB factor × PV Travel Time Savings. "
             "Highlighted row = base case (no WEBs). "
@@ -3185,7 +3265,7 @@ with tab_sensitivity:
                 "NPV ($M)": "{:.1f}",
                 "BCR": lambda b: fmt_bcr(None if pd.isna(b) else b),
             })
-            st.dataframe(_styled_vsl, use_container_width=True, hide_index=True)
+            st.dataframe(_styled_vsl, width="stretch", hide_index=True)
             st.caption(
                 "Highlighted row = Central (base case) VSL. "
                 "Only the fatal component of safety benefits is scaled; other severity classes are unchanged. "
@@ -3200,7 +3280,7 @@ with tab_sensitivity:
         _fy_rows = [{"Benefit": label, "First year ($M)": round(fy.get(key, 0.0), 2)}
                     for key, label in TYPE_LABELS.items()]
         _fy_rows.append({"Benefit": "Total", "First year ($M)": round(fy.get("total", 0.0), 2)})
-        st.dataframe(pd.DataFrame(_fy_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(_fy_rows), width="stretch", hide_index=True)
 
     # --- Monte Carlo Risk Analysis (advanced only) ---
     if show_advanced:
@@ -3372,7 +3452,7 @@ with tab_sensitivity:
                     "BCR": [f"{_mean_bcr:.2f}", f"{_p10_bcr:.2f}", f"{_p50_bcr:.2f}",
                             f"{_p90_bcr:.2f}", f"{_prob_bcr_ge1:.0f}%"],
                 })
-                st.dataframe(_mc_stats, use_container_width=True, hide_index=True)
+                st.dataframe(_mc_stats, width="stretch", hide_index=True)
                 st.caption(
                     f"{_n_total} simulations · "
                     f"Traffic CV {st.session_state.get('mc_demand', 15)}% · "
