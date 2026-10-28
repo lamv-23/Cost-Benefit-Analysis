@@ -2528,7 +2528,7 @@ with tab_about:
         "Cost": [
             "Capital (P50)",
             "Capital (P90)",
-            "Project recurrent costs",
+            "Option recurrent costs",
             "Base case recurrent costs",
             "Upfront carbon",
             "Outturn capital (nominal)",
@@ -2594,7 +2594,7 @@ with tab_about:
     )
     sens_rows = [
         ("Discount rate", "3%, 4% and 7%, whatever the central rate is."),
-        ("Costs and benefits", "Project costs and transport benefits at +20%, \u221220%, +40% and \u221240%. Residual value follows capital; recurrent cost savings, upfront carbon and construction disruption are not scaled."),
+        ("Costs and benefits", "Option costs and transport benefits at +20%, \u221220%, +40% and \u221240%. Residual value follows capital; recurrent cost savings, upfront carbon and construction disruption are not scaled."),
         ("P90 capital cost", "Capital at base plus the P90 contingency in every year."),
         ("Opening delayed", "Opening delayed by 1 year and by 3 years, with benefits recalculated for the delayed calendar years."),
         ("Traffic growth", "No traffic growth, and half the forecast traffic growth, from the opening year."),
