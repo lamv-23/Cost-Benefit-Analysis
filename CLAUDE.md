@@ -253,6 +253,8 @@ python3 -m pytest tests -q
 ## Deployment, Branches & Environment
 
 - `claude/complete-cba-dashboard-hBs4G` is the default branch and **deploys to Streamlit Cloud on push** — do feature work on a separate branch; merge/push only when the user says to
+- Live app: https://cost-benefit-analysis-zc69vmcrcp6ouyi5hzzmz5.streamlit.app (main file `app.py`). Cloud's Python version is set in the app's settings at share.streamlit.io, not by `runtime.txt` — it must be 3.12
+- `STATUS.md` is the handoff: what is live, decisions made and open follow-ups — update it at the end of a working session
 - Push as GitHub account `lamv-23` (repo owner); a 403 on push means the wrong account is active — run `gh auth switch --user lamv-23`
 - `runtime.txt` pins Python 3.12 on Cloud; local is 3.9 — keep `from __future__ import annotations` in `cba_engine.py`
 - Shell is zsh: write `"${REV}:app.py"` not `$REV:app.py` (`:a` is a zsh modifier), and quote `'==='` in `echo`
